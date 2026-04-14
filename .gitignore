@@ -1,0 +1,40 @@
+# --- OS & editors ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.code-workspace
+
+# --- Secrets (never commit) ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Generated & machine-specific paths ---
+cache/
+output/
+backup/
+data/charm_manifest.json
+*.bak.xlsx
+data/supplier_catalog_backups/
+
+# --- Business / PII / large binaries (keep local only) ---
+# Order PDFs contain buyer and order details.
+input/**/*.pdf
+# Catalog and charm assets are your operational data (and can be large).
+data/**/*.xlsx
+data/charm_images/**
+!data/charm_images/.gitkeep
+
+# Optional: local AI prompt scratchpad (uncomment if you want it private)
+# prompts.txt

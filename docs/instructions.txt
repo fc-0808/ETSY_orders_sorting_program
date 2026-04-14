@@ -1,0 +1,39 @@
+LAYOUT
+  data/   supplier_catalog.xlsx
+          supplier_catalog_backups/  (auto: timestamped copies before the tool overwrites the catalog)
+  input/  order PDFs
+  output/ shopping_route.xlsx, .html (generated)
+  cache/  auto-managed
+
+Run:  .\run.ps1 [args]
+
+--- COMMANDS ---
+--new-batch              Process new PDFs from input/
+--new-batch file.pdf     Process specific PDF(s)
+--purge-purchased        Remove purchased/OOP items (logs OOP to cache/)
+--refresh-catalog        Rebuild route after editing supplier_catalog.xlsx
+--rebuild-catalog        Re-sort catalog by floor/stall (run after filling supplier info)
+--list-catalog-backups   List backups in data/supplier_catalog_backups/
+--restore-latest-catalog-backup   Restore supplier_catalog.xlsx from newest backup (close Excel first)
+--restore-catalog-backup FILE     Restore from one backup (name or full path)
+
+--- CHINESE ---
+--chinese                Add Simplified Chinese version (shopping_route_zh.xlsx)
+--chinese-exclude-shops X,Y   Exclude shops from Chinese file
+Examples:  .\run.ps1 --new-batch --chinese
+           .\run.ps1 --refresh-catalog --chinese --chinese-exclude-shops Y2KASEofficial
+
+--- HTML ---
+--html                   Generate self-contained HTML (mobile-friendly, shareable, offline)
+Examples:  .\run.ps1 --refresh-catalog --html
+           .\run.ps1 --refresh-catalog --chinese --html
+
+--- CHARM SHOPS (one-time) ---
+.\run.ps1 --init-charm-shops   Add Charm Shops sheet to catalog
+Edit: data/supplier_catalog.xlsx → Charm Shops tab
+
+--- CHARM ASSIGNMENT ---
+1. Open data/supplier_catalog.xlsx → Product Map
+2. Amber rows = new charm products. Set Column H "Charm Shop" from dropdown.
+3. .\run.ps1 --refresh-catalog
+4. To add shop: Charm Shops tab → add row → --refresh-catalog
