@@ -30,11 +30,11 @@ blue "Awaiting Supplier Info" section so they are never buried in the table.
    checks both sheets, preventing re-addition.
 
    **When column G (Charm Code) is set** to a library code, the shopping route (and HTML) **Charm**
-   section uses the library/disk photo for that code (folder file wins over Excel embed),
-   so shoppers see your canonical reference bead strap, not only the flat PDF mock-up.
+   section **aggregates by charm code** — one row per unique charm with the library photo,
+   code, SKU, charm shop, and total quantity across all orders.  Folder file wins over embed.
 
-   **When Charm Code is blank**, the route keeps using the **order PDF** product image for
-   the charm row (fine if the listing photo is enough, or the charm is not in the library yet).
+   **When Charm Code is blank**, the order is shown in a separate **"Awaiting Charm Code"**
+   sub-section with the product photo and a prompt to assign a code in the catalog.
 
    Typical setup: add every distinct charm to the library once; for each catalog product
    that ships with that charm, pick the matching **G** (shop) and **H** (code).  **G** can
@@ -390,6 +390,7 @@ _ZH: dict[str, str] = {
     "order(s)":              "个订单",
     "Charm shops":           "挂件店铺",
     "No charm shops configured": "未配置挂件店铺",
+    "Private Notes":         "私信备注",
 }
 
 
@@ -480,6 +481,7 @@ class Order:
     ship_to_name:   str = ""
     ship_to_country: str = ""
     order_date:     str = ""
+    private_notes:  str = ""
     items: list[OrderItem] = field(default_factory=list)
 
 
@@ -532,8 +534,11 @@ class ResolvedItem:
 #         Right column (x >= 200): product title, qty, model, style + photo
 # Images sort top->bottom and match items 1-to-1 in that order.
 
-_COL_BOUNDARY = 200   # px dividing left address block from right product block
-_Y_TOLERANCE  = 3.0   # px -- merge words within this gap into one line
+_COL_BOUNDARY     = 200   # px dividing left address block from right product block
+_LEFT_META_MAX_X  = 100   # px — order metadata (order#, address, shop, date) lives at x≈36
+_LEFT_PN_MIN_X    = 100   # px — Private notes content lives at x≈174 (separate sub-column)
+_LEFT_PN_MAX_Y    = 500   # px — crop footer ("Do the green thing", etc. at y≈700+)
+_Y_TOLERANCE      = 3.0   # px -- merge words within this gap into one line
 
 _QUANTITY_RE          = re.compile(r"^Quantity:\s*(\d+)")
 _MODEL_RE             = re.compile(r"^(?:Phone|iPhone)\s+Model:\s*(.+)", re.IGNORECASE)
@@ -541,6 +546,7 @@ _STYLE_RE             = re.compile(r"^Styles?:\s*(.+)")
 _CURRENCY_RE          = re.compile(r"^[A-Z]{3}$")
 _ORDER_RE             = re.compile(r"^Order\s+#(\d+)")
 _SCHEDULED_RE         = re.compile(r"^Scheduled\s+to\s+(?:ship|dispatch)\s+by", re.IGNORECASE)
+_PRIVATE_NOTES_RE     = re.compile(r"^Private\s+notes?$", re.IGNORECASE)
 # Some shops (e.g. LUVEKASEofficial, LUVKASEofficial) append a currency code
 # like " HKD" at the end of the first title line because their PDF lays out a
 # price tag on the same horizontal baseline as the product text.  Strip it so
@@ -568,6 +574,26 @@ def _words_to_lines(words: list[dict], x_min: float, x_max: float) -> list[str]:
     return [" ".join(parts) for _, parts in lines]
 
 
+def _extract_private_notes(lines: list[str]) -> str:
+    """Return the Private notes content from lines in the inner-right sub-column (x ≈ 174).
+
+    Scans for the "Private notes" header, then collects all following lines as
+    the note text.  Stops at the first known footer pattern so page footers like
+    "Do the green thing …" are never included.
+    """
+    i, n = 0, len(lines)
+    while i < n:
+        if _PRIVATE_NOTES_RE.match(lines[i]):
+            i += 1
+            note_parts: list[str] = []
+            while i < n:
+                note_parts.append(lines[i])
+                i += 1
+            return " ".join(note_parts).strip()
+        i += 1
+    return ""
+
+
 def parse_pdf(path: Path) -> list[Order]:
     """Extract all orders (with product photos) from a single Etsy order PDF."""
     fitz_doc = fitz.open(str(path))
@@ -585,15 +611,31 @@ def parse_pdf(path: Path) -> list[Order]:
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
             words = page.extract_words(keep_blank_chars=True, extra_attrs=["top"])
-            left  = _words_to_lines(words, 0,             _COL_BOUNDARY)
-            right = _words_to_lines(words, _COL_BOUNDARY, 9999)
+
+            # Order metadata lives at x ≈ 36 (strictly left).  Using x < 100
+            # keeps it separate from the "Private notes" content at x ≈ 174,
+            # preventing Y-proximity merges like "Shop Private notes" or
+            # "Y2KASEofficial need case".
+            left  = _words_to_lines(words, 0,                _LEFT_META_MAX_X)
+            right = _words_to_lines(words, _COL_BOUNDARY,    9999)
+
+            # Inner-right sub-column: "Private notes" header + note content.
+            # Crop to y < _LEFT_PN_MAX_Y to exclude page footers (y ≈ 700+).
+            pn_words  = [w for w in words
+                         if _LEFT_PN_MIN_X <= w["x0"] < _COL_BOUNDARY
+                         and w.get("top", 0) < _LEFT_PN_MAX_Y]
+            left_pn   = _words_to_lines(pn_words, _LEFT_PN_MIN_X, _COL_BOUNDARY)
+            pn_text   = _extract_private_notes(left_pn)
 
             order = _parse_left_column(left)
             if not order:
                 continue
-            items = _parse_right_column(right)
+            items, right_private_notes = _parse_right_column(right)
             if not items:
                 continue
+            # Inner-right sub-column is the primary source for private notes;
+            # right column (x ≥ 200) is a fallback for unusual PDF layouts.
+            order.private_notes = pn_text or right_private_notes
 
             # Assign photos: images are sorted top->bottom matching item order
             page_imgs = sorted(page.images, key=lambda i: i["top"])
@@ -663,15 +705,33 @@ def _parse_left_column(lines: list[str]) -> Order | None:
     return o
 
 
-def _parse_right_column(lines: list[str]) -> list[OrderItem]:
-    """Parse product items from the right column of one page."""
+def _parse_right_column(lines: list[str]) -> tuple[list[OrderItem], str]:
+    """Parse product items and optional private notes from the right column of one page.
+
+    Returns (items, private_notes) where private_notes is everything that
+    follows the "Private notes" section header (if present).
+    """
     items: list[OrderItem] = []
+    private_notes = ""
     i, n = 0, len(lines)
 
     while i < n:
+        # "Private notes" section header — collect all remaining lines as notes
+        if _PRIVATE_NOTES_RE.match(lines[i]):
+            i += 1
+            note_parts: list[str] = []
+            while i < n:
+                note_parts.append(lines[i])
+                i += 1
+            private_notes = " ".join(note_parts).strip()
+            break
+
         title_parts: list[str] = []
         while i < n:
             if _QUANTITY_RE.match(lines[i]):
+                break
+            # Stop title collection at the Private notes header
+            if _PRIVATE_NOTES_RE.match(lines[i]):
                 break
             if _CURRENCY_RE.match(lines[i]):
                 i += 1
@@ -705,7 +765,7 @@ def _parse_right_column(lines: list[str]) -> list[OrderItem]:
 
         items.append(item)
 
-    return items
+    return items, private_notes
 
 
 # ---------------------------------------------------------------------------
@@ -2992,6 +3052,7 @@ def _resolved_to_dict(r: ResolvedItem) -> dict:
         "ship_to_name":    r.order.ship_to_name,
         "ship_to_country": r.order.ship_to_country,
         "order_date":      r.order.order_date,
+        "private_notes":   r.order.private_notes,
         "title":           r.item.title,
         "quantity":        r.item.quantity,
         "phone_model":     r.item.phone_model,
@@ -3019,6 +3080,7 @@ def _dict_to_resolved(d: dict) -> ResolvedItem:
         ship_to_name    = d.get("ship_to_name",    ""),
         ship_to_country = d.get("ship_to_country", ""),
         order_date      = d.get("order_date",      ""),
+        private_notes   = d.get("private_notes",   ""),
     )
     photo_bytes = base64.b64decode(d["photo_b64"]) if d.get("photo_b64") else None
     item = OrderItem(
@@ -3255,8 +3317,11 @@ def load_items_from_xlsx(xlsx_path: Path) -> list[ResolvedItem]:
 
         order_str = order_cell.strip()
 
-        if order_str.startswith("~#"):
-            charm_onum = order_str[2:].strip()
+        if order_str.startswith("~C:"):
+            continue
+        if order_str.startswith("~?#") or order_str.startswith("~#"):
+            _prefix_len = 3 if order_str.startswith("~?#") else 2
+            charm_onum = order_str[_prefix_len:].strip()
             if charm_onum.isdigit():
                 charm_order_nums.add(charm_onum)
             continue
@@ -3272,9 +3337,17 @@ def load_items_from_xlsx(xlsx_path: Path) -> list[ResolvedItem]:
         if grip_val != "N/A": style_parts.append("Grip")
         style = "+".join(style_parts) if style_parts else "Case"
 
+        # Private Notes: col 15 (index 14) in new EN 15-col format
+        _pn_idx = 14
+        _pn_raw = (
+            str(row_vals[_pn_idx]).strip()
+            if is_new_format and len(row_vals) > _pn_idx and row_vals[_pn_idx]
+            else ""
+        )
         order = Order(
-            order_number = order_num,
-            etsy_shop    = str(row_vals[etsy_idx]).strip() if len(row_vals) > etsy_idx and row_vals[etsy_idx] else "",
+            order_number  = order_num,
+            etsy_shop     = str(row_vals[etsy_idx]).strip() if len(row_vals) > etsy_idx and row_vals[etsy_idx] else "",
+            private_notes = _pn_raw,
         )
         item = OrderItem(
             title       = str(row_vals[5]).strip() if row_vals[5] else "",
@@ -3371,8 +3444,19 @@ def load_existing_statuses(xlsx_path: Path) -> dict[tuple[str, str], str]:
         title_val  = str(row_vals[5]).strip() if row_vals[5] else ""
         norm_title = _normalize(title_val)[:50]
 
-        if order_str.startswith("~#"):
-            charm_order_num = order_str[2:].strip()
+        # Aggregated charm row: ~C:<charm_code>
+        if order_str.startswith("~C:"):
+            charm_code_key = order_str[3:].strip()
+            if charm_code_key and len(row_vals) > charm_col:
+                val = str(row_vals[charm_col]).strip() if row_vals[charm_col] else ""
+                if val in keep:
+                    statuses[(charm_code_key, "", "charm_agg")] = val
+            continue
+
+        # Legacy per-order charm row: ~#<order_num> (backward compat)
+        if order_str.startswith("~#") or order_str.startswith("~?#"):
+            prefix_len = 3 if order_str.startswith("~?#") else 2
+            charm_order_num = order_str[prefix_len:].strip()
             if charm_order_num.isdigit() and len(row_vals) > charm_col:
                 val = str(row_vals[charm_col]).strip() if row_vals[charm_col] else ""
                 if val in keep:
@@ -4987,17 +5071,19 @@ def _sheet_route(ws, items: list[ResolvedItem],
     ws.title = _t("Shopping Route", lang)
     ws.sheet_properties.tabColor = "1F4E79"
 
-    # EN: 14 cols (with Etsy). ZH: compact 7 cols — no floor/product/component status/order#.
+    # EN: 15 cols (with Etsy + Private Notes). ZH: compact 8 cols.
     _zh_route_compact = lang == "zh"
     if _zh_route_compact:
         HDRS = [
             "#", _t("Photo", lang), _t("Supplier", lang), _t("Stall", lang),
             _t("Items to Purchase", lang),
             _t("Phone Model", lang), _t("Qty", lang),
+            _t("Private Notes", lang),
         ]
         COL_ITEMS_TO_PURCHASE = 5
         COL_SUPPLIER, COL_STALL = 3, 4
         COL_PHONE, COL_QTY = 6, 7
+        COL_PRIVATE_NOTES = 8
     else:
         HDRS = [
             "#", _t("Photo", lang), _t("Floor", lang), _t("Supplier", lang),
@@ -5007,11 +5093,13 @@ def _sheet_route(ws, items: list[ResolvedItem],
             _t("Phone Model", lang), _t("Qty", lang),
             _t("Order #", lang),
             _t("Etsy Shop", lang),
+            _t("Private Notes", lang),
         ]
         COL_ITEMS_TO_PURCHASE = 7
         COL_CASE, COL_GRIP, COL_CHARM = 8, 9, 10
         COL_SUPPLIER, COL_STALL = 4, 5
         COL_PHONE, COL_QTY = 11, 12
+        COL_PRIVATE_NOTES = 15
     COLS    = len(HDRS)
     HDR_ROW = 4
     col_end = get_column_letter(COLS)
@@ -5202,6 +5290,9 @@ def _sheet_route(ws, items: list[ResolvedItem],
             if not _zh_route_compact:
                 ws.cell(row, 13, f"#{r.order.order_number}")
                 ws.cell(row, 14, r.order.etsy_shop)
+            if r.order.private_notes:
+                pn = ws.cell(row, COL_PRIVATE_NOTES, r.order.private_notes)
+                pn.alignment = _WRAP
 
             _style_row(ws, row, COLS, fill=fill)
             if not _zh_route_compact:
@@ -5215,6 +5306,8 @@ def _sheet_route(ws, items: list[ResolvedItem],
                         c.font = _NA_FONT
                     else:
                         ws.cell(row, col).alignment = _CENTER
+            if r.order.private_notes:
+                ws.cell(row, COL_PRIVATE_NOTES).alignment = _WRAP
 
             ws.cell(row, 1).alignment = _CENTER
             if not _zh_route_compact:
@@ -5278,6 +5371,9 @@ def _sheet_route(ws, items: list[ResolvedItem],
             if not _zh_route_compact:
                 ws.cell(row, 13, f"#{r.order.order_number}")
                 ws.cell(row, 14, r.order.etsy_shop)
+            if r.order.private_notes:
+                pn = ws.cell(row, COL_PRIVATE_NOTES, r.order.private_notes)
+                pn.alignment = _WRAP
             _style_row(ws, row, COLS, fill=_NEEDSINFO_FILL, font=_NEEDSINFO_FONT)
             if not _zh_route_compact:
                 for col, has in (
@@ -5289,6 +5385,8 @@ def _sheet_route(ws, items: list[ResolvedItem],
                         c.font = _NA_FONT
                     else:
                         c.alignment = _CENTER
+            if r.order.private_notes:
+                ws.cell(row, COL_PRIVATE_NOTES).alignment = _WRAP
             ws.cell(row, 1).alignment = _CENTER
             if not _zh_route_compact:
                 ws.cell(row, 3).alignment = _CENTER
@@ -5341,6 +5439,9 @@ def _sheet_route(ws, items: list[ResolvedItem],
             if not _zh_route_compact:
                 ws.cell(row, 13, f"#{r.order.order_number}")
                 ws.cell(row, 14, r.order.etsy_shop)
+            if r.order.private_notes:
+                pn = ws.cell(row, COL_PRIVATE_NOTES, r.order.private_notes)
+                pn.alignment = _WRAP
             _style_row(ws, row, COLS, fill=_WARN_FILL, font=_WARN_FONT)
             if not _zh_route_compact:
                 for col, has in (
@@ -5352,6 +5453,8 @@ def _sheet_route(ws, items: list[ResolvedItem],
                         c.font = _NA_FONT
                     else:
                         c.alignment = _CENTER
+            if r.order.private_notes:
+                ws.cell(row, COL_PRIVATE_NOTES).alignment = _WRAP
             ws.cell(row, 1).alignment = _CENTER
             if not _zh_route_compact:
                 ws.cell(row, 3).alignment = _CENTER
@@ -5442,27 +5545,68 @@ def _sheet_route(ws, items: list[ResolvedItem],
     # CHARMS TO PURCHASE — dedicated section, completely separate building
     # ---------------------------------------------------------------------------
     #
-    # Each order whose style contains a charm component gets ONE row here.
-    # The Charm column (col 9) carries the per-order status dropdown.
-    # Case and Grip columns are always N/A (charms have nothing to do with the
-    # case/grip supplier floors).
-    #
-    # Order # cells use a "~#XXXXXXX" sentinel so that load_existing_statuses()
-    # and load_items_from_xlsx() can distinguish charm rows from main rows.
+    # Two sub-sections:
+    #   A) Aggregated by charm code — one row per unique charm, photo + details
+    #      from the Charm Library, total qty across all orders.  Status tracked
+    #      per charm code via sentinel ``~C:<code>`` in the Order # column.
+    #   B) Awaiting charm code — orders whose style has a charm component but
+    #      no charm code assigned yet.  Shows product photo + prompt to assign.
     # ---------------------------------------------------------------------------
     if charm_items:
-        row += 1   # one blank separator row between main sections and charm section
+        row += 1   # one blank separator row
 
-        # Pre-compute shared variables used in both the banner and data rows
-        _cshops              = charm_shops or []
-        _cshops_lookup_tmp   = {cs.shop_name: cs for cs in _cshops}
-        total_charm_qty_c    = sum(r.item.quantity for r in charm_items)
-        assigned_count       = sum(
+        _cshops            = charm_shops or []
+        _cshops_lookup_tmp = {cs.shop_name: cs for cs in _cshops}
+        total_charm_qty_c  = sum(r.item.quantity for r in charm_items)
+
+        # Partition: items with a charm code vs items still awaiting one
+        _coded_items:    list[ResolvedItem] = []
+        _awaiting_items: list[ResolvedItem] = []
+        for _ci in charm_items:
+            _cc = (_ci.supplier.charm_code if _ci.supplier else "").strip()
+            if _cc:
+                _coded_items.append(_ci)
+            else:
+                _awaiting_items.append(_ci)
+
+        # Aggregate coded items by charm code
+        _charm_agg: dict[str, dict] = {}
+        for _ci in _coded_items:
+            _cc = _ci.supplier.charm_code.strip()
+            if _cc not in _charm_agg:
+                _lib = (charm_library or {}).get(_cc)
+                _charm_agg[_cc] = {
+                    "code": _cc,
+                    "sku": _lib.sku if _lib else "",
+                    "default_shop": _lib.default_charm_shop if _lib else "",
+                    "notes": _lib.notes if _lib else "",
+                    "photo_bytes": None,
+                    "charm_shop": "",
+                    "charm_shop_obj": None,
+                    "total_qty": 0,
+                    "orders": [],
+                    "items": [],
+                }
+                _ph = charm_photo_bytes_from_folder(_cc, charm_images_dir)
+                if not _ph and _lib and _lib.photo_bytes:
+                    _ph = _lib.photo_bytes
+                _charm_agg[_cc]["photo_bytes"] = _ph
+            _charm_agg[_cc]["total_qty"] += _ci.item.quantity
+            _charm_agg[_cc]["orders"].append(_ci.order.order_number)
+            _charm_agg[_cc]["items"].append(_ci)
+            if not _charm_agg[_cc]["charm_shop"]:
+                _as = (_ci.supplier.charm_shop if _ci.supplier else "").strip()
+                if _as:
+                    _charm_agg[_cc]["charm_shop"] = _as
+                    _charm_agg[_cc]["charm_shop_obj"] = _cshops_lookup_tmp.get(_as)
+
+        n_unique_charms  = len(_charm_agg)
+        n_missing_code   = len(_awaiting_items)
+        unassigned_count = sum(
             1 for r in charm_items
-            if (r.supplier and r.supplier.charm_shop
-                and r.supplier.charm_shop in _cshops_lookup_tmp)
+            if not (r.supplier and r.supplier.charm_shop
+                    and r.supplier.charm_shop in _cshops_lookup_tmp)
         )
-        unassigned_count = len(charm_items) - assigned_count
 
         # --- Banner row ---
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
@@ -5472,6 +5616,13 @@ def _sheet_route(ws, items: list[ResolvedItem],
                 f"  \u2014  \u5171\u9700 {total_charm_qty_c} \u4e2a\u6302\u4ef6"
                 f"\uff0c\u6d89\u53ca {len(charm_items)} \u4e2a\u8ba2\u5355"
             )
+            if n_unique_charms:
+                charm_banner_text += f"  \u2014  {n_unique_charms} \u79cd\u6302\u4ef6"
+            if n_missing_code:
+                charm_banner_text += (
+                    f"  \u25b6  {n_missing_code} \u4e2a\u8ba2\u5355\u5f85\u5206\u914d\u6302\u4ef6\u7f16\u7801"
+                    f" \u2014 \u6253\u5f00 supplier_catalog.xlsx \u2192 Product Map H\u5217"
+                )
             if unassigned_count:
                 charm_banner_text += (
                     f"  \u25b6  {unassigned_count} \u4e2a\u8ba2\u5355\u672a\u5206\u914d\u6302\u4ef6\u5e97"
@@ -5482,10 +5633,17 @@ def _sheet_route(ws, items: list[ResolvedItem],
                 f"  \u2014  {total_charm_qty_c} charm(s) needed"
                 f" across {len(charm_items)} order(s)"
             )
+            if n_missing_code:
+                charm_banner_text += (
+                    f"  \u25b6  {n_missing_code} order(s) missing charm-code"
+                    f" assignment \u2014 open supplier_catalog.xlsx"
+                    f" \u2192 Product Map col H (Charm Code)"
+                )
             if unassigned_count:
                 charm_banner_text += (
-                    f"  \u25b6  {unassigned_count} order(s) missing charm-shop assignment"
-                    f" \u2014 open supplier_catalog.xlsx \u2192 Product Map col G (Charm Shop)"
+                    f"  \u25b6  {unassigned_count} order(s) missing charm-shop"
+                    f" assignment \u2014 open supplier_catalog.xlsx"
+                    f" \u2192 Product Map col G (Charm Shop)"
                 )
         charm_banner = ws.cell(row, 1, charm_banner_text)
         charm_banner.font      = Font("Calibri", bold=True, size=13, color="FFFFFF")
@@ -5499,11 +5657,11 @@ def _sheet_route(ws, items: list[ResolvedItem],
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
         if _cshops:
             shop_parts = [f"{s.shop_name}  ({s.stall})" for s in _cshops]
-            shops_label = ("挂件店铺：  " if lang == "zh" else "Charm shops:   ")
+            shops_label = ("\u6302\u4ef6\u5e97\u94fa\uff1a  " if lang == "zh" else "Charm shops:   ")
             shops_text  = shops_label + "   |   ".join(shop_parts)
         else:
             shops_text = (
-                "未配置挂件店铺 — 请在 supplier_catalog.xlsx 的挂件店铺标签中添加"
+                "\u672a\u914d\u7f6e\u6302\u4ef6\u5e97\u94fa \u2014 \u8bf7\u5728 supplier_catalog.xlsx \u7684\u6302\u4ef6\u5e97\u94fa\u6807\u7b7e\u4e2d\u6dfb\u52a0"
                 if lang == "zh"
                 else "No charm shops configured \u2014 add them in the "
                      "'Charm Shops' tab of supplier_catalog.xlsx"
@@ -5516,118 +5674,154 @@ def _sheet_route(ws, items: list[ResolvedItem],
         ws.row_dimensions[row].height = 20
         row += 1
 
-        # --- Charm sub-header row (same column layout as main header) ---
-        for ci, h in enumerate(HDRS, 1):
-            ws.cell(row, ci, h)
-        _style_header(ws, row, COLS)
-        if not _zh_route_compact:
-            # Case and Grip headers muted — always N/A in charm rows
-            ws.cell(row, COL_CASE).fill  = _NA_FILL
-            ws.cell(row, COL_CASE).font  = _CHARM_NA_HDR_FONT
-            ws.cell(row, COL_GRIP).fill  = _NA_FILL
-            ws.cell(row, COL_GRIP).font  = _CHARM_NA_HDR_FONT
-            ws.cell(row, COL_CHARM).fill = _CHARM_HDR_FILL   # vivid purple
-        ws.row_dimensions[row].height = 18
-        row += 1
-
-        # Reuse the pre-computed lookup (charm_shop_name → CharmShop)
-        charm_shop_lookup = _cshops_lookup_tmp
-
-        # Sort charm items: assigned charm shop first, then product title (same
-        # title stacks), then order #.
-        def _charm_sort_key(ri: ResolvedItem) -> tuple[str, str, str]:
-            assigned_name = (ri.supplier.charm_shop if ri.supplier else "") or ""
-            return (assigned_name, _normalize(ri.item.title), ri.order.order_number)
-
+        charm_shop_lookup   = _cshops_lookup_tmp
+        charm_section_cells: list[str] = []
         charm_first_row     = row
-        charm_section_cells: list[str] = []   # feeds charm-section DataValidation
 
-        for cidx, r in enumerate(sorted(charm_items, key=_charm_sort_key)):
-            fill = _CHARM_GROUP_FILLS[cidx % 2]
-            onum = r.order.order_number
-
-            # Resolve assigned charm shop from the catalog entry
-            assigned_name = (r.supplier.charm_shop if r.supplier else "") or ""
-            assigned_cs   = charm_shop_lookup.get(assigned_name)
-
-            if assigned_cs:
-                shop_display  = assigned_cs.shop_name
-                stall_display = assigned_cs.stall
-            elif assigned_name:
-                # Name recorded but not found in Charm Shops tab → flag it
-                shop_display  = f"? {assigned_name}"
-                stall_display = "?"
-            else:
-                # Not yet assigned — prompt user
-                shop_display  = "--"
-                stall_display = "--"
-
-            ws.cell(row, 1, cidx + 1)
-            # col 2 = photo
+        # ===============================================================
+        # SUB-SECTION A — Aggregated charm purchase list (by charm code)
+        # ===============================================================
+        if _charm_agg:
             if _zh_route_compact:
-                ws.cell(row, COL_SUPPLIER, shop_display)
-                ws.cell(row, COL_STALL, stall_display)
+                _CHARM_HDRS = [
+                    "#", _t("Photo", lang),
+                    "\u6302\u4ef6\u7f16\u7801",
+                    "SKU",
+                    "\u6302\u4ef6\u5e97\u94fa",
+                    "\u6446\u4f4d",
+                    _t("Qty", lang),
+                    "\u5907\u6ce8",
+                ]
             else:
-                ws.cell(row, 3, "--")   # separate building — floor label not applicable
-                ws.cell(row, 4, shop_display)
-                ws.cell(row, 5, stall_display)
-                ws.cell(row, 6, title_fn(r.item.title) if title_fn else r.item.title)
-            itp_cell = ws.cell(row, COL_ITEMS_TO_PURCHASE, "\u2014")  # case/grip N/A in charm section
-            itp_cell.alignment = _CENTER
-            itp_cell.font = _ITEMS_TO_PURCHASE_FONT
-
+                _CHARM_HDRS = [
+                    "#", _t("Photo", lang), "",
+                    "Charm Code" if lang != "zh" else "\u6302\u4ef6\u7f16\u7801",
+                    "SKU",
+                    "Charm Shop" if lang != "zh" else "\u6302\u4ef6\u5e97\u94fa",
+                    _t("Stall", lang),
+                    "", "",
+                    _t("Charm", lang),
+                    "",
+                    _t("Qty", lang),
+                    "Orders" if lang != "zh" else "\u5173\u8054\u8ba2\u5355",
+                    "",
+                    "Notes" if lang != "zh" else "\u5907\u6ce8",
+                ]
+            for ci, h in enumerate(_CHARM_HDRS, 1):
+                ws.cell(row, ci, h)
+            _style_header(ws, row, COLS)
             if not _zh_route_compact:
-                # Case and Grip: always N/A in charm rows
-                for na_col in (COL_CASE, COL_GRIP):
-                    nc = ws.cell(row, na_col, _t("N/A", lang))
-                    nc.fill      = _NA_FILL
-                    nc.font      = _NA_FONT
-                    nc.alignment = _CENTER
-
-                # Charm status: the only active component in this section
-                charm_cell = ws.cell(row, COL_CHARM)
-                preserved  = _statuses.get((onum, _normalize(r.item.title)[:50], "charm"))
-                charm_cell.value     = _t(preserved, lang) if preserved else _t("Pending", lang)
-                charm_cell.alignment = _CENTER
-                charm_section_cells.append(charm_cell.coordinate)
-
-            ws.cell(row, COL_PHONE, r.item.phone_model)
-            ws.cell(row, COL_QTY, r.item.quantity)
-            if not _zh_route_compact:
-                # "~#" prefix marks this as a charm-section row for status-reload logic
-                ws.cell(row, 13, f"~#{r.order.order_number}")
-                ws.cell(row, 14, r.order.etsy_shop)
-
-            _style_row(ws, row, COLS, fill=fill)
-            if not _zh_route_compact:
-                # Re-apply N/A styling for Case/Grip after _style_row resets fills
-                for na_col in (COL_CASE, COL_GRIP):
-                    nc = ws.cell(row, na_col)
-                    nc.fill = _NA_FILL
-                    nc.font = _NA_FONT
-                ws.cell(row, COL_CHARM).alignment = _CENTER
-            ws.cell(row, 1).alignment = _CENTER
-            if not _zh_route_compact:
-                ws.cell(row, 3).alignment = _CENTER
-            ws.cell(row, COL_QTY).alignment = _CENTER
-            ws.row_dimensions[row].height = _row_h
-            _ch_ph = _resolve_charm_photo_bytes(
-                r, charm_library, charm_images_dir,
-            ) or r.item.photo_bytes
-            _embed_photo(ws, _ch_ph, row, 2, _photo_px)
+                for _muted_col in (3, 8, 9, 11, 14):
+                    ws.cell(row, _muted_col).fill = _NA_FILL
+                    ws.cell(row, _muted_col).font = _CHARM_NA_HDR_FONT
+                ws.cell(row, COL_CHARM).fill = _CHARM_HDR_FILL
+            ws.row_dimensions[row].height = 18
             row += 1
+            charm_first_row = row
+
+            sorted_codes = sorted(
+                _charm_agg,
+                key=lambda c: (_charm_agg[c]["charm_shop"] or "\uffff", c),
+            )
+
+            for cidx, code in enumerate(sorted_codes):
+                agg  = _charm_agg[code]
+                fill = _CHARM_GROUP_FILLS[cidx % 2]
+
+                _cs_name = agg["charm_shop"] or agg["default_shop"]
+                _cs_obj  = charm_shop_lookup.get(_cs_name)
+                if _cs_obj:
+                    shop_display  = _cs_obj.shop_name
+                    stall_display = _cs_obj.stall
+                elif _cs_name:
+                    shop_display  = f"? {_cs_name}"
+                    stall_display = "?"
+                else:
+                    shop_display  = "--"
+                    stall_display = "--"
+
+                unique_orders  = sorted(set(agg["orders"]))
+                orders_display = ", ".join(f"#{o}" for o in unique_orders)
+                notes_val      = agg["notes"]
+
+                ws.cell(row, 1, cidx + 1)
+                if _zh_route_compact:
+                    ws.cell(row, 3, code)
+                    ws.cell(row, 4, agg["sku"])
+                    ws.cell(row, 5, shop_display)
+                    ws.cell(row, 6, stall_display)
+                    ws.cell(row, 7, agg["total_qty"])
+                    if notes_val:
+                        ws.cell(row, 8, notes_val).alignment = _WRAP
+                else:
+                    ws.cell(row, 3, "")
+                    ws.cell(row, 4, code)
+                    ws.cell(row, 5, agg["sku"])
+                    ws.cell(row, 6, shop_display)
+                    ws.cell(row, 7, stall_display)
+                    ws.cell(row, 8, "")
+                    ws.cell(row, 9, "")
+
+                    preserved = _statuses.get((code, "", "charm_agg"))
+                    if not preserved:
+                        _per_order = []
+                        for _ri in agg["items"]:
+                            _ps = _statuses.get((
+                                _ri.order.order_number,
+                                _normalize(_ri.item.title)[:50],
+                                "charm",
+                            ))
+                            if _ps:
+                                _per_order.append(_ps)
+                        if _per_order:
+                            if any(s == "Out of Production" for s in _per_order):
+                                preserved = "Out of Production"
+                            elif any(s == "Out of Stock" for s in _per_order):
+                                preserved = "Out of Stock"
+                            elif all(s == "Purchased" for s in _per_order):
+                                preserved = "Purchased"
+
+                    charm_cell = ws.cell(row, COL_CHARM)
+                    charm_cell.value     = _t(preserved, lang) if preserved else _t("Pending", lang)
+                    charm_cell.alignment = _CENTER
+                    charm_section_cells.append(charm_cell.coordinate)
+
+                    ws.cell(row, 11, "")
+                    ws.cell(row, 12, agg["total_qty"])
+                    ws.cell(row, 13, f"~C:{code}")
+                    _orders_trunc = orders_display[:60] + ("\u2026" if len(orders_display) > 60 else "")
+                    ws.cell(row, 14, _orders_trunc)
+                    if notes_val:
+                        ws.cell(row, 15, notes_val).alignment = _WRAP
+
+                _style_row(ws, row, COLS, fill=fill)
+                if not _zh_route_compact:
+                    for _na_c in (3, 8, 9, 11):
+                        nc = ws.cell(row, _na_c)
+                        nc.fill = _NA_FILL
+                        nc.font = _NA_FONT
+                    ws.cell(row, COL_CHARM).alignment = _CENTER
+                    _sentinel = ws.cell(row, 13)
+                    _sentinel.font = Font("Calibri", size=7, color="D8D8D8")
+                if notes_val:
+                    ws.cell(row, 15 if not _zh_route_compact else 8).alignment = _WRAP
+                ws.cell(row, 1).alignment = _CENTER
+                ws.cell(row, 4 if not _zh_route_compact else 3).alignment = _CENTER
+                ws.cell(row, 12 if not _zh_route_compact else 7).alignment = _CENTER
+                ws.row_dimensions[row].height = _row_h
+                _embed_photo(ws, agg["photo_bytes"], row, 2, _photo_px)
+                row += 1
 
         charm_last_row = row - 1
 
-        # DataValidation for charm section (same options as main sections)
+        # DataValidation for aggregated charm status cells
         if charm_section_cells:
             dv_charm = DataValidation(**dv_kwargs)
             ws.add_data_validation(dv_charm)
             for coord in charm_section_cells:
                 dv_charm.add(coord)
 
-        # Conditional formatting for charm section rows.
-        # Only the Charm column (COL_CHARM) is active; simple single-column rules.
+        # Conditional formatting for aggregated charm rows
         if not _zh_route_compact and charm_last_row >= charm_first_row:
             charm_range = f"A{charm_first_row}:{col_end}{charm_last_row}"
             cr0 = charm_first_row
@@ -5655,13 +5849,134 @@ def _sheet_route(ws, items: list[ResolvedItem],
                 stopIfTrue=True,
             ))
 
+        # ===============================================================
+        # SUB-SECTION B — Awaiting charm code assignment
+        # ===============================================================
+        if _awaiting_items:
+            row += 1
+            _total_await_qty = sum(r.item.quantity for r in _awaiting_items)
+
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
+            if lang == "zh":
+                _await_text = (
+                    f"\u23f3  \u5f85\u5206\u914d\u6302\u4ef6\u7f16\u7801  \u2014  "
+                    f"{len(_awaiting_items)} \u4e2a\u8ba2\u5355"
+                    f"\uff08{_total_await_qty} \u4ef6\uff09"
+                    f"  \u2192  \u6253\u5f00 supplier_catalog.xlsx"
+                    f" \u2192 Product Map H\u5217 (\u6302\u4ef6\u7f16\u7801)"
+                )
+            else:
+                _await_text = (
+                    f"\u23f3  AWAITING CHARM CODE ASSIGNMENT  \u2014  "
+                    f"{len(_awaiting_items)} order(s)"
+                    f" ({_total_await_qty} unit(s))"
+                    f"  \u2192  open supplier_catalog.xlsx"
+                    f" \u2192 Product Map col H (Charm Code)"
+                )
+            await_cell = ws.cell(row, 1, _await_text)
+            await_cell.font      = Font("Calibri", bold=True, size=11, color="7D4E00")
+            await_cell.fill      = PatternFill("solid", fgColor="FFF3CD")
+            await_cell.border    = _BORDER
+            await_cell.alignment = _CENTER
+            ws.row_dimensions[row].height = 22
+            row += 1
+
+            for ci, h in enumerate(HDRS, 1):
+                ws.cell(row, ci, h)
+            _style_header(ws, row, COLS)
+            if not _zh_route_compact:
+                ws.cell(row, COL_CASE).fill  = _NA_FILL
+                ws.cell(row, COL_CASE).font  = _CHARM_NA_HDR_FONT
+                ws.cell(row, COL_GRIP).fill  = _NA_FILL
+                ws.cell(row, COL_GRIP).font  = _CHARM_NA_HDR_FONT
+                ws.cell(row, COL_CHARM).fill = PatternFill("solid", fgColor="FFF3CD")
+                ws.cell(row, COL_CHARM).font = Font("Calibri", bold=True, size=11, color="7D4E00")
+            ws.row_dimensions[row].height = 18
+            row += 1
+
+            _AWAIT_FILL      = PatternFill("solid", fgColor="FFFBF0")
+            _AWAIT_CODE_FONT = Font("Calibri", size=9, color="7D4E00", italic=True)
+            _AWAIT_CODE_FILL = PatternFill("solid", fgColor="FFF3CD")
+
+            def _await_sort(ri: ResolvedItem) -> tuple[str, str]:
+                return (_normalize(ri.item.title), ri.order.order_number)
+
+            for aidx, r in enumerate(sorted(_awaiting_items, key=_await_sort)):
+                onum = r.order.order_number
+                assigned_name = (r.supplier.charm_shop if r.supplier else "") or ""
+                assigned_cs   = charm_shop_lookup.get(assigned_name)
+                if assigned_cs:
+                    shop_display  = assigned_cs.shop_name
+                    stall_display = assigned_cs.stall
+                elif assigned_name:
+                    shop_display  = f"? {assigned_name}"
+                    stall_display = "?"
+                else:
+                    shop_display  = "--"
+                    stall_display = "--"
+
+                ws.cell(row, 1, aidx + 1)
+                if _zh_route_compact:
+                    ws.cell(row, COL_SUPPLIER, shop_display)
+                    ws.cell(row, COL_STALL, stall_display)
+                else:
+                    ws.cell(row, 3, "--")
+                    ws.cell(row, 4, shop_display)
+                    ws.cell(row, 5, stall_display)
+                    ws.cell(row, 6, title_fn(r.item.title) if title_fn else r.item.title)
+                itp_cell = ws.cell(row, COL_ITEMS_TO_PURCHASE, "\u2014")
+                itp_cell.alignment = _CENTER
+                itp_cell.font = _ITEMS_TO_PURCHASE_FONT
+
+                if not _zh_route_compact:
+                    for na_col in (COL_CASE, COL_GRIP):
+                        nc = ws.cell(row, na_col, _t("N/A", lang))
+                        nc.fill      = _NA_FILL
+                        nc.font      = _NA_FONT
+                        nc.alignment = _CENTER
+                    _await_charm = ws.cell(row, COL_CHARM)
+                    _await_charm.value     = "\u23f3 Awaiting Code" if lang != "zh" else "\u23f3 \u5f85\u5206\u914d"
+                    _await_charm.alignment = _CENTER
+                    _await_charm.font      = _AWAIT_CODE_FONT
+                    _await_charm.fill      = _AWAIT_CODE_FILL
+
+                ws.cell(row, COL_PHONE, r.item.phone_model)
+                ws.cell(row, COL_QTY, r.item.quantity)
+                if not _zh_route_compact:
+                    ws.cell(row, 13, f"~?#{r.order.order_number}")
+                    ws.cell(row, 14, r.order.etsy_shop)
+                if r.order.private_notes:
+                    pn = ws.cell(row, COL_PRIVATE_NOTES, r.order.private_notes)
+                    pn.alignment = _WRAP
+
+                _style_row(ws, row, COLS, fill=_AWAIT_FILL)
+                if not _zh_route_compact:
+                    for na_col in (COL_CASE, COL_GRIP):
+                        nc = ws.cell(row, na_col)
+                        nc.fill = _NA_FILL
+                        nc.font = _NA_FONT
+                    _await_charm = ws.cell(row, COL_CHARM)
+                    _await_charm.font = _AWAIT_CODE_FONT
+                    _await_charm.fill = _AWAIT_CODE_FILL
+                    _await_charm.alignment = _CENTER
+                if r.order.private_notes:
+                    ws.cell(row, COL_PRIVATE_NOTES).alignment = _WRAP
+                ws.cell(row, 1).alignment = _CENTER
+                if not _zh_route_compact:
+                    ws.cell(row, 3).alignment = _CENTER
+                ws.cell(row, COL_QTY).alignment = _CENTER
+                ws.row_dimensions[row].height = _row_h
+                _embed_photo(ws, r.item.photo_bytes, row, 2, _photo_px)
+                row += 1
+
+
     # -- Column widths, freeze, filter
     # Product narrowed (26) so Items to Purchase (14) is more prominent
     _photo_col_w = ZH_PHOTO_COL_W if lang == "zh" else PHOTO_COL_W
     if _zh_route_compact:
-        col_widths = [4, _photo_col_w, 13, 9, 14, 18, 4]
+        col_widths = [4, _photo_col_w, 13, 9, 14, 18, 4, 28]
     else:
-        col_widths = [4, _photo_col_w, 6, 13, 9, 26, 14, 10, 10, 10, 18, 4, 16, 15]
+        col_widths = [4, _photo_col_w, 6, 13, 9, 26, 14, 10, 10, 10, 18, 4, 16, 15, 32]
     for ci, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(ci)].width = w
 
@@ -5685,6 +6000,7 @@ def _sheet_orders(ws, items: list[ResolvedItem], lang: str = "en", title_fn=None
             _t("Order Date", lang), _t("Photo", lang),
             _t("Phone Model", lang), _t("Qty", lang),
             _t("Supplier", lang), _t("Stall", lang), _t("Match %", lang),
+            _t("Private Notes", lang),
         ]
     else:
         HDRS = [
@@ -5694,6 +6010,7 @@ def _sheet_orders(ws, items: list[ResolvedItem], lang: str = "en", title_fn=None
             _t("Case", lang), _t("Grip", lang), _t("Charm", lang),
             _t("Phone Model", lang), _t("Qty", lang),
             _t("Supplier", lang), _t("Stall", lang), _t("Match %", lang),
+            _t("Private Notes", lang),
         ]
     COLS = len(HDRS)
 
@@ -5710,8 +6027,8 @@ def _sheet_orders(ws, items: list[ResolvedItem], lang: str = "en", title_fn=None
     row = 2
     for r in sorted(items, key=lambda x: x.order.order_number):
         if lang == "zh":
-            _b, _s, _c, _od, _ph, _pm, _q, _su, _st, _m = (
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+            _b, _s, _c, _od, _ph, _pm, _q, _su, _st, _m, _pn = (
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
             )
             ws.cell(row, _b,  r.order.buyer_name)
             ws.cell(row, _s,  r.order.ship_to_name)
@@ -5722,13 +6039,15 @@ def _sheet_orders(ws, items: list[ResolvedItem], lang: str = "en", title_fn=None
             ws.cell(row, _su, (r.supplier.shop_name or "--") if r.supplier else "--")
             ws.cell(row, _st, (r.supplier.stall or "--")     if r.supplier else "--")
             ws.cell(row, _m,  f"{r.match_score:.0f}%"        if r.supplier else "--")
+            if r.order.private_notes:
+                ws.cell(row, _pn, r.order.private_notes).alignment = _WRAP
             center_cols = (_q, _m)
         else:
             case, grip, charm = _style_flags(r.item.style)
             ws.cell(row, 1, f"#{r.order.order_number}")
             ws.cell(row, 2, r.order.etsy_shop)
-            _b, _s, _c, _od, _ph, _pr, _ca, _g, _ch, _pm, _q, _su, _st, _m = (
-                3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
+            _b, _s, _c, _od, _ph, _pr, _ca, _g, _ch, _pm, _q, _su, _st, _m, _pn = (
+                3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
             )
             ws.cell(row, _b,  r.order.buyer_name)
             ws.cell(row, _s,  r.order.ship_to_name)
@@ -5743,6 +6062,8 @@ def _sheet_orders(ws, items: list[ResolvedItem], lang: str = "en", title_fn=None
             ws.cell(row, _su, (r.supplier.shop_name or "--") if r.supplier else "--")
             ws.cell(row, _st, (r.supplier.stall or "--")     if r.supplier else "--")
             ws.cell(row, _m,  f"{r.match_score:.0f}%"        if r.supplier else "--")
+            if r.order.private_notes:
+                ws.cell(row, _pn, r.order.private_notes).alignment = _WRAP
             center_cols = (_ca, _g, _ch, _q, _m)
 
         if not r.supplier or _needs_catalog_entry(r):
@@ -5754,6 +6075,8 @@ def _sheet_orders(ws, items: list[ResolvedItem], lang: str = "en", title_fn=None
         _style_row(ws, row, COLS, fill=fill)
         for cc in center_cols:
             ws.cell(row, cc).alignment = _CENTER
+        if r.order.private_notes:
+            ws.cell(row, _pn).alignment = _WRAP
         ws.row_dimensions[row].height = ROW_HEIGHT
         _, _, _has_charm = _style_has(r.item.style)
         _od_ph = (
@@ -5765,9 +6088,9 @@ def _sheet_orders(ws, items: list[ResolvedItem], lang: str = "en", title_fn=None
         row += 1
 
     if lang == "zh":
-        col_widths = [18, 18, 14, 14, PHOTO_COL_W, 18, 4, 14, 10, 10]
+        col_widths = [18, 18, 14, 14, PHOTO_COL_W, 18, 4, 14, 10, 10, 28]
     else:
-        col_widths = [16, 18, 16, 18, 14, 14, PHOTO_COL_W, 52, 6, 6, 7, 18, 4, 14, 10, 10]
+        col_widths = [16, 18, 16, 18, 14, 14, PHOTO_COL_W, 52, 6, 6, 7, 18, 4, 14, 10, 10, 32]
     for ci, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(ci)].width = w
 
@@ -5911,6 +6234,590 @@ def generate_xlsx(items: list[ResolvedItem], output: Path,
 
     wb.save(output)
     log.info("Saved -> %s", output.resolve())
+
+
+# ---------------------------------------------------------------------------
+# Simplified Shopping Route — single-sheet, minimal columns
+# ---------------------------------------------------------------------------
+#
+# Section 1 — Cases / Grips (10 columns):
+#   # | Photo | Supplier | Stall | Items to Purchase | Case | Grip |
+#   Phone Model | Qty | Private Notes
+#
+# Section 2 — Charms aggregated by code (same 10-column grid):
+#   # | Photo | Charm Code | Charm Shop | Stall | Charm | — | — | Qty |
+#   Private Notes
+# ---------------------------------------------------------------------------
+
+def _sheet_route_simple(
+    ws,
+    items: list[ResolvedItem],
+    statuses: dict[tuple[str, str], str] | None = None,
+    charm_shops: list[CharmShop] | None = None,
+    charm_library: dict[str, CharmLibraryEntry] | None = None,
+    charm_images_dir: Path | None = None,
+) -> None:
+    ws.title = "Shopping Route"
+    ws.sheet_properties.tabColor = "1F4E79"
+
+    COLS    = 10
+    col_end = get_column_letter(COLS)
+    HDR_ROW = 4
+
+    # ── Section 1 column positions ───────────────────────────────────────
+    S1_PHOTO    = 2
+    S1_SUPPLIER = 3
+    S1_STALL    = 4
+    S1_ITP      = 5   # Items to Purchase
+    S1_CASE     = 6
+    S1_GRIP     = 7
+    S1_PHONE    = 8
+    S1_QTY      = 9
+    S1_NOTES    = 10
+
+    # ── Section 2 column positions (same grid, different semantics) ───────
+    S2_PHOTO       = 2
+    S2_CHARM_CODE  = 3
+    S2_CHARM_SHOP  = 4
+    S2_STALL       = 5
+    S2_CHARM       = 6
+    # cols 7-8 intentionally blank / N/A
+    S2_QTY         = 9
+    S2_NOTES       = 10
+
+    _statuses  = statuses or {}
+    _row_h     = ROW_HEIGHT
+    _photo_px  = PHOTO_PX
+    _photo_col_w = PHOTO_COL_W
+
+    # ── Classify items ────────────────────────────────────────────────────
+    def _has_loc(r: ResolvedItem) -> bool:
+        return bool(r.supplier and (r.supplier.shop_name or r.supplier.stall))
+
+    routable   = [r for r in items if _has_loc(r)]
+    needs_info = [r for r in items if r.supplier and not _has_loc(r) and not _needs_catalog_entry(r)]
+    unmatched  = [r for r in items if not r.supplier or _needs_catalog_entry(r)]
+    charm_items = [r for r in items if _style_has(r.item.style)[2]]
+
+    total_charm_qty = sum(r.item.quantity for r in charm_items)
+    supplier_stops  = len({(r.supplier.shop_name, r.supplier.stall) for r in routable})
+    order_count     = len({r.order.order_number for r in items})
+
+    # ── Title ─────────────────────────────────────────────────────────────
+    ws.merge_cells(f"A1:{col_end}1")
+    ws.cell(1, 1, f"Shopping Route  --  {date.today().strftime('%B %d, %Y')}").font = _TITLE_FONT
+    ws.row_dimensions[1].height = 36
+
+    # ── Subtitle ──────────────────────────────────────────────────────────
+    ws.merge_cells(f"A2:{col_end}2")
+    sub_parts = [
+        f"{len(items)} items",
+        f"{order_count} orders",
+        f"{supplier_stops} supplier stops",
+        "sorted lowest to highest floor",
+    ]
+    if charm_items:
+        sub_parts.append(f"{total_charm_qty} charm(s) needed \u2014 separate building")
+    if needs_info:
+        sub_parts.append(f"{len(needs_info)} awaiting supplier info")
+    if unmatched:
+        sub_parts.append(f"{len(unmatched)} unmatched")
+    ws.cell(2, 1, "  |  ".join(sub_parts)).font = _SUB_FONT
+    ws.row_dimensions[2].height = 24
+
+    # ── Legend ────────────────────────────────────────────────────────────
+    ws.merge_cells(f"A3:{col_end}3")
+    ws.cell(3, 1,
+        "Status:  Pending (white)   |   Purchased (green)"
+        "   |   Out of Stock (amber)   |   Out of Production (red)"
+        "   |   N/A (gray)"
+    ).font = Font("Calibri", size=9, italic=True, color="555555")
+    ws.row_dimensions[3].height = 14
+
+    # ── Section 1 header row ──────────────────────────────────────────────
+    S1_HDRS = [
+        "#", "Photo", "Supplier", "Stall",
+        "Items to Purchase", "Case", "Grip",
+        "Phone Model", "Qty", "Private Notes",
+    ]
+    for ci, h in enumerate(S1_HDRS, 1):
+        ws.cell(HDR_ROW, ci, h)
+    _style_header(ws, HDR_ROW, COLS)
+    ws.cell(HDR_ROW, S1_ITP ).fill = PatternFill("solid", fgColor="2E7D32")
+    ws.cell(HDR_ROW, S1_CASE).fill = PatternFill("solid", fgColor="1A6B3C")
+    ws.cell(HDR_ROW, S1_GRIP).fill = PatternFill("solid", fgColor="1A3D6B")
+    ws.row_dimensions[HDR_ROW].height = 18
+
+    # ── Group routable items by supplier ──────────────────────────────────
+    groups: dict[tuple[str, str], list[ResolvedItem]] = defaultdict(list)
+    for r in routable:
+        groups[(r.supplier.shop_name, r.supplier.stall)].append(r)
+    for gk in groups:
+        groups[gk].sort(key=_route_item_sort_key)
+    sorted_keys = sorted(
+        groups,
+        key=lambda k: (_stall_floor(k[1]), k[1] or "\uffff", k[0]),
+    )
+
+    active_case_cells: list[str] = []
+    active_grip_cells: list[str] = []
+    row = HDR_ROW + 1
+    first_data_row = row
+    seq = 1
+
+    _status_opts = STATUS_OPTIONS
+    dv_formula   = f'"{",".join(_status_opts)}"'
+    dv_kwargs    = dict(
+        type="list", formula1=dv_formula, allow_blank=False, showDropDown=False,
+        showErrorMessage=True,
+        error="Pick a value from the dropdown.", errorTitle="Invalid status",
+    )
+
+    def _write_comp(ws, row, col, has_component, active_cells, order_num="", comp="", item_title=""):
+        cell = ws.cell(row, col)
+        if has_component:
+            nt  = _normalize(item_title)[:50]
+            prv = _statuses.get((order_num, nt, comp))
+            cell.value     = _t(prv, "en") if prv else "Pending"
+            cell.alignment = _CENTER
+            active_cells.append(cell.coordinate)
+        else:
+            cell.value     = "N/A"
+            cell.fill      = _NA_FILL
+            cell.font      = _NA_FONT
+            cell.alignment = _CENTER
+
+    def _write_s1_row(ws, row, r: ResolvedItem, fill, supplier_display, stall_display):
+        nonlocal seq
+        has_case, has_grip, _ = _style_has(r.item.style)
+        onum = r.order.order_number
+        nt   = _normalize(r.item.title)[:50]
+        case_st = _statuses.get((onum, nt, "case"))
+        grip_st = _statuses.get((onum, nt, "grip"))
+        items_label = _items_to_purchase(has_case, has_grip, case_st, grip_st, "en")
+
+        ws.cell(row, 1, seq)
+        ws.cell(row, S1_SUPPLIER, supplier_display)
+        ws.cell(row, S1_STALL, stall_display)
+        itp = ws.cell(row, S1_ITP, items_label)
+        itp.alignment = _CENTER
+        itp.font      = _ITEMS_TO_PURCHASE_FONT
+        _write_comp(ws, row, S1_CASE, has_case, active_case_cells, onum, "case", r.item.title)
+        _write_comp(ws, row, S1_GRIP, has_grip, active_grip_cells, onum, "grip", r.item.title)
+        ws.cell(row, S1_PHONE, r.item.phone_model)
+        ws.cell(row, S1_QTY,   r.item.quantity)
+        if r.order.private_notes:
+            ws.cell(row, S1_NOTES, r.order.private_notes).alignment = _WRAP
+
+        _style_row(ws, row, COLS, fill=fill)
+        for ci, has in ((S1_CASE, has_case), (S1_GRIP, has_grip)):
+            c = ws.cell(row, ci)
+            if not has:
+                c.fill = _NA_FILL
+                c.font = _NA_FONT
+            else:
+                c.alignment = _CENTER
+        if r.order.private_notes:
+            ws.cell(row, S1_NOTES).alignment = _WRAP
+        ws.cell(row, 1).alignment      = _CENTER
+        ws.cell(row, S1_QTY).alignment = _CENTER
+        ws.row_dimensions[row].height  = _row_h
+        _embed_photo(ws, r.item.photo_bytes, row, S1_PHOTO, _photo_px)
+        seq += 1
+
+    # ── Routable rows ─────────────────────────────────────────────────────
+    for gidx, key in enumerate(sorted_keys):
+        fill = _GROUP_FILLS[gidx % 2]
+        for r in groups[key]:
+            _write_s1_row(ws, row, r, fill,
+                          r.supplier.shop_name or "--",
+                          r.supplier.stall     or "--")
+            row += 1
+
+    # ── Needs Supplier Info ───────────────────────────────────────────────
+    if needs_info:
+        row += 1
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
+        ni = ws.cell(row, 1,
+            "(~)  In Catalog \u2013 Awaiting Supplier Info  "
+            "\u2192  open supplier_catalog.xlsx and fill in Shop Name + Stall"
+        )
+        ni.font   = Font("Calibri", bold=True, size=11, color="1F4E79")
+        ni.fill   = PatternFill("solid", fgColor="BDD7EE")
+        ni.border = _BORDER
+        row += 1
+        for r in sorted(needs_info, key=_route_item_sort_key):
+            _write_s1_row(ws, row, r, _NEEDSINFO_FILL,
+                          r.supplier.shop_name or "\u2014",
+                          r.supplier.stall     or "\u2014")
+            # Re-apply needs-info font to non-N/A cells after _write_s1_row
+            for ci in range(1, COLS + 1):
+                c = ws.cell(row, ci)
+                if c.fill.fgColor.value != "EFEFEF":   # skip N/A cells
+                    c.font = _NEEDSINFO_FONT
+            row += 1
+
+    # ── Unmatched ─────────────────────────────────────────────────────────
+    if unmatched:
+        row += 1
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
+        warn = ws.cell(row, 1, "(!!)  Unmatched Items \u2014 supplier not found in catalog")
+        warn.font   = Font("Calibri", bold=True, size=11, color="856404")
+        warn.fill   = _WARN_FILL
+        warn.border = _BORDER
+        row += 1
+        for r in sorted(unmatched, key=_route_item_sort_key):
+            _write_s1_row(ws, row, r, _WARN_FILL, "???", "???")
+            for ci in range(1, COLS + 1):
+                ws.cell(row, ci).font = _WARN_FONT
+            row += 1
+
+    last_data_row = row - 1
+
+    # ── Status dropdowns for Case / Grip ──────────────────────────────────
+    for cell_list in (active_case_cells, active_grip_cells):
+        if cell_list:
+            dv = DataValidation(**dv_kwargs)
+            ws.add_data_validation(dv)
+            for coord in cell_list:
+                dv.add(coord)
+
+    # ── Conditional formatting for Section 1 ──────────────────────────────
+    if last_data_row >= first_data_row:
+        s1_range = f"A{first_data_row}:{col_end}{last_data_row}"
+        r0 = first_data_row
+        gc = f"${get_column_letter(S1_CASE)}"
+        hc = f"${get_column_letter(S1_GRIP)}"
+        ws.conditional_formatting.add(s1_range, FormulaRule(
+            formula=[f'OR({gc}{r0}="Out of Production",{hc}{r0}="Out of Production")'],
+            fill=_STATUS_FILLS["Out of Production"], font=_STATUS_FONTS["Out of Production"], stopIfTrue=True,
+        ))
+        ws.conditional_formatting.add(s1_range, FormulaRule(
+            formula=[f'AND(OR({gc}{r0}="Out of Stock",{hc}{r0}="Out of Stock"),'
+                     f'NOT(OR({gc}{r0}="Out of Production",{hc}{r0}="Out of Production")))'],
+            fill=_STATUS_FILLS["Out of Stock"], font=_STATUS_FONTS["Out of Stock"], stopIfTrue=True,
+        ))
+        ws.conditional_formatting.add(s1_range, FormulaRule(
+            formula=[f'AND(OR({gc}{r0}="N/A",{gc}{r0}="Purchased"),'
+                     f'OR({hc}{r0}="N/A",{hc}{r0}="Purchased"))'],
+            fill=_STATUS_FILLS["Purchased"], font=_STATUS_FONTS["Purchased"], stopIfTrue=True,
+        ))
+
+    # =========================================================================
+    # SECTION 2 — CHARMS (aggregated by charm code)
+    # =========================================================================
+    if charm_items:
+        row += 1
+
+        _cshops        = charm_shops or []
+        _cshops_lookup = {cs.shop_name: cs for cs in _cshops}
+        total_charm_qty_c = sum(r.item.quantity for r in charm_items)
+
+        # Partition coded vs awaiting
+        _coded_items:    list[ResolvedItem] = []
+        _awaiting_items: list[ResolvedItem] = []
+        for _ci in charm_items:
+            _cc = (_ci.supplier.charm_code if _ci.supplier else "").strip()
+            (_coded_items if _cc else _awaiting_items).append(_ci)
+
+        # Aggregate by charm code
+        _charm_agg: dict[str, dict] = {}
+        for _ci in _coded_items:
+            _cc = _ci.supplier.charm_code.strip()
+            if _cc not in _charm_agg:
+                _lib = (charm_library or {}).get(_cc)
+                _charm_agg[_cc] = {
+                    "code": _cc,
+                    "default_shop": _lib.default_charm_shop if _lib else "",
+                    "photo_bytes": charm_photo_bytes_from_folder(_cc, charm_images_dir)
+                                   or (_lib.photo_bytes if _lib else None),
+                    "charm_shop": "",
+                    "total_qty": 0,
+                    "orders": [],
+                    "items": [],
+                }
+            _charm_agg[_cc]["total_qty"] += _ci.item.quantity
+            _charm_agg[_cc]["orders"].append(_ci.order.order_number)
+            _charm_agg[_cc]["items"].append(_ci)
+            if not _charm_agg[_cc]["charm_shop"]:
+                _as = (_ci.supplier.charm_shop if _ci.supplier else "").strip()
+                if _as:
+                    _charm_agg[_cc]["charm_shop"] = _as
+
+        n_missing_code   = len(_awaiting_items)
+        unassigned_count = sum(
+            1 for r in charm_items
+            if not (r.supplier and r.supplier.charm_shop and r.supplier.charm_shop in _cshops_lookup)
+        )
+
+        # ── Charm banner ──────────────────────────────────────────────────
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
+        cb_text = (
+            f"\u2728  CHARMS TO PURCHASE  \u2014  SEPARATE BUILDING"
+            f"  \u2014  {total_charm_qty_c} charm(s) needed across {len(charm_items)} order(s)"
+        )
+        if n_missing_code:
+            cb_text += f"  \u25b6  {n_missing_code} order(s) missing charm-code assignment"
+        if unassigned_count:
+            cb_text += f"  \u25b6  {unassigned_count} order(s) missing charm-shop assignment"
+        cb = ws.cell(row, 1, cb_text)
+        cb.font      = Font("Calibri", bold=True, size=13, color="FFFFFF")
+        cb.fill      = _CHARM_BANNER_FILL
+        cb.border    = _BORDER
+        cb.alignment = _CENTER
+        ws.row_dimensions[row].height = 26
+        row += 1
+
+        # ── Charm shops reference ─────────────────────────────────────────
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
+        if _cshops:
+            shops_text = "Charm shops:   " + "   |   ".join(
+                f"{s.shop_name}  ({s.stall})" for s in _cshops
+            )
+        else:
+            shops_text = "No charm shops configured \u2014 add them in the 'Charm Shops' tab"
+        sr = ws.cell(row, 1, shops_text)
+        sr.font      = Font("Calibri", bold=True, size=10, color="3D1359")
+        sr.fill      = _CHARM_SHOPS_FILL
+        sr.border    = _BORDER
+        sr.alignment = _CENTER
+        ws.row_dimensions[row].height = 20
+        row += 1
+
+        # ── Section 2 sub-header ─────────────────────────────────────────
+        S2_HDRS = [
+            "#", "Photo", "Charm Code", "Charm Shop", "Stall",
+            "Charm", "", "", "Qty", "Private Notes",
+        ]
+        for ci, h in enumerate(S2_HDRS, 1):
+            ws.cell(row, ci, h)
+        _style_header(ws, row, COLS)
+        ws.cell(row, S2_CHARM).fill = _CHARM_HDR_FILL
+        for _mc in (7, 8):
+            ws.cell(row, _mc).fill = _NA_FILL
+            ws.cell(row, _mc).font = _CHARM_NA_HDR_FONT
+        ws.row_dimensions[row].height = 18
+        row += 1
+
+        charm_first_row     = row
+        charm_section_cells: list[str] = []
+
+        # ── Aggregated charm rows ─────────────────────────────────────────
+        sorted_codes = sorted(
+            _charm_agg,
+            key=lambda c: (_charm_agg[c]["charm_shop"] or "\uffff", c),
+        )
+        for cidx, code in enumerate(sorted_codes):
+            agg  = _charm_agg[code]
+            fill = _CHARM_GROUP_FILLS[cidx % 2]
+
+            _cs_name = agg["charm_shop"] or agg["default_shop"]
+            _cs_obj  = _cshops_lookup.get(_cs_name)
+            if _cs_obj:
+                shop_disp  = _cs_obj.shop_name
+                stall_disp = _cs_obj.stall
+            elif _cs_name:
+                shop_disp  = f"? {_cs_name}"
+                stall_disp = "?"
+            else:
+                shop_disp  = "--"
+                stall_disp = "--"
+
+            preserved = _statuses.get((code, "", "charm_agg"))
+            if not preserved:
+                _per_order = []
+                for _ri in agg["items"]:
+                    _ps = _statuses.get((_ri.order.order_number, _normalize(_ri.item.title)[:50], "charm"))
+                    if _ps:
+                        _per_order.append(_ps)
+                if _per_order:
+                    if any(s == "Out of Production" for s in _per_order):
+                        preserved = "Out of Production"
+                    elif any(s == "Out of Stock" for s in _per_order):
+                        preserved = "Out of Stock"
+                    elif all(s == "Purchased" for s in _per_order):
+                        preserved = "Purchased"
+
+            # Collect private notes from all orders (deduplicated)
+            _all_notes: list[str] = []
+            _seen_notes: set[str] = set()
+            for _ri in agg["items"]:
+                _pn = (_ri.order.private_notes or "").strip()
+                if _pn and _pn not in _seen_notes:
+                    _all_notes.append(_pn)
+                    _seen_notes.add(_pn)
+
+            ws.cell(row, 1, cidx + 1)
+            ws.cell(row, S2_CHARM_CODE, code)
+            ws.cell(row, S2_CHARM_SHOP, shop_disp)
+            ws.cell(row, S2_STALL,      stall_disp)
+            charm_cell = ws.cell(row, S2_CHARM)
+            charm_cell.value     = _t(preserved, "en") if preserved else "Pending"
+            charm_cell.alignment = _CENTER
+            charm_section_cells.append(charm_cell.coordinate)
+            ws.cell(row, S2_QTY, agg["total_qty"])
+            if _all_notes:
+                ws.cell(row, S2_NOTES, "; ".join(_all_notes)).alignment = _WRAP
+
+            _style_row(ws, row, COLS, fill=fill)
+            for _mc in (7, 8):
+                ws.cell(row, _mc).fill = _NA_FILL
+                ws.cell(row, _mc).font = _NA_FONT
+            ws.cell(row, S2_CHARM).alignment      = _CENTER
+            ws.cell(row, 1).alignment             = _CENTER
+            ws.cell(row, S2_CHARM_CODE).alignment = _CENTER
+            ws.cell(row, S2_QTY).alignment        = _CENTER
+            if _all_notes:
+                ws.cell(row, S2_NOTES).alignment = _WRAP
+            ws.row_dimensions[row].height = _row_h
+            _embed_photo(ws, agg["photo_bytes"], row, S2_PHOTO, _photo_px)
+            row += 1
+
+        charm_last_row = row - 1
+
+        # ── Charm status dropdowns ────────────────────────────────────────
+        if charm_section_cells:
+            dv_charm = DataValidation(**dv_kwargs)
+            ws.add_data_validation(dv_charm)
+            for coord in charm_section_cells:
+                dv_charm.add(coord)
+
+        # ── Conditional formatting for Section 2 ──────────────────────────
+        if charm_last_row >= charm_first_row:
+            c2_range = f"A{charm_first_row}:{col_end}{charm_last_row}"
+            ic       = f"${get_column_letter(S2_CHARM)}"
+            cr0      = charm_first_row
+            ws.conditional_formatting.add(c2_range, FormulaRule(
+                formula=[f'{ic}{cr0}="Out of Production"'],
+                fill=_STATUS_FILLS["Out of Production"], font=_STATUS_FONTS["Out of Production"], stopIfTrue=True,
+            ))
+            ws.conditional_formatting.add(c2_range, FormulaRule(
+                formula=[f'{ic}{cr0}="Out of Stock"'],
+                fill=_STATUS_FILLS["Out of Stock"], font=_STATUS_FONTS["Out of Stock"], stopIfTrue=True,
+            ))
+            ws.conditional_formatting.add(c2_range, FormulaRule(
+                formula=[f'{ic}{cr0}="Purchased"'],
+                fill=_STATUS_FILLS["Purchased"], font=_STATUS_FONTS["Purchased"], stopIfTrue=True,
+            ))
+
+        # ── Awaiting charm code sub-section ──────────────────────────────
+        if _awaiting_items:
+            row += 1
+            _total_await_qty = sum(r.item.quantity for r in _awaiting_items)
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
+            aw = ws.cell(row, 1,
+                f"\u23f3  AWAITING CHARM CODE ASSIGNMENT  \u2014  "
+                f"{len(_awaiting_items)} order(s) ({_total_await_qty} unit(s))"
+                f"  \u2192  open supplier_catalog.xlsx \u2192 Product Map col H (Charm Code)"
+            )
+            aw.font      = Font("Calibri", bold=True, size=11, color="7D4E00")
+            aw.fill      = PatternFill("solid", fgColor="FFF3CD")
+            aw.border    = _BORDER
+            aw.alignment = _CENTER
+            ws.row_dimensions[row].height = 22
+            row += 1
+
+            for ci, h in enumerate(S2_HDRS, 1):
+                ws.cell(row, ci, h)
+            _style_header(ws, row, COLS)
+            ws.cell(row, S2_CHARM).fill = PatternFill("solid", fgColor="FFF3CD")
+            ws.cell(row, S2_CHARM).font = Font("Calibri", bold=True, size=11, color="7D4E00")
+            for _mc in (7, 8):
+                ws.cell(row, _mc).fill = _NA_FILL
+                ws.cell(row, _mc).font = _CHARM_NA_HDR_FONT
+            ws.row_dimensions[row].height = 18
+            row += 1
+
+            _AWAIT_FILL      = PatternFill("solid", fgColor="FFFBF0")
+            _AWAIT_CODE_FONT = Font("Calibri", size=9, color="7D4E00", italic=True)
+            _AWAIT_CODE_FILL = PatternFill("solid", fgColor="FFF3CD")
+
+            for aidx, r in enumerate(sorted(
+                _awaiting_items,
+                key=lambda ri: (_normalize(ri.item.title), ri.order.order_number),
+            )):
+                assigned_name = (r.supplier.charm_shop if r.supplier else "") or ""
+                assigned_cs   = _cshops_lookup.get(assigned_name)
+                if assigned_cs:
+                    shop_disp  = assigned_cs.shop_name
+                    stall_disp = assigned_cs.stall
+                elif assigned_name:
+                    shop_disp  = f"? {assigned_name}"
+                    stall_disp = "?"
+                else:
+                    shop_disp  = "--"
+                    stall_disp = "--"
+
+                ws.cell(row, 1, aidx + 1)
+                ws.cell(row, S2_CHARM_CODE, "\u2014")
+                ws.cell(row, S2_CHARM_SHOP, shop_disp)
+                ws.cell(row, S2_STALL,      stall_disp)
+                _ac = ws.cell(row, S2_CHARM, "\u23f3 Awaiting Code")
+                _ac.alignment = _CENTER
+                _ac.font      = _AWAIT_CODE_FONT
+                _ac.fill      = _AWAIT_CODE_FILL
+                ws.cell(row, S2_QTY, r.item.quantity)
+                if r.order.private_notes:
+                    ws.cell(row, S2_NOTES, r.order.private_notes).alignment = _WRAP
+
+                _style_row(ws, row, COLS, fill=_AWAIT_FILL)
+                _ac = ws.cell(row, S2_CHARM)
+                _ac.font = _AWAIT_CODE_FONT
+                _ac.fill = _AWAIT_CODE_FILL
+                _ac.alignment = _CENTER
+                for _mc in (7, 8):
+                    ws.cell(row, _mc).fill = _NA_FILL
+                    ws.cell(row, _mc).font = _NA_FONT
+                if r.order.private_notes:
+                    ws.cell(row, S2_NOTES).alignment = _WRAP
+                ws.cell(row, 1).alignment      = _CENTER
+                ws.cell(row, S2_QTY).alignment = _CENTER
+                ws.row_dimensions[row].height  = _row_h
+                _embed_photo(ws, r.item.photo_bytes, row, S2_PHOTO, _photo_px)
+                row += 1
+
+    # ── Column widths ─────────────────────────────────────────────────────
+    # #  | Photo       | Supplier/Code | Shop/Supplier | Stall/Stall |
+    # ITP/Charm | Case/— | Grip/— | Phone/Qty | Qty/Notes
+    col_widths = [4, _photo_col_w, 14, 14, 9, 10, 8, 8, 18, 32]
+    for ci, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+
+    ws.freeze_panes = "A5"
+    if last_data_row >= first_data_row:
+        ws.auto_filter.ref = f"A{HDR_ROW}:{col_end}{last_data_row}"
+
+
+def generate_xlsx_simple(
+    items: list[ResolvedItem],
+    output: Path,
+    statuses: dict[tuple[str, str], str] | None = None,
+    charm_shops: list[CharmShop] | None = None,
+    charm_library: dict[str, CharmLibraryEntry] | None = None,
+    charm_images_dir: Path | None = None,
+) -> None:
+    """Generate the simplified single-sheet shopping route workbook."""
+    wb = openpyxl.Workbook()
+    _sheet_route_simple(
+        wb.active, items,
+        statuses=statuses,
+        charm_shops=charm_shops,
+        charm_library=charm_library,
+        charm_images_dir=charm_images_dir,
+    )
+    from openpyxl.worksheet.page import PageMargins
+    ws = wb.active
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize   = ws.PAPERSIZE_A4
+    ws.page_setup.fitToPage   = True
+    ws.page_setup.fitToWidth  = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_margins = PageMargins(
+        left=0.4, right=0.4, top=0.6, bottom=0.6, header=0.3, footer=0.3,
+    )
+    wb.save(output)
+    log.info("Simple route saved -> %s", output.resolve())
 
 
 # ---------------------------------------------------------------------------
@@ -6068,6 +6975,7 @@ def _html_item_card(r: ResolvedItem, seq: int, row_cls: str, lang: str,
         title_display, shop_disp, stall_disp, floor_disp,
         r.item.phone_model, order_ref,
         getattr(r.order, "etsy_shop", ""),
+        r.order.private_notes,
     ])).lower().replace('"', '')
 
     floor_td = (
@@ -6100,6 +7008,13 @@ def _html_item_card(r: ResolvedItem, seq: int, row_cls: str, lang: str,
         if _zh_html_compact else
         f'  <td data-label="{_t("Order #", lang)}" class="col-order">{order_ref}</td>\n'
     )
+    _pn_text = r.order.private_notes
+    private_notes_td = (
+        f'  <td data-label="{_t("Private Notes", lang)}" class="col-private-notes">'
+        f'{_pn_text}</td>\n'
+        if _pn_text else
+        f'  <td data-label="{_t("Private Notes", lang)}" class="col-private-notes"></td>\n'
+    )
 
     # Embed order + norm keys on the <tr> so JS can recompute row colour
     # after any status change without re-parsing each cell's skey string.
@@ -6119,6 +7034,173 @@ def _html_item_card(r: ResolvedItem, seq: int, row_cls: str, lang: str,
         f'  <td data-label="{_t("Qty", lang)}" class="col-qty">{r.item.quantity}</td>\n'
         f'{order_td}'
         f'  {etsy_td}\n'
+        f'{private_notes_td}'
+        f'</tr>'
+    )
+
+
+def _html_charm_agg_card(
+    seq: int, agg: dict, row_cls: str, lang: str,
+    statuses: dict | None = None,
+    charm_shop_lookup: dict | None = None,
+    charm_library: dict[str, CharmLibraryEntry] | None = None,
+    charm_images_dir: Path | None = None,
+) -> str:
+    """Render one aggregated charm row as a responsive <tr> for the HTML route."""
+    _statuses = statuses or {}
+    code      = agg["code"]
+    sku       = agg["sku"]
+    notes     = agg["notes"]
+
+    cs_lookup = charm_shop_lookup or {}
+    _cs_name  = agg.get("charm_shop") or agg.get("default_shop") or ""
+    _cs_obj   = cs_lookup.get(_cs_name)
+    if _cs_obj:
+        shop_disp  = _cs_obj.shop_name
+        stall_disp = _cs_obj.stall
+    elif _cs_name:
+        shop_disp  = f"? {_cs_name}"
+        stall_disp = "?"
+    else:
+        shop_disp  = "--"
+        stall_disp = "--"
+
+    unique_orders  = sorted(set(agg["orders"]))
+    orders_display = ", ".join(f"#{o}" for o in unique_orders)
+
+    preserved = _statuses.get((code, "", "charm_agg"))
+    if not preserved:
+        _per_order = []
+        for _ri in agg["items"]:
+            _ps = _statuses.get((
+                _ri.order.order_number,
+                _normalize(_ri.item.title)[:50],
+                "charm",
+            ))
+            if _ps:
+                _per_order.append(_ps)
+        if _per_order:
+            if any(s == "Out of Production" for s in _per_order):
+                preserved = "Out of Production"
+            elif any(s == "Out of Stock" for s in _per_order):
+                preserved = "Out of Stock"
+            elif all(s == "Purchased" for s in _per_order):
+                preserved = "Purchased"
+    charm_val = _t(preserved, lang) if preserved else _t("Pending", lang)
+    na_val    = _t("N/A", lang)
+
+    img_src = _image_data_uri(agg.get("photo_bytes"))
+    img_html = (
+        f'<img src="{img_src}" class="item-photo" loading="lazy" alt="">'
+        if img_src else
+        '<div class="item-photo no-photo"></div>'
+    )
+
+    skey = f"~C:{code}||charm_agg"
+
+    def _badge_agg(val: str) -> str:
+        cls = _status_cls(val)
+        return (
+            f'<span class="badge {cls} ibadge" '
+            f'data-skey="{skey}" data-comp="charm" data-val="{val}" '
+            f'role="button" tabindex="0" '
+            f'title="{"点击更新状态" if lang == "zh" else "Tap to update status"}">'
+            f'{val}</span>'
+        )
+
+    search_text = " ".join(filter(None, [
+        code, sku, shop_disp, stall_disp, orders_display, notes,
+    ])).lower().replace('"', '')
+
+    _zh = lang == "zh"
+    floor_td = "" if _zh else f'  <td data-label="{_t("Floor", lang)}" class="col-floor">--</td>\n'
+    product_td = (
+        "" if _zh else
+        f'  <td data-label="Charm Code / SKU" class="col-product">'
+        f'<strong>{code}</strong>{(" — " + sku) if sku else ""}</td>\n'
+    )
+    case_td = "" if _zh else f'  <td class="col-status"><span class="badge s-na">{na_val}</span></td>\n'
+    grip_td = "" if _zh else f'  <td class="col-status"><span class="badge s-na">{na_val}</span></td>\n'
+    charm_td = "" if _zh else f'  <td data-label="{_t("Charm", lang)}" class="col-status">{_badge_agg(charm_val)}</td>\n'
+    order_td = "" if _zh else f'  <td data-label="Orders" class="col-order">{orders_display}</td>\n'
+    etsy_td = "" if _zh else f'<td class="col-shop">{notes}</td>'
+    pn_td = f'  <td class="col-private-notes"></td>\n'
+
+    return (
+        f'<tr class="item-row {row_cls}" data-search="{search_text}" data-title="{code}">\n'
+        f'  <td class="col-seq">{seq}</td>\n'
+        f'  <td class="col-photo">{img_html}</td>\n'
+        f'{floor_td}'
+        f'  <td data-label="Charm Shop" class="col-supplier">{shop_disp}</td>\n'
+        f'  <td data-label="{_t("Stall", lang)}" class="col-stall">{stall_disp}</td>\n'
+        f'{product_td}'
+        f'  <td class="col-items">\u2014</td>\n'
+        f'{case_td}{grip_td}{charm_td}'
+        f'  <td class="col-model"></td>\n'
+        f'  <td data-label="{_t("Qty", lang)}" class="col-qty">{agg["total_qty"]}</td>\n'
+        f'{order_td}'
+        f'  {etsy_td}\n'
+        f'{pn_td}'
+        f'</tr>'
+    )
+
+
+def _html_charm_await_card(
+    r: ResolvedItem, seq: int, row_cls: str, lang: str,
+    charm_shop_lookup: dict | None = None,
+    etsy_shop_col: bool = True,
+) -> str:
+    """Render an awaiting-charm-code item as a <tr> for the HTML route."""
+    cs_lookup  = charm_shop_lookup or {}
+    assigned   = (r.supplier.charm_shop if r.supplier else "") or ""
+    cs_obj     = cs_lookup.get(assigned)
+    shop_disp  = cs_obj.shop_name if cs_obj else (f"? {assigned}" if assigned else "--")
+    stall_disp = cs_obj.stall     if cs_obj else ("?" if assigned else "--")
+
+    na_val   = _t("N/A", lang)
+    title_fn = None
+    title    = r.item.title
+
+    img_src  = _image_data_uri(r.item.photo_bytes)
+    img_html = (
+        f'<img src="{img_src}" class="item-photo" loading="lazy" alt="">'
+        if img_src else
+        '<div class="item-photo no-photo"></div>'
+    )
+
+    await_label = "\u23f3 Awaiting Code" if lang != "zh" else "\u23f3 \u5f85\u5206\u914d"
+
+    search_text = " ".join(filter(None, [
+        title, shop_disp, stall_disp, r.item.phone_model,
+        r.order.order_number, r.order.private_notes,
+    ])).lower().replace('"', '')
+
+    _zh = lang == "zh"
+    floor_td   = "" if _zh else f'  <td class="col-floor">--</td>\n'
+    product_td = "" if _zh else f'  <td class="col-product">{title}</td>\n'
+    case_td    = "" if _zh else f'  <td class="col-status"><span class="badge s-na">{na_val}</span></td>\n'
+    grip_td    = "" if _zh else f'  <td class="col-status"><span class="badge s-na">{na_val}</span></td>\n'
+    charm_td   = "" if _zh else f'  <td class="col-status"><span class="badge s-pending" style="color:#7D4E00;background:#FFF3CD;font-style:italic">{await_label}</span></td>\n'
+    order_td   = "" if _zh else f'  <td class="col-order">~?#{r.order.order_number}</td>\n'
+    etsy_td    = f'<td class="col-shop">{r.order.etsy_shop}</td>' if etsy_shop_col and not _zh else ""
+    _pn        = r.order.private_notes
+    pn_td      = f'  <td class="col-private-notes">{_pn}</td>\n' if _pn else f'  <td class="col-private-notes"></td>\n'
+
+    return (
+        f'<tr class="item-row {row_cls}" data-search="{search_text}" data-title="{title}">\n'
+        f'  <td class="col-seq">{seq}</td>\n'
+        f'  <td class="col-photo">{img_html}</td>\n'
+        f'{floor_td}'
+        f'  <td class="col-supplier">{shop_disp}</td>\n'
+        f'  <td class="col-stall">{stall_disp}</td>\n'
+        f'{product_td}'
+        f'  <td class="col-items">\u2014</td>\n'
+        f'{case_td}{grip_td}{charm_td}'
+        f'  <td class="col-model">{r.item.phone_model}</td>\n'
+        f'  <td class="col-qty">{r.item.quantity}</td>\n'
+        f'{order_td}'
+        f'  {etsy_td}\n'
+        f'{pn_td}'
         f'</tr>'
     )
 
@@ -6251,6 +7333,7 @@ def generate_html(items: list[ResolvedItem], output: Path,
             _t("Items to Purchase", lang),
             _t("Phone Model", lang),
             _t("Qty", lang),
+            _t("Private Notes", lang),
         ]
     else:
         col_labels = [
@@ -6268,6 +7351,7 @@ def generate_html(items: list[ResolvedItem], output: Path,
             _t("Qty",         lang),
             _t("Order #",     lang),
             _t("Etsy Shop", lang),
+            _t("Private Notes", lang),
         ]
     thead_cells = "".join(f"<th>{h}</th>" for h in col_labels)
 
@@ -6345,26 +7429,73 @@ def generate_html(items: list[ResolvedItem], output: Path,
     if charm_items:
         _cshops      = charm_shops or []
         cs_lookup    = {cs.shop_name: cs for cs in _cshops}
+
+        # Partition into coded vs awaiting
+        _h_coded:   list[ResolvedItem] = []
+        _h_await:   list[ResolvedItem] = []
+        for _hci in charm_items:
+            _hcc = (_hci.supplier.charm_code if _hci.supplier else "").strip()
+            if _hcc:
+                _h_coded.append(_hci)
+            else:
+                _h_await.append(_hci)
+
+        # Aggregate coded items by charm code
+        _h_agg: dict[str, dict] = {}
+        for _hci in _h_coded:
+            _hcc = _hci.supplier.charm_code.strip()
+            if _hcc not in _h_agg:
+                _hlib = (charm_library or {}).get(_hcc)
+                _h_agg[_hcc] = {
+                    "code": _hcc,
+                    "sku": _hlib.sku if _hlib else "",
+                    "default_shop": _hlib.default_charm_shop if _hlib else "",
+                    "notes": _hlib.notes if _hlib else "",
+                    "photo_bytes": None,
+                    "charm_shop": "",
+                    "total_qty": 0,
+                    "orders": [],
+                    "items": [],
+                }
+                _hph = charm_photo_bytes_from_folder(_hcc, charm_images_dir)
+                if not _hph and _hlib and _hlib.photo_bytes:
+                    _hph = _hlib.photo_bytes
+                _h_agg[_hcc]["photo_bytes"] = _hph
+            _h_agg[_hcc]["total_qty"] += _hci.item.quantity
+            _h_agg[_hcc]["orders"].append(_hci.order.order_number)
+            _h_agg[_hcc]["items"].append(_hci)
+            if not _h_agg[_hcc]["charm_shop"]:
+                _has = (_hci.supplier.charm_shop if _hci.supplier else "").strip()
+                if _has:
+                    _h_agg[_hcc]["charm_shop"] = _has
+
+        n_missing_code = len(_h_await)
         unassigned_c = sum(1 for r in charm_items
                            if not (r.supplier and r.supplier.charm_shop
                                    and r.supplier.charm_shop in cs_lookup))
 
         if lang == "zh":
             charm_banner = (
-                f"✨ 待购挂件 — 独立楼栋 — 共需 {total_charm_qty} 个挂件，"
-                f"涉及 {len(charm_items)} 个订单"
-                + (f" — {unassigned_c} 个未分配" if unassigned_c else "")
+                f"\u2728 \u5f85\u8d2d\u6302\u4ef6 \u2014 \u72ec\u7acb\u697c\u68cb \u2014 \u5171\u9700 {total_charm_qty} \u4e2a\u6302\u4ef6\uff0c"
+                f"\u6d89\u53ca {len(charm_items)} \u4e2a\u8ba2\u5355"
             )
+            if n_missing_code:
+                charm_banner += f" \u25b6 {n_missing_code} \u4e2a\u5f85\u5206\u914d\u7f16\u7801"
+            if unassigned_c:
+                charm_banner += f" \u25b6 {unassigned_c} \u4e2a\u672a\u5206\u914d\u5e97\u94fa"
             shops_row = (
-                "挂件店铺：" + "  |  ".join(f"{s.shop_name} ({s.stall})" for s in _cshops)
-                if _cshops else "未配置挂件店铺"
+                "\u6302\u4ef6\u5e97\u94fa\uff1a" + "  |  ".join(f"{s.shop_name} ({s.stall})" for s in _cshops)
+                if _cshops else "\u672a\u914d\u7f6e\u6302\u4ef6\u5e97\u94fa"
             )
         else:
             charm_banner = (
-                f"✨ CHARMS TO PURCHASE — SEPARATE BUILDING — "
+                f"\u2728 CHARMS TO PURCHASE \u2014 SEPARATE BUILDING \u2014 "
                 f"{total_charm_qty} charm(s) across {len(charm_items)} order(s)"
-                + (f" — {unassigned_c} unassigned" if unassigned_c else "")
             )
+            if n_missing_code:
+                charm_banner += f" \u25b6 {n_missing_code} awaiting charm code"
+            if unassigned_c:
+                charm_banner += f" \u25b6 {unassigned_c} unassigned shop"
             shops_row = (
                 "Charm shops:  " + "   |   ".join(f"{s.shop_name} ({s.stall})" for s in _cshops)
                 if _cshops else "No charm shops configured"
@@ -6376,26 +7507,56 @@ def generate_html(items: list[ResolvedItem], output: Path,
         )
         body_parts.append(f"<tr class='thead-repeat'>{thead_cells}</tr>")
 
-        def _charm_sort_key(ri: ResolvedItem) -> tuple[str, str, str]:
-            assigned = (ri.supplier.charm_shop if ri.supplier else "") or ""
-            return (assigned, _normalize(ri.item.title), ri.order.order_number)
-
-        for cidx, r in enumerate(sorted(charm_items, key=_charm_sort_key)):
-            norm  = _normalize(r.item.title)[:50]
-            onum  = r.order.order_number
-            pres  = _statuses.get((onum, norm, "charm"))
-            chv   = _t(pres, lang) if pres else _t("Pending", lang)
-            na    = _t("N/A", lang)
+        # Sub-section A: aggregated charm cards
+        sorted_h_codes = sorted(
+            _h_agg,
+            key=lambda c: (_h_agg[c]["charm_shop"] or "\uffff", c),
+        )
+        for cidx, code in enumerate(sorted_h_codes):
+            agg = _h_agg[code]
+            preserved = _statuses.get((code, "", "charm_agg"))
+            if not preserved:
+                _hpo = []
+                for _ri in agg["items"]:
+                    _ps = _statuses.get((_ri.order.order_number, _normalize(_ri.item.title)[:50], "charm"))
+                    if _ps:
+                        _hpo.append(_ps)
+                if _hpo:
+                    if any(s == "Out of Production" for s in _hpo):
+                        preserved = "Out of Production"
+                    elif any(s == "Out of Stock" for s in _hpo):
+                        preserved = "Out of Stock"
+                    elif all(s == "Purchased" for s in _hpo):
+                        preserved = "Purchased"
+            chv = _t(preserved, lang) if preserved else _t("Pending", lang)
+            na  = _t("N/A", lang)
             row_cls = _row_status_cls(na, na, chv, lang) + " charm-item"
-            body_parts.append(_html_item_card(
-                r, cidx + 1, row_cls, lang,
-                is_charm=True, title_fn=title_fn,
+            body_parts.append(_html_charm_agg_card(
+                cidx + 1, agg, row_cls, lang,
                 statuses=_statuses,
                 charm_shop_lookup=cs_lookup,
-                etsy_shop_col=show_etsy,
                 charm_library=charm_library,
                 charm_images_dir=charm_images_dir,
             ))
+
+        # Sub-section B: awaiting charm code
+        if _h_await:
+            await_label = (
+                f"\u23f3 \u5f85\u5206\u914d\u6302\u4ef6\u7f16\u7801 \u2014 {len(_h_await)} \u4e2a\u8ba2\u5355"
+                if lang == "zh" else
+                f"\u23f3 AWAITING CHARM CODE \u2014 {len(_h_await)} order(s)"
+            )
+            body_parts.append(_section_banner(await_label, "banner-warn"))
+            body_parts.append(f"<tr class='thead-repeat'>{thead_cells}</tr>")
+            for aidx, r in enumerate(sorted(
+                _h_await,
+                key=lambda ri: (_normalize(ri.item.title), ri.order.order_number),
+            )):
+                body_parts.append(_html_charm_await_card(
+                    r, aidx + 1, "charm-item row-warn", lang,
+                    charm_shop_lookup=cs_lookup,
+                    etsy_shop_col=show_etsy,
+                ))
 
     tbody_html = "\n".join(body_parts)
 
@@ -6546,6 +7707,7 @@ tr.item-row:last-child td {{ border-bottom: none; }}
 .col-qty     {{ text-align: center; font-weight: 700; font-size: 16px; }}
 .col-order   {{ text-align: center; font-size: 12px; color: #555; }}
 .col-shop    {{ font-size: 12px; color: #555; }}
+.col-private-notes {{ font-size: 12px; color: #8B1A1A; font-style: italic; max-width: 220px; white-space: pre-wrap; word-break: break-word; }}
 
 /* ── Photos ── */
 .item-photo {{ width: 210px; height: 210px; object-fit: contain; border-radius: 6px; display: block; margin: 0 auto; }}
@@ -8098,6 +9260,27 @@ def main() -> None:
     partial_purge_count = 0   # items whose style was trimmed (one section done)
     oop_records: list[tuple[str, str, str, str]] = []
     if args.purge_purchased:
+        # Bridge aggregated charm statuses to per-order keys so the purge
+        # logic (which checks per-order (order_num, norm_title, "charm"))
+        # works with the new ~C:<code> aggregated format.
+        _agg_charm_statuses = {
+            k: v for k, v in existing_statuses.items()
+            if len(k) == 3 and k[2] == "charm_agg"
+        }
+        if _agg_charm_statuses:
+            for r in all_resolved:
+                if not _style_has(r.item.style)[2]:
+                    continue
+                _cc = (r.supplier.charm_code if r.supplier else "").strip()
+                if not _cc:
+                    continue
+                _agg_val = _agg_charm_statuses.get((_cc, "", "charm_agg"))
+                if _agg_val:
+                    _nt = _normalize(r.item.title)[:50]
+                    _per_key = (r.order.order_number, _nt, "charm")
+                    if _per_key not in existing_statuses:
+                        existing_statuses[_per_key] = _agg_val
+
         new_resolved: list[ResolvedItem] = []
         for r in all_resolved:
             remaining_style = _compute_remaining_style(
@@ -8147,13 +9330,23 @@ def main() -> None:
         # Retain only the statuses for items that are still in the route.
         # Use (order_num, norm_title) pairs so we never accidentally carry over
         # statuses from a purged item that shares an order number with a kept one.
+        # Aggregated charm statuses (charm_agg) are kept if any remaining item
+        # references that charm code.
         kept_keys = {
             (r.order.order_number, _normalize(r.item.title)[:50])
             for r in all_resolved
         }
+        _kept_charm_codes = {
+            (r.supplier.charm_code.strip() if r.supplier else "")
+            for r in all_resolved
+            if _style_has(r.item.style)[2]
+        } - {""}
         existing_statuses = {
             k: v for k, v in existing_statuses.items()
-            if (k[0], k[1]) in kept_keys
+            if (
+                (len(k) == 3 and k[2] == "charm_agg" and k[0] in _kept_charm_codes)
+                or (k[0], k[1]) in kept_keys
+            )
         }
 
     # ------------------------------------------------------------------ #
@@ -8182,6 +9375,12 @@ def main() -> None:
     generate_xlsx(all_resolved, output_path, statuses=existing_statuses,
                   charm_shops=charm_shops, charm_library=charm_library,
                   charm_images_dir=charm_images_dir)
+
+    # Step 8b-simple -- Always generate simplified shopping route (minimal columns)
+    simple_output_path = output_path.with_stem(output_path.stem + "_simple")
+    generate_xlsx_simple(all_resolved, simple_output_path, statuses=existing_statuses,
+                         charm_shops=charm_shops, charm_library=charm_library,
+                         charm_images_dir=charm_images_dir)
 
     # Step 8b -- Optionally generate a Simplified Chinese version
     zh_item_count   = 0   # used later in the summary print
@@ -8308,6 +9507,7 @@ def main() -> None:
     if purged_count or partial_purge_count:
         print(f"  [>>]  {remaining_ct} item(s) still need attention")
     print(f"  --->  {output_path.resolve()}  ({len(all_resolved)} items)")
+    print(f"  [SIMPLE]  {simple_output_path.resolve()}  (simplified — no floor/product/order cols)")
     if manifest_written_path is not None:
         print(
             f"  [JSON] {manifest_written_path.resolve()}  "
