@@ -35,27 +35,53 @@ try:
         CHARM_SHOPS_SHEET,
         ProductMapPickerRow,
         extract_photos_from_xlsx,
+        get_catalog_photo_map,
+        normalize_catalog_charm_shops,
+        import_charm_screenshot_assets,
         list_product_map_rows_for_picker,
+        sort_suppliers_sheet,
+        write_charm_library_skus,
+        load_cache,
+        load_catalog,
         load_charm_library,
         load_charm_shops,
-    mark_product_map_discontinued_by_row,
-    reorder_charm_library_rows,
-    update_product_map_cells,
-    update_product_map_photo,
-)
+        mark_product_map_discontinued_by_row,
+        reorder_charm_library_rows,
+        save_cache,
+        update_product_map_cells,
+        update_product_map_photo,
+        Order,
+        OrderItem,
+        ResolvedItem,
+        _style_has,
+        _normalize,
+    )
 except ImportError:
     CATALOG_SHEET = "Product Map"  # type: ignore[assignment, misc]
     CHARM_LIBRARY_SHEET = "Charm Library"  # type: ignore[assignment, misc]
     CHARM_SHOPS_SHEET = "Charm Shops"  # type: ignore[assignment, misc]
     ProductMapPickerRow = None  # type: ignore[assignment, misc]
     extract_photos_from_xlsx = None  # type: ignore[assignment, misc]
+    get_catalog_photo_map = None  # type: ignore[assignment, misc]
+    normalize_catalog_charm_shops = None  # type: ignore[assignment, misc]
+    import_charm_screenshot_assets = None  # type: ignore[assignment, misc]
     list_product_map_rows_for_picker = None  # type: ignore[assignment, misc]
+    sort_suppliers_sheet = None  # type: ignore[assignment, misc]
+    write_charm_library_skus = None  # type: ignore[assignment, misc]
+    load_cache = None  # type: ignore[assignment, misc]
+    load_catalog = None  # type: ignore[assignment, misc]
     load_charm_library = None  # type: ignore[assignment, misc]
     load_charm_shops = None  # type: ignore[assignment, misc]
     mark_product_map_discontinued_by_row = None  # type: ignore[assignment, misc]
     reorder_charm_library_rows = None  # type: ignore[assignment, misc]
+    save_cache = None  # type: ignore[assignment, misc]
     update_product_map_cells = None  # type: ignore[assignment, misc]
     update_product_map_photo = None  # type: ignore[assignment, misc]
+    Order = None  # type: ignore[assignment, misc]
+    OrderItem = None  # type: ignore[assignment, misc]
+    ResolvedItem = None  # type: ignore[assignment, misc]
+    _style_has = None  # type: ignore[assignment, misc]
+    _normalize = None  # type: ignore[assignment, misc]
 
 try:
     from PIL import Image, ImageTk
@@ -95,6 +121,31 @@ def charm_import_pattern_argv() -> list[str]:
         "--import-charm-pattern",
         "Screenshot*.png",
     ]
+
+
+def _auto_sku_from_stem(stem: str) -> str:
+    """Derive a CHM-WORD1-WORD2-... SKU suggestion from a staged file's stem.
+
+    Strips the ``__incoming__<8hex>_`` prefix, splits the remaining text
+    on separators, removes noise tokens (numbers, generic words), uppercases
+    each part, and joins with dashes — e.g.:
+      ``__incoming__a1b2c3d4_pink_pearl_necklace``  →  ``CHM-PINK-PEARL-NECKL``
+      ``__incoming__a1b2c3d4_Screenshot_20240115``  →  ``""``  (all noise)
+    """
+    clean = re.sub(r"^__incoming__[0-9a-fA-F]+_", "", stem)
+    raw_parts = re.split(r"[_\-\s\.]+", clean)
+    _NOISE = {
+        "screenshot", "img", "image", "photo", "copy", "new", "file",
+        "jpeg", "jpg", "png", "webp", "pic", "pics",
+    }
+    parts = [
+        w.upper() for w in raw_parts
+        if w and not w.isdigit() and w.lower() not in _NOISE
+    ]
+    if not parts:
+        return ""
+    # Up to 5 parts, each capped at 5 characters for a compact CHM-style code
+    return "CHM-" + "-".join(p[:5] for p in parts[:5])
 ORDER_PDF_EXT = ".pdf"
 DEFAULT_ORDER_INPUT_DIR = PROJECT_ROOT / "input"
 DEFAULT_BACKUP_DIR = PROJECT_ROOT / "backup"
@@ -103,8 +154,10 @@ _ORDER_PDF_MMdd_SUFFIX = re.compile(r"_(\d{4})\.pdf$", re.IGNORECASE)
 DROP_ZONE_H = 92
 
 FILE_SUPPLIER_CATALOG = DATA_DIR / "supplier_catalog.xlsx"
+FILE_ORDERS_CACHE = PROJECT_ROOT / "cache" / "orders_cache.json"
 FILE_SHOPPING_ROUTE = OUTPUT_DIR / "shopping_route.xlsx"
 FILE_SHOPPING_ROUTE_ZH = OUTPUT_DIR / "shopping_route_zh.xlsx"
+FILE_SHOPPING_ROUTE_SIMPLE = OUTPUT_DIR / "shopping_route_simple.xlsx"
 FILE_SHOPPING_HTML = OUTPUT_DIR / "shopping_route.html"
 FILE_SHOPPING_HTML_ZH = OUTPUT_DIR / "shopping_route_zh.html"
 
@@ -371,6 +424,7 @@ CHROME: dict[Lang, dict[str, str]] = {
         "cat_backup_restore_pick": "Select a backup in the list first.",
         "cat_backup_close": "Close",
         "btn_edit_products": "Edit products…",
+        "btn_orders_dashboard": "Orders Dashboard…",
         "edit_title": "Edit Product Map",
         "edit_heading": "Assign shop, stall, charm code — or mark as discontinued",
         "edit_intro": (
@@ -463,6 +517,7 @@ CHROME: dict[Lang, dict[str, str]] = {
         "quick_data_folder": "Open data folder",
         "quick_route": "Excel (default)",
         "quick_route_zh": "Excel — Chinese",
+        "quick_route_simple": "Simple list (Excel)",
         "quick_html": "Web page",
         "quick_html_zh": "Web — Chinese",
         "file_missing_title": "File not found",
@@ -639,6 +694,7 @@ CHROME: dict[Lang, dict[str, str]] = {
         "cat_backup_restore_pick": "请先在列表中选择一项备份。",
         "cat_backup_close": "关闭",
         "btn_edit_products": "编辑商品…",
+        "btn_orders_dashboard": "订单总览…",
         "edit_title": "编辑商品表",
         "edit_heading": "分配店铺、摊位与挂饰代码，或标记为停售",
         "edit_intro": (
@@ -729,6 +785,7 @@ CHROME: dict[Lang, dict[str, str]] = {
         "quick_data_folder": "打开商品数据文件夹",
         "quick_route": "Excel（默认）",
         "quick_route_zh": "Excel — 中文版",
+        "quick_route_simple": "简版清单（Excel）",
         "quick_html": "网页版",
         "quick_html_zh": "网页 — 中文版",
         "file_missing_title": "还没有这个文件",
@@ -1191,6 +1248,8 @@ class App(tk.Tk):
             btn.config(text=CHROME[self._lang][key])
         if self._btn_edit_products:
             self._btn_edit_products.config(text=CHROME[self._lang]["btn_edit_products"])
+        if hasattr(self, "_btn_orders_dashboard") and self._btn_orders_dashboard:
+            self._btn_orders_dashboard.config(text=CHROME[self._lang]["btn_orders_dashboard"])
         if self._btn_catalog_backups:
             self._btn_catalog_backups.config(text=CHROME[self._lang]["btn_catalog_backups"])
         if self._w_btn_data:
@@ -1423,17 +1482,29 @@ class App(tk.Tk):
         self._w_quick_grp_sup.pack(anchor=tk.W, pady=(0, 4))
         row_sup = ttk.Frame(grp_sup, style="App.TFrame")
         row_sup.pack(anchor=tk.W, fill=tk.X)
-        _mk_open_btn(row_sup, FILE_SUPPLIER_CATALOG, "quick_catalog")
-        self._btn_edit_products = ttk.Button(
-            row_sup, text="", command=self._open_edit_products_dialog, style="Tool.TButton"
-        )
-        self._btn_edit_products.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 4))
+        # Left cluster: file openers
+        sup_left = ttk.Frame(row_sup, style="App.TFrame")
+        sup_left.pack(side=tk.LEFT)
+        _mk_open_btn(sup_left, FILE_SUPPLIER_CATALOG, "quick_catalog")
         self._btn_catalog_backups = ttk.Button(
-            row_sup, text="", command=self._open_catalog_backups_dialog, style="Tool.TButton"
+            sup_left, text="", command=self._open_catalog_backups_dialog, style="Tool.TButton"
         )
         self._btn_catalog_backups.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 4))
-        self._w_btn_data = ttk.Button(row_sup, text="", command=self._open_data_folder, style="Tool.TButton")
+        self._w_btn_data = ttk.Button(sup_left, text="", command=self._open_data_folder, style="Tool.TButton")
         self._w_btn_data.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 4))
+        # Divider
+        ttk.Separator(row_sup, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=(8, 8), pady=(0, 4))
+        # Right cluster: editor / dashboard tools
+        sup_right = ttk.Frame(row_sup, style="App.TFrame")
+        sup_right.pack(side=tk.LEFT)
+        self._btn_edit_products = ttk.Button(
+            sup_right, text="", command=self._open_edit_products_dialog, style="Tool.TButton"
+        )
+        self._btn_edit_products.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 4))
+        self._btn_orders_dashboard = ttk.Button(
+            sup_right, text="", command=self._open_orders_dashboard, style="Tool.TButton"
+        )
+        self._btn_orders_dashboard.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 4))
 
         ttk.Separator(quick_rows, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(6, 8))
 
@@ -1441,14 +1512,13 @@ class App(tk.Tk):
         grp_route.pack(anchor=tk.W, fill=tk.X, pady=(0, 0))
         self._w_quick_grp_route = ttk.Label(grp_route, text="", style="Sub.TLabel", wraplength=1060)
         self._w_quick_grp_route.pack(anchor=tk.W, pady=(0, 4))
-        row_route_xlsx = ttk.Frame(grp_route, style="App.TFrame")
-        row_route_xlsx.pack(anchor=tk.W, fill=tk.X, pady=(0, 4))
-        _mk_open_btn(row_route_xlsx, FILE_SHOPPING_ROUTE, "quick_route")
-        _mk_open_btn(row_route_xlsx, FILE_SHOPPING_ROUTE_ZH, "quick_route_zh")
-        row_route_web = ttk.Frame(grp_route, style="App.TFrame")
-        row_route_web.pack(anchor=tk.W, fill=tk.X)
-        _mk_open_btn(row_route_web, FILE_SHOPPING_HTML, "quick_html")
-        _mk_open_btn(row_route_web, FILE_SHOPPING_HTML_ZH, "quick_html_zh")
+        row_route = ttk.Frame(grp_route, style="App.TFrame")
+        row_route.pack(anchor=tk.W, fill=tk.X)
+        _mk_open_btn(row_route, FILE_SHOPPING_ROUTE, "quick_route")
+        _mk_open_btn(row_route, FILE_SHOPPING_ROUTE_ZH, "quick_route_zh")
+        _mk_open_btn(row_route, FILE_SHOPPING_ROUTE_SIMPLE, "quick_route_simple")
+        _mk_open_btn(row_route, FILE_SHOPPING_HTML, "quick_html")
+        _mk_open_btn(row_route, FILE_SHOPPING_HTML_ZH, "quick_html_zh")
 
         strip = tk.Frame(top_block, bg=COLORS["strip"], highlightthickness=0)
         strip.pack(fill=tk.X, pady=(8, 0))
@@ -1874,6 +1944,7 @@ class App(tk.Tk):
             highlightthickness=0,
         )
         self._run_btn.pack(side=tk.LEFT)
+
         self._w_run_hint = tk.Label(
             fin,
             text="",
@@ -2095,6 +2166,103 @@ class App(tk.Tk):
         self._spawn_generator(
             self._collect_generator_args("new_batch", include_charm_steps=False),
             log_intro=self._t("pdf_new_batch_start"),
+        )
+
+    def _open_orders_dashboard(self) -> None:
+        if load_cache is None or _style_has is None or _normalize is None:
+            messagebox.showerror("Missing imports", "Cannot open dashboard: core imports unavailable.")
+            return
+        if not FILE_ORDERS_CACHE.exists():
+            messagebox.showinfo("No data", "No order cache found.\nRun a job first to populate orders.")
+            return
+
+        items, _ = load_cache(FILE_ORDERS_CACHE)
+        if not items:
+            messagebox.showinfo("No data", "Order cache is empty.\nRun a job first.")
+            return
+
+        title_to_row: dict[str, int] = {}
+        if list_product_map_rows_for_picker is not None and FILE_SUPPLIER_CATALOG.exists():
+            try:
+                for pr in list_product_map_rows_for_picker(FILE_SUPPLIER_CATALOG):
+                    full_key = _normalize(pr.title)
+                    # Register both the full key and the 50-char-truncated variant.
+                    # Items cached before this fix stored norm_title with [:50];
+                    # registering both ensures either lookup hits the right row.
+                    title_to_row[full_key] = pr.row_num
+                    title_to_row[full_key[:50]] = pr.row_num
+            except Exception:
+                pass
+
+        sup_shops: list[str] = []
+        sup_stalls: list[str] = []
+        sup_shop_stalls: dict[str, str] = {}   # shop_name → stall
+        sup_stall_shops: dict[str, str] = {}   # stall → shop_name
+        try:
+            import openpyxl as _xl
+            _wb = _xl.load_workbook(FILE_SUPPLIER_CATALOG, read_only=True, data_only=True)
+            if "Suppliers" in _wb.sheetnames:
+                _ws = _wb["Suppliers"]
+                _shop_ci = _stall_ci = None
+                for ci in range(1, 20):
+                    h = str(_ws.cell(1, ci).value or "").strip().lower()
+                    if h == "shop name":
+                        _shop_ci = ci
+                    elif h == "stall":
+                        _stall_ci = ci
+                for r in _ws.iter_rows(min_row=2, values_only=False):
+                    _sv = str(r[_shop_ci - 1].value or "").strip() if _shop_ci else ""
+                    _stv = str(r[_stall_ci - 1].value or "").strip() if _stall_ci else ""
+                    if _sv and _sv not in sup_shops:
+                        sup_shops.append(_sv)
+                    if _stv and _stv not in sup_stalls:
+                        sup_stalls.append(_stv)
+                    if _sv and _stv:
+                        sup_shop_stalls.setdefault(_sv, _stv)
+                        sup_stall_shops.setdefault(_stv, _sv)
+            _wb.close()
+        except Exception:
+            pass
+
+        charm_library: dict = {}
+        charm_codes: list[str] = []
+        charm_shop_names: list[str] = []
+        charm_shop_stalls: dict[str, str] = {}   # shop_name → stall from Charm Shops tab
+        try:
+            if load_charm_library is not None and FILE_SUPPLIER_CATALOG.exists():
+                charm_library = load_charm_library(FILE_SUPPLIER_CATALOG)
+                charm_codes = list(charm_library.keys())
+            if load_charm_shops is not None and FILE_SUPPLIER_CATALOG.exists():
+                for cs in load_charm_shops(FILE_SUPPLIER_CATALOG):
+                    if cs.shop_name:
+                        charm_shop_names.append(cs.shop_name)
+                        if cs.stall:
+                            charm_shop_stalls[cs.shop_name] = cs.stall
+        except Exception:
+            pass
+
+        # Load canonical product photos from the catalog (norm_title → jpeg bytes).
+        # Every order for the same product always shows the same photo this way,
+        # regardless of which PDF batch it was originally extracted from.
+        catalog_photos: dict[str, bytes] = {}
+        if get_catalog_photo_map is not None and FILE_SUPPLIER_CATALOG.exists():
+            try:
+                catalog_photos = get_catalog_photo_map(FILE_SUPPLIER_CATALOG)
+            except Exception:
+                pass
+
+        _OrdersDashboardDialog(
+            self, items,
+            title_to_row=title_to_row,
+            supplier_shops=sup_shops,
+            supplier_stalls=sup_stalls,
+            supplier_shop_stalls=sup_shop_stalls,
+            supplier_stall_shops=sup_stall_shops,
+            charm_codes=charm_codes,
+            charm_shop_names=charm_shop_names,
+            charm_library=charm_library,
+            charm_shop_stalls=charm_shop_stalls,
+            catalog_photos=catalog_photos,
         )
 
     def _open_edit_products_dialog(self) -> None:
@@ -2973,6 +3141,3189 @@ class App(tk.Tk):
             self._collect_generator_args(job),
             log_intro=self._t("log_start"),
         )
+
+
+# ======================================================================
+# Orders Dashboard Dialog — standalone window with photo thumbnails,
+# filter buttons, mode toggle (Case/Grip vs Charms), and inline editing.
+# ======================================================================
+
+class _OrdersDashboardDialog:
+    _THUMB = 64
+    _ROW_H = 74
+
+    _CG_FILTERS = ("all", "ready", "needs_info", "unmatched")
+    _CH_FILTERS = ("all", "assigned", "needs_code", "needs_shop")
+
+    _FILTER_LABELS = {
+        "en": {"all": "All", "ready": "Ready", "needs_info": "Needs Info",
+               "unmatched": "Unmatched", "assigned": "Assigned",
+               "needs_code": "Needs Code", "needs_shop": "Needs Shop"},
+        "zh": {"all": "\u5168\u90e8", "ready": "\u5c31\u7eea",
+               "needs_info": "\u5f85\u586b\u4fe1\u606f",
+               "unmatched": "\u672a\u5339\u914d", "assigned": "\u5df2\u5206\u914d",
+               "needs_code": "\u5f85\u5206\u914d\u7f16\u7801",
+               "needs_shop": "\u5f85\u5206\u914d\u5e97\u94fa"},
+    }
+
+    _FILTER_COLORS = {
+        "all": ("#1F4E79", "#ffffff"), "ready": ("#047857", "#ffffff"),
+        "needs_info": ("#1e40af", "#ffffff"), "unmatched": ("#92400e", "#ffffff"),
+        "assigned": ("#5b21b6", "#ffffff"), "needs_code": ("#92400e", "#ffffff"),
+        "needs_shop": ("#1e40af", "#ffffff"),
+    }
+
+    def __init__(
+        self, parent: App, items: list,
+        *, title_to_row: dict[str, int],
+        supplier_shops: list[str], supplier_stalls: list[str],
+        supplier_shop_stalls: dict[str, str] | None = None,
+        supplier_stall_shops: dict[str, str] | None = None,
+        charm_codes: list[str], charm_shop_names: list[str],
+        charm_library: dict | None = None,
+        charm_shop_stalls: dict[str, str] | None = None,
+        catalog_photos: dict[str, bytes] | None = None,
+    ) -> None:
+        self._parent = parent
+        self._lang = parent._lang
+        self._items = items
+        self._title_to_row = title_to_row
+        self._sup_shops = supplier_shops
+        self._sup_stalls = supplier_stalls
+        # Bidirectional mappings: shop ↔ stall (built from Suppliers sheet)
+        self._sup_shop_stalls: dict[str, str] = supplier_shop_stalls or {}
+        self._sup_stall_shops: dict[str, str] = supplier_stall_shops or {}
+        self._charm_codes = charm_codes
+        self._charm_shops = charm_shop_names
+        self._charm_library: dict = charm_library or {}
+        # shop_name → stall mapping from the Charm Shops tab
+        self._charm_shop_stalls: dict[str, str] = charm_shop_stalls or {}
+        # Canonical product photos from Product Map (norm_title → jpeg bytes).
+        # Kept mutable so photo-upload updates propagate live without a restart.
+        self._catalog_photos: dict[str, bytes] = dict(catalog_photos or {})
+        self._tk_img_refs: list[object] = []
+        self._hover_photo: list[object] = []
+        self._hover_tip: tk.Toplevel | None = None
+        self._hover_after_id: list[object | None] = [None]
+        self._hover_active_iid: list[str | None] = [None]
+        self._preview_photo_ref: list[object] = []
+        self._charm_lib_photo_ref: list[object] = []
+        # Photo preview in the detail panel (kept to prevent GC of PhotoImage)
+        self._detail_photo_ref: list[object] = []
+        self._charm_tile_frames: dict[str, tk.Frame] = {}
+        self._charm_tile_info: dict[str, dict] = {}
+        self._selected_charm_code: str = ""
+        self._selected_indices: list[int] = []
+        self._gallery_hint: tk.Label | None = None
+        self._recently_used_frame: tk.Frame | None = None
+        self._ru_photo_refs: list[object] = []
+        # Column sort state
+        self._sort_col: str = ""      # active sort column key, "" = no sort
+        self._sort_dir: str = "asc"   # "asc" | "desc"
+        # Base heading labels (without sort indicators) — populated in _configure_columns
+        self._col_base_labels: dict[str, str] = {}
+        self._tile_hover_after: list[object | None] = [None]
+        self._tile_hover_tip: tk.Toplevel | None = None
+        self._tile_hover_photo_ref: list[object] = []
+        self._pil_ok = Image is not None and ImageTk is not None
+        # Purchase-status dict: {(order_num, norm_title, component): status_str}
+        # component = "case" | "grip" | "charm"
+        # Only non-Pending values are stored (Pending is the default/omitted key).
+        self._pstatuses: dict[tuple[str, str, str], str] = {}
+
+        self._mode = "casegrip"
+        self._active_filter = "all"
+
+        self._cg_items: list[dict] = []
+        self._ch_items: list[dict] = []
+        self._selected: dict | None = None
+        self._build_item_lists()
+
+        d = tk.Toplevel(parent)
+        self._d = d
+        d.title("Orders Dashboard" if self._lang == "en" else "\u8ba2\u5355\u603b\u89c8")
+        d.transient(parent)
+        d.grab_set()
+        d.configure(bg=COLORS["app"])
+        # Width accommodates Case/Grip/Buy-Status purchase-status columns
+        d.geometry("1640x880")
+        d.minsize(1260, 680)
+        d.grid_columnconfigure(0, weight=1)
+        d.grid_rowconfigure(2, weight=1)
+
+        # ── Row 0: Hero ───────────────────────────────────────────────
+        hero = tk.Frame(d, bg=COLORS["hero"], highlightthickness=0)
+        hero.grid(row=0, column=0, sticky="ew")
+        tk.Label(hero, text="Orders Dashboard" if self._lang == "en" else "\u8ba2\u5355\u603b\u89c8",
+                 font=("Segoe UI", 14, "bold"), fg="#ffffff",
+                 bg=COLORS["hero"]).pack(anchor=tk.W, padx=16, pady=(12, 2))
+        tk.Label(hero,
+                 text=("View and edit all current orders — product photos, supplier info, charm assignments."
+                       if self._lang == "en" else
+                       "\u67e5\u770b\u5e76\u7f16\u8f91\u6240\u6709\u5f53\u524d\u8ba2\u5355 \u2014 "
+                       "\u4ea7\u54c1\u56fe\u7247\u3001\u4f9b\u5e94\u5546\u4fe1\u606f\u3001\u6302\u4ef6\u5206\u914d\u3002"),
+                 font=("Segoe UI", 10), fg="#dbeafe",
+                 bg=COLORS["hero"]).pack(anchor=tk.W, padx=16, pady=(0, 10))
+
+        # ── Row 1: Mode toggle + filter bar + search ──────────────────
+        toolbar = tk.Frame(d, bg=COLORS["strip"], highlightthickness=0)
+        toolbar.grid(row=1, column=0, sticky="ew")
+
+        mode_frame = tk.Frame(toolbar, bg=COLORS["strip"])
+        mode_frame.pack(side=tk.LEFT, padx=(12, 0), pady=6)
+        self._btn_mode_cg = tk.Button(
+            mode_frame, text="\U0001F4F1 Case / Grip", font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT, bd=0, padx=14, pady=5, cursor="hand2",
+            command=lambda: self._set_mode("casegrip"))
+        self._btn_mode_cg.pack(side=tk.LEFT, padx=(0, 2))
+        self._btn_mode_ch = tk.Button(
+            mode_frame, text="\u2728 Charms", font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT, bd=0, padx=14, pady=5, cursor="hand2",
+            command=lambda: self._set_mode("charms"))
+        self._btn_mode_ch.pack(side=tk.LEFT)
+
+        sep = tk.Frame(toolbar, bg=COLORS["border"], width=1, highlightthickness=0)
+        sep.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=4)
+
+        self._filter_frame = tk.Frame(toolbar, bg=COLORS["strip"])
+        self._filter_frame.pack(side=tk.LEFT, pady=6)
+        self._filter_btns: list[tk.Button] = []
+
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", lambda *_: self._populate_tree())
+        se = ttk.Entry(toolbar, textvariable=self._search_var,
+                       font=("Segoe UI", 10), width=30)
+        se.pack(side=tk.RIGHT, padx=(0, 14), pady=6)
+        tk.Label(toolbar, text="\U0001F50D", font=("Segoe UI", 11),
+                 bg=COLORS["strip"], fg=COLORS["muted"]).pack(side=tk.RIGHT)
+
+        # "+ Add Order" button — opens the manual-order dialog
+        self._btn_add_order = tk.Button(
+            toolbar,
+            text="+ Add Order" if self._lang == "en" else "+ \u6dfb\u52a0\u8ba2\u5355",
+            font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT, bd=0, padx=14, pady=5, cursor="hand2",
+            bg="#047857", fg="#ffffff",
+            activebackground="#065f46", activeforeground="#ffffff",
+            command=self._open_add_manual_order,
+        )
+        self._btn_add_order.pack(side=tk.RIGHT, padx=(0, 14), pady=6)
+
+        # ── Row 2: Body (tree left + detail panel right) ──────────────
+        body = tk.Frame(d, bg=COLORS["app"])
+        body.grid(row=2, column=0, sticky="nsew", padx=12, pady=(8, 0))
+        # Tree takes all available horizontal space; right panel is a FIXED 330px
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=0)   # never resizes
+        body.grid_rowconfigure(0, weight=1)
+
+        # Tree frame
+        tf = tk.Frame(body, bg=COLORS["app"])
+        tf.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        tf.grid_rowconfigure(0, weight=1)
+        tf.grid_columnconfigure(0, weight=1)
+
+        sty = ttk.Style()
+        row_h = self._ROW_H if self._pil_ok else 24
+        sty.configure("Dash.Treeview", rowheight=row_h, font=("Segoe UI", 10),
+                       background="#ffffff", fieldbackground="#ffffff")
+        sty.configure("Dash.Treeview.Heading", font=("Segoe UI", 10, "bold"),
+                       background=COLORS["accent"], foreground="#ffffff",
+                       relief="flat", padding=(6, 6))
+        sty.map("Dash.Treeview.Heading", background=[("active", COLORS["hero"])])
+        sty.map("Dash.Treeview", background=[("selected", COLORS["accent"])],
+                foreground=[("selected", "#ffffff")])
+
+        self._tree = ttk.Treeview(
+            tf, show="tree headings", selectmode="extended", style="Dash.Treeview",
+        )
+        vsb = ttk.Scrollbar(tf, orient=tk.VERTICAL, command=self._tree.yview)
+        hsb = ttk.Scrollbar(tf, orient=tk.HORIZONTAL, command=self._tree.xview)
+        self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        self._tree.bind("<<TreeviewSelect>>", self._on_select)
+        self._tree.bind("<Motion>", self._on_tree_motion)
+        self._tree.bind("<Leave>", lambda _: self._hide_hover())
+        # Inline status picker — fires after row selection is already resolved
+        self._tree.bind("<ButtonRelease-1>", self._on_tree_cell_click)
+
+        self._tree.heading("#0", text="Photo", anchor=tk.CENTER)
+        self._tree.column("#0", width=68 if self._pil_ok else 20, stretch=False, anchor=tk.CENTER)
+
+        # Tag colors
+        for tag, bg, fg in [
+            ("ready",              "#d1fae5", "#065f46"),
+            ("needs_info",         "#dbeafe", "#1e3a8a"),
+            ("unmatched",          "#fef3c7", "#78350f"),
+            ("assigned",           "#ede9fe", "#4c1d95"),
+            ("needs_code",         "#fef3c7", "#78350f"),
+            ("needs_shop",         "#dbeafe", "#1e3a8a"),
+            ("alt_ready",          "#ecfdf5", "#065f46"),
+            ("alt_needs_info",     "#eff6ff", "#1e3a8a"),
+            ("alt_unmatched",      "#fffbeb", "#78350f"),
+            ("alt_assigned",       "#f5f3ff", "#4c1d95"),
+            ("alt_needs_code",     "#fffbeb", "#78350f"),
+            ("alt_needs_shop",     "#eff6ff", "#1e3a8a"),
+            # Purchase-status override tags (same palette as the route Excel)
+            ("ps_purchased",       "#c6efce", "#276221"),
+            ("ps_oos",             "#ffeb9c", "#7d4e00"),
+            ("ps_oop",             "#ffc7ce", "#9c0006"),
+            ("alt_ps_purchased",   "#dff5e4", "#276221"),
+            ("alt_ps_oos",         "#fff8cc", "#7d4e00"),
+            ("alt_ps_oop",         "#ffe4e8", "#9c0006"),
+        ]:
+            self._tree.tag_configure(tag, background=bg, foreground=fg)
+
+        # ── Detail panel (right) — FIXED 330px, never resizes ────────
+        panel_outer = tk.Frame(body, width=330, bg=COLORS["card"],
+                               highlightthickness=1, highlightbackground=COLORS["border"])
+        panel_outer.grid(row=0, column=1, sticky="ns")
+        panel_outer.pack_propagate(False)   # ← enforces the fixed width
+        panel_outer.grid_propagate(False)
+        self._panel = panel_outer
+
+        # ── Top: compact order info strip (hidden when nothing selected) ─
+        # No product photo — it is already visible in the tree column.
+        self._order_info_frame = tk.Frame(panel_outer, bg="#f8faff",
+                                          highlightthickness=0)
+        # (packed dynamically in _on_select / _clear_detail)
+
+        self._detail_title = tk.Label(
+            self._order_info_frame, text="", font=("Segoe UI", 11, "bold"),
+            fg=COLORS["text"], bg="#f8faff",
+            wraplength=296, justify=tk.LEFT, anchor=tk.NW,
+            cursor="hand2",
+        )
+        self._detail_title.pack(fill=tk.X, padx=10, pady=(10, 2))
+
+        def _copy_title(_event=None):
+            title = self._detail_title.cget("text")
+            if not title:
+                return
+            self._d.clipboard_clear()
+            self._d.clipboard_append(title)
+            # Brief colour flash to confirm the copy
+            orig_fg = self._detail_title.cget("fg")
+            self._detail_title.config(fg="#047857")
+            self._d.after(400, lambda: self._detail_title.config(fg=orig_fg))
+
+        self._detail_title.bind("<Button-1>", _copy_title)
+
+        self._detail_meta = tk.Label(
+            self._order_info_frame, text="", font=("Segoe UI", 8),
+            fg=COLORS["muted"], bg="#f8faff", anchor=tk.W,
+            wraplength=296, justify=tk.LEFT,
+        )
+        self._detail_meta.pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        self._detail_notes = tk.Label(
+            self._order_info_frame, text="", font=("Segoe UI", 8, "italic"),
+            fg="#7c3aed", bg="#f8faff", anchor=tk.W,
+            wraplength=296, justify=tk.LEFT,
+        )
+        self._detail_notes.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        # ── Photo preview + upload (shown only for single-selection) ──────
+        self._detail_photo_frame = tk.Frame(self._order_info_frame, bg="#f8faff")
+        # (packed dynamically in _on_select; hidden via pack_forget in _clear_detail)
+
+        self._detail_photo_lbl = tk.Label(
+            self._detail_photo_frame, bg="#eef2ff",
+            bd=1, relief=tk.SOLID, highlightthickness=0,
+            cursor="hand2",
+        )
+        self._detail_photo_lbl.pack(pady=(4, 3))
+
+        _upload_text = (
+            ("\U0001F4F7  Upload Photo" if self._lang == "en"
+             else "\U0001F4F7  上传图片")
+        )
+        self._upload_photo_btn = tk.Button(
+            self._detail_photo_frame,
+            text=_upload_text,
+            font=("Segoe UI", 9), relief=tk.FLAT, bd=0,
+            padx=8, pady=4, cursor="hand2",
+            bg="#e0e7ff", fg="#3730a3",
+            activebackground="#c7d2fe", activeforeground="#1e1b4b",
+            command=self._upload_photo_for_order,
+        )
+        self._upload_photo_btn.pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        self._upload_photo_status = tk.Label(
+            self._detail_photo_frame, text="",
+            font=("Segoe UI", 8, "bold"), fg="#047857", bg="#f8faff",
+            wraplength=290, justify=tk.CENTER,
+        )
+        self._upload_photo_status.pack(fill=tk.X, padx=10, pady=(0, 6))
+
+        # Named separator so we can use pack(before=) when needed
+        self._order_info_sep = tk.Frame(
+            self._order_info_frame, bg=COLORS["border"], height=1,
+            highlightthickness=0,
+        )
+        self._order_info_sep.pack(fill=tk.X)
+
+        # ── Middle/main area: filled dynamically per mode ─────────────
+        # For Case/Grip: Supplier/Stall comboboxes (always visible, grayed until selection)
+        # For Charms:    Scrollable charm library tile gallery (always visible)
+        self._mode_panel = tk.Frame(panel_outer, bg=COLORS["card"])
+        self._mode_panel.pack(fill=tk.BOTH, expand=True)
+
+        # ── Bottom: save controls (hidden when nothing selected) ───────
+        self._save_controls_frame = tk.Frame(panel_outer, bg=COLORS["card"])
+        # (packed dynamically)
+        self._save_status_lbl = tk.Label(
+            self._save_controls_frame, text="", font=("Segoe UI", 9, "bold"),
+            fg="#047857", bg=COLORS["card"])
+
+        # Edit fields storage
+        self._edit_widgets: dict[str, object] = {}
+
+        # ── Row 3: Footer ─────────────────────────────────────────────
+        foot = tk.Frame(d, bg=COLORS["app"])
+        foot.grid(row=3, column=0, sticky="ew", padx=14, pady=(8, 12))
+        ttk.Button(foot, text="Close" if self._lang == "en" else "\u5173\u95ed",
+                   command=d.destroy, style="Tool.TButton").pack(side=tk.RIGHT)
+        self._regen_btn = ttk.Button(
+            foot, text="Regenerate Shopping Route" if self._lang == "en" else "\u91cd\u65b0\u751f\u6210\u91c7\u8d2d\u6e05\u5355",
+            command=self._regen, style="Tool.TButton")
+        self._regen_btn.pack(side=tk.LEFT)
+        self._save_status = tk.Label(foot, text="", font=("Segoe UI", 10, "bold"),
+                                     fg="#047857", bg=COLORS["app"])
+        self._save_status.pack(side=tk.LEFT, padx=(16, 0))
+
+        # Load purchase statuses BEFORE _set_mode so the first tree render
+        # already reflects any persisted statuses.
+        self._load_pstatuses_cache()
+
+        self._set_mode("casegrip")
+        d.protocol("WM_DELETE_WINDOW", d.destroy)
+
+        # ── Keyboard shortcuts ─────────────────────────────────────────
+        # Ctrl+A — select all visible rows in the current tree
+        def _select_all(_event=None):
+            self._tree.selection_set(self._tree.get_children())
+            self._on_select()
+        d.bind("<Control-a>", _select_all)
+        d.bind("<Control-A>", _select_all)
+        # Escape — clear selection
+        def _deselect(_event=None):
+            self._tree.selection_remove(self._tree.selection())
+            self._clear_detail()
+        d.bind("<Escape>", _deselect)
+        # Enter / Return — save if something is selected
+        d.bind("<Return>", lambda _: self._save())
+
+    # ── Item classification ───────────────────────────────────────────
+
+    def _build_item_lists(self) -> None:
+        cg: list[dict] = []
+        ch: list[dict] = []
+        for r in self._items:
+            has_case, has_grip, has_charm = _style_has(r.item.style)
+            sup = r.supplier
+            shop = sup.shop_name if sup else ""
+            stall = sup.stall if sup else ""
+            c_code = sup.charm_code if sup else ""
+            # Charm shop resolution — Charm Library's default_charm_shop is the
+            # canonical 1:1 source of truth (enforced by normalize_catalog_charm_
+            # shops).  Falls back to the per-product entry for codes not yet
+            # registered in the library.  Exact same priority as the shopping
+            # route's aggregation, guaranteeing dashboard ↔ Excel consistency.
+            c_shop = ""
+            if c_code:
+                _lib_entry = self._charm_library.get(c_code)
+                if _lib_entry and getattr(_lib_entry, "default_charm_shop", ""):
+                    c_shop = _lib_entry.default_charm_shop
+            if not c_shop:
+                c_shop = sup.charm_shop if sup else ""
+            has_loc = bool(sup and (shop or stall))
+            norm = _normalize(r.item.title)   # full key — no truncation
+
+            # Canonical photo: prefer the Product Map photo over the PDF photo.
+            # This guarantees every order for the same product uses the same image.
+            canonical_photo = (
+                self._catalog_photos.get(norm)
+                or self._catalog_photos.get(norm[:50])
+                or r.item.photo_bytes
+            )
+
+            base = {
+                "order": r.order.order_number, "title": r.item.title,
+                "phone": r.item.phone_model, "qty": r.item.quantity,
+                "photo_bytes": canonical_photo,
+                "norm_title": norm,
+                "private_notes": r.order.private_notes,
+                "buyer": r.order.buyer_name, "date": r.order.order_date,
+                "etsy_shop": r.order.etsy_shop,
+            }
+
+            if has_case or has_grip:
+                if has_loc:
+                    st = "ready"
+                elif sup is not None:
+                    # Matched a catalog entry but supplier/stall not filled yet —
+                    # open supplier_catalog.xlsx and fill in Shop Name + Stall.
+                    st = "needs_info"
+                else:
+                    st = "unmatched"
+                cg.append({**base, "supplier": shop, "stall": stall,
+                           "case": "\u2713" if has_case else "",
+                           "grip": "\u2713" if has_grip else "", "status": st})
+
+            if has_charm:
+                if c_code and c_shop:
+                    cst = "assigned"
+                elif not c_code:
+                    # No charm code yet — this is always the first gap to fill:
+                    # you must know which specific charm before assigning a shop.
+                    cst = "needs_code"
+                else:
+                    # Code is known; still needs a shop to buy it from.
+                    cst = "needs_shop"
+                # Stall comes from the Charm Shops tab, not the product supplier
+                charm_stall = self._charm_shop_stalls.get(c_shop, "") if c_shop else ""
+                ch.append({**base, "charm_code": c_code, "charm_shop": c_shop,
+                           "stall": charm_stall, "status": cst})
+
+        self._cg_items = cg
+        self._ch_items = ch
+
+    # ── Thumbnails ────────────────────────────────────────────────────
+
+    def _thumb(self, raw: bytes | None) -> object | None:
+        if not self._pil_ok or not raw or Image is None or ImageTk is None:
+            return None
+        try:
+            im = Image.open(BytesIO(raw))
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.mode else "RGB")
+            if im.mode == "RGBA":
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[3])
+                im = bg
+            im.thumbnail((self._THUMB, self._THUMB), Image.Resampling.LANCZOS)
+            ph = ImageTk.PhotoImage(im)
+            self._tk_img_refs.append(ph)
+            return ph
+        except Exception:
+            return None
+
+    def _make_preview(self, raw: bytes | None, max_dim: int = 180) -> object | None:
+        if not self._pil_ok or not raw or Image is None or ImageTk is None:
+            return None
+        try:
+            im = Image.open(BytesIO(raw))
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.mode else "RGB")
+            if im.mode == "RGBA":
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[3])
+                im = bg
+            w, h = im.size
+            if w > max_dim or h > max_dim:
+                ratio = min(max_dim / w, max_dim / h)
+                im = im.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
+            ph = ImageTk.PhotoImage(im)
+            self._preview_photo_ref.clear()
+            self._preview_photo_ref.append(ph)
+            return ph
+        except Exception:
+            return None
+
+    # ── Mode toggle ───────────────────────────────────────────────────
+
+    def _set_mode(self, mode: str) -> None:
+        self._cancel_tile_hover()
+        self._mode = mode
+        self._active_filter = "all"
+        self._selected = None
+
+        if mode == "casegrip":
+            self._btn_mode_cg.config(bg=COLORS["accent"], fg="#ffffff")
+            self._btn_mode_ch.config(bg=COLORS["strip"], fg=COLORS["text"])
+            filters = self._CG_FILTERS
+        else:
+            self._btn_mode_cg.config(bg=COLORS["strip"], fg=COLORS["text"])
+            self._btn_mode_ch.config(bg="#5b21b6", fg="#ffffff")
+            filters = self._CH_FILTERS
+
+        for btn in self._filter_btns:
+            btn.destroy()
+        self._filter_btns.clear()
+
+        labels = self._FILTER_LABELS.get(self._lang, self._FILTER_LABELS["en"])
+        for fid in filters:
+            bg, fg = self._FILTER_COLORS[fid]
+            btn = tk.Button(
+                self._filter_frame, text=f" {labels[fid]} ",
+                font=("Segoe UI", 9, "bold"), relief=tk.FLAT, bd=0,
+                padx=10, pady=3, cursor="hand2",
+                command=lambda f=fid: self._set_filter(f),
+            )
+            btn.pack(side=tk.LEFT, padx=(0, 4))
+            self._filter_btns.append(btn)
+
+        self._configure_columns()
+        self._build_mode_panel()   # builds the always-visible charm gallery or CG form
+        self._update_filter_styles()
+        self._populate_tree()
+        self._clear_detail()
+
+    def _set_filter(self, fid: str) -> None:
+        self._active_filter = fid
+        self._update_filter_styles()
+        self._populate_tree()
+
+    def _update_filter_styles(self) -> None:
+        labels = self._FILTER_LABELS.get(self._lang, self._FILTER_LABELS["en"])
+        filters = self._CG_FILTERS if self._mode == "casegrip" else self._CH_FILTERS
+        for btn, fid in zip(self._filter_btns, filters):
+            bg, fg = self._FILTER_COLORS[fid]
+            if fid == self._active_filter:
+                btn.config(bg=bg, fg=fg)
+            else:
+                btn.config(bg="#e2e8f0", fg="#475569")
+
+    # ── Column configuration (with sort binding) ─────────────────────
+    #
+    # Sortable columns get a click command that calls _sort_by_column.
+    # Non-sortable columns (#, Photo, Case checkmark, Grip checkmark, Qty)
+    # are left without a command so the cursor stays default.
+    # Sort indicators (▲ / ▼) are appended to the active heading label.
+
+    # Maps column key → dict key in each item dict.
+    # Keys starting with "_ps_" are sentinel values handled specially in the
+    # sort engine (they rank by _PSTATUS_SORT_ORDER, not alphabetically).
+    _CG_SORT_MAP: dict[str, str] = {
+        "order": "order", "product": "title", "supplier": "supplier",
+        "stall": "stall",  "phone": "phone",   "status": "status",
+        "notes": "private_notes",
+        "case":  "_ps_case",   # purchase-status sort
+        "grip":  "_ps_grip",   # purchase-status sort
+    }
+    _CH_SORT_MAP: dict[str, str] = {
+        "order": "order", "product": "title", "charm_code": "charm_code",
+        "charm_shop": "charm_shop", "stall": "stall", "status": "status",
+        "notes": "private_notes",
+        "buy_status": "_ps_charm",  # purchase-status sort
+    }
+
+    # Purchase-status options — mirrors STATUS_OPTIONS in generate_shopping_route.py
+    _PURCHASE_STATUSES: list[str] = [
+        "Pending", "Purchased", "Out of Stock", "Out of Production",
+    ]
+    # Priority for determining the "worst" status (highest-priority first)
+    _PSTATUS_PRIORITY: list[str] = [
+        "Out of Production", "Out of Stock", "Pending", "Purchased",
+    ]
+    # Ascending sort order: Pending first (most action needed) → Purchased last
+    _PSTATUS_SORT_ORDER: dict[str, int] = {
+        "Pending": 0, "Out of Stock": 1, "Out of Production": 2,
+        "Purchased": 3,
+    }
+    # Display text shown in the tree cells (abbreviated for column width)
+    _PSTATUS_DISPLAY: dict[str, str] = {
+        "Pending":           "Pending",
+        "Purchased":         "Purchased",
+        "Out of Stock":      "Out of Stock",
+        "Out of Production": "Out of Prod.",
+    }
+    # Maps English status value → tree row tag name
+    _PSTATUS_TAG: dict[str, str] = {
+        "Purchased":         "ps_purchased",
+        "Out of Stock":      "ps_oos",
+        "Out of Production": "ps_oop",
+    }
+
+    def _configure_columns(self) -> None:
+        tree = self._tree
+        self._sort_col = ""   # reset sort when switching mode
+        self._col_base_labels.clear()
+
+        if tree["columns"]:
+            tree["columns"] = ()
+
+        def _hdr(col: str, label: str, *, anchor=tk.W, sortable: bool = True) -> None:
+            """Register heading with optional sort command and store base label."""
+            self._col_base_labels[col] = label
+            cmd = (lambda c=col: self._sort_by_column(c)) if sortable else None
+            if cmd:
+                tree.heading(col, text=label, anchor=anchor, command=cmd)
+            else:
+                tree.heading(col, text=label, anchor=anchor)
+
+        if self._mode == "casegrip":
+            tree["columns"] = ("seq", "order", "product", "supplier", "stall",
+                               "case", "grip", "phone", "qty", "status", "notes")
+            _hdr("seq",      "#",            anchor=tk.CENTER, sortable=False)
+            _hdr("order",    "Order #",      anchor=tk.CENTER, sortable=True)
+            _hdr("product",  "Product",      sortable=True)
+            _hdr("supplier", "Supplier",     sortable=True)
+            _hdr("stall",    "Stall",        anchor=tk.CENTER, sortable=True)
+            # Case / Grip columns now show the per-component purchase status
+            _hdr("case",     "Case",         anchor=tk.CENTER, sortable=True)
+            _hdr("grip",     "Grip",         anchor=tk.CENTER, sortable=True)
+            _hdr("phone",    "Phone Model",  sortable=True)
+            _hdr("qty",      "Qty",          anchor=tk.CENTER, sortable=False)
+            _hdr("status",   "Match",        anchor=tk.CENTER, sortable=True)
+            _hdr("notes",    "Private Notes",sortable=True)
+            tree.column("seq",      width=32,  minwidth=26,  anchor=tk.CENTER, stretch=False)
+            tree.column("order",    width=95,  minwidth=80,  anchor=tk.CENTER, stretch=False)
+            tree.column("product",  width=200, minwidth=120, stretch=True)
+            tree.column("supplier", width=90,  minwidth=60,  stretch=False)
+            tree.column("stall",    width=58,  minwidth=44,  anchor=tk.CENTER, stretch=False)
+            tree.column("case",     width=108, minwidth=72,  anchor=tk.CENTER, stretch=False)
+            tree.column("grip",     width=108, minwidth=72,  anchor=tk.CENTER, stretch=False)
+            tree.column("phone",    width=118, minwidth=80,  stretch=False)
+            tree.column("qty",      width=32,  minwidth=26,  anchor=tk.CENTER, stretch=False)
+            tree.column("status",   width=72,  minwidth=50,  anchor=tk.CENTER, stretch=False)
+            tree.column("notes",    width=160, minwidth=80,  stretch=False)
+        else:
+            tree["columns"] = ("seq", "order", "product", "charm_code", "charm_shop",
+                               "stall", "qty", "status", "buy_status", "notes")
+            _hdr("seq",        "#",            anchor=tk.CENTER, sortable=False)
+            _hdr("order",      "Order #",      anchor=tk.CENTER, sortable=True)
+            _hdr("product",    "Product",      sortable=True)
+            _hdr("charm_code", "Charm Code",   anchor=tk.CENTER, sortable=True)
+            _hdr("charm_shop", "Charm Shop",   sortable=True)
+            _hdr("stall",      "Stall",        anchor=tk.CENTER, sortable=True)
+            _hdr("qty",        "Qty",          anchor=tk.CENTER, sortable=False)
+            _hdr("status",     "Match",        anchor=tk.CENTER, sortable=True)
+            # Charm purchase status column
+            _hdr("buy_status", "Buy Status",   anchor=tk.CENTER, sortable=True)
+            _hdr("notes",      "Private Notes",sortable=True)
+            tree.column("seq",        width=32,  minwidth=26,  anchor=tk.CENTER, stretch=False)
+            tree.column("order",      width=95,  minwidth=80,  anchor=tk.CENTER, stretch=False)
+            tree.column("product",    width=200, minwidth=120, stretch=True)
+            tree.column("charm_code", width=90,  minwidth=60,  anchor=tk.CENTER, stretch=False)
+            tree.column("charm_shop", width=120, minwidth=70,  stretch=False)
+            tree.column("stall",      width=58,  minwidth=44,  anchor=tk.CENTER, stretch=False)
+            tree.column("qty",        width=32,  minwidth=26,  anchor=tk.CENTER, stretch=False)
+            tree.column("status",     width=90,  minwidth=55,  anchor=tk.CENTER, stretch=False)
+            tree.column("buy_status", width=108, minwidth=72,  anchor=tk.CENTER, stretch=False)
+            tree.column("notes",      width=160, minwidth=80,  stretch=False)
+
+    # ── Sort engine ───────────────────────────────────────────────────
+
+    def _sort_by_column(self, col: str) -> None:
+        """Toggle sort direction if same column, reset to ascending if new column."""
+        if self._sort_col == col:
+            self._sort_dir = "desc" if self._sort_dir == "asc" else "asc"
+        else:
+            self._sort_col = col
+            self._sort_dir = "asc"
+        self._populate_tree()
+
+    def _refresh_sort_indicators(self) -> None:
+        """Append ▲ / ▼ to the active column heading; clear all others."""
+        sort_map = self._CH_SORT_MAP if self._mode == "charms" else self._CG_SORT_MAP
+        UP, DN = " ▲", " ▼"
+        for col, base in self._col_base_labels.items():
+            if col not in (list(self._tree["columns"])):
+                continue
+            if col == self._sort_col and col in sort_map:
+                indicator = DN if self._sort_dir == "desc" else UP
+                self._tree.heading(col, text=base + indicator)
+            else:
+                self._tree.heading(col, text=base)
+
+    # ── Edit fields ───────────────────────────────────────────────────
+
+    def _build_mode_panel(self) -> None:
+        """Rebuild the middle area of the right panel for the current mode.
+
+        Case/Grip mode: Supplier + Stall comboboxes (always visible).
+        Charms mode:    Scrollable charm-library tile gallery (always visible).
+        The order-info strip (top) and save controls (bottom) are managed
+        separately by _on_select / _clear_detail.
+        """
+        for w in self._mode_panel.winfo_children():
+            w.destroy()
+        self._edit_widgets.clear()
+        self._charm_lib_photo_ref.clear()
+        self._charm_tile_frames.clear()
+        self._selected_charm_code = ""
+
+        # Clear dynamically-added children from the save-controls frame so
+        # repeated mode switches don't accumulate multiple Save buttons.
+        # _save_status_lbl lives here too but must be preserved.
+        for w in list(self._save_controls_frame.winfo_children()):
+            if w is not self._save_status_lbl:
+                w.destroy()
+
+        if self._mode == "casegrip":
+            self._build_casegrip_form()
+        else:
+            self._build_charm_gallery()
+
+    # ── Case / Grip mode: simple supplier form ────────────────────────
+
+    def _build_casegrip_form(self) -> None:
+        f = tk.Frame(self._mode_panel, bg=COLORS["card"])
+        f.pack(fill=tk.X, padx=12, pady=12)
+        # Two equal columns: Supplier (0) and Stall (1)
+        f.columnconfigure(0, weight=1)
+        f.columnconfigure(1, weight=1)
+
+        # ── Row 0: column headers ──────────────────────────────────────
+        tk.Label(f,
+                 text="SUPPLIER" if self._lang == "en" else "\u4f9b\u5e94\u5546",
+                 font=("Segoe UI", 7, "bold"), fg="#94a3b8",
+                 bg=COLORS["card"]).grid(row=0, column=0, sticky=tk.W, pady=(0, 3))
+        tk.Label(f,
+                 text="STALL" if self._lang == "en" else "\u6444\u4f4d",
+                 font=("Segoe UI", 7, "bold"), fg="#94a3b8",
+                 bg=COLORS["card"]).grid(row=0, column=1, sticky=tk.W,
+                                         padx=(8, 0), pady=(0, 3))
+
+        # ── Row 1: comboboxes side by side ─────────────────────────────
+        sv = tk.StringVar()
+        cb = ttk.Combobox(f, textvariable=sv, values=self._sup_shops,
+                          font=("Segoe UI", 10))
+        cb.grid(row=1, column=0, sticky=tk.EW, pady=(0, 0))
+        self._edit_widgets["sup_var"] = sv
+        self._edit_widgets["sup_cb"] = cb
+
+        stv = tk.StringVar()
+        scb = ttk.Combobox(f, textvariable=stv, values=self._sup_stalls,
+                           font=("Segoe UI", 10))
+        scb.grid(row=1, column=1, sticky=tk.EW, padx=(8, 0), pady=(0, 0))
+        self._edit_widgets["stall_var"] = stv
+        self._edit_widgets["stall_cb"] = scb
+
+        # ── Row 2: autofill hints (shared row, muted small text) ───────
+        hint_row = tk.Frame(f, bg=COLORS["card"])
+        hint_row.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=(3, 0))
+        self._sup_autofill_lbl = tk.Label(hint_row, text="",
+                                          font=("Segoe UI", 8), fg="#047857",
+                                          bg=COLORS["card"])
+        self._sup_autofill_lbl.pack(side=tk.LEFT)
+        self._stall_autofill_lbl = tk.Label(hint_row, text="",
+                                            font=("Segoe UI", 8), fg="#047857",
+                                            bg=COLORS["card"])
+        self._stall_autofill_lbl.pack(side=tk.LEFT, padx=(12, 0))
+
+        # ── Row 3: Save button spanning both columns ────────────────────
+        save_btn = ttk.Button(f,
+                              text="Save Supplier & Stall" if self._lang == "en"
+                              else "\u4fdd\u5b58\u4f9b\u5e94\u5546\u4e0e\u6444\u4f4d",
+                              command=self._save, style="Tool.TButton")
+        save_btn.grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
+        self._edit_widgets["save_btn"] = save_btn
+
+        # ── Bidirectional auto-fill ────────────────────────────────────
+        def _autofill_stall(_event=None) -> None:
+            """When a shop is chosen, auto-fill stall if the mapping is known."""
+            shop = sv.get().strip()
+            if not shop:
+                self._sup_autofill_lbl.config(text="")
+                return
+            stall = self._sup_shop_stalls.get(shop, "")
+            if stall and not stv.get().strip():
+                stv.set(stall)
+                self._stall_autofill_lbl.config(
+                    text="\u2713 Stall auto-filled" if self._lang == "en"
+                    else "\u2713 \u6444\u4f4d\u5df2\u81ea\u52a8\u586b\u5165"
+                )
+            else:
+                self._stall_autofill_lbl.config(text="")
+            self._sup_autofill_lbl.config(text="")
+
+        def _autofill_shop(_event=None) -> None:
+            """When a stall is chosen, auto-fill shop if the mapping is known."""
+            stall = stv.get().strip()
+            if not stall:
+                self._stall_autofill_lbl.config(text="")
+                return
+            shop = self._sup_stall_shops.get(stall, "")
+            if shop and not sv.get().strip():
+                sv.set(shop)
+                self._sup_autofill_lbl.config(
+                    text="\u2713 Supplier auto-filled" if self._lang == "en"
+                    else "\u2713 \u4f9b\u5e94\u5546\u5df2\u81ea\u52a8\u586b\u5165"
+                )
+            else:
+                self._sup_autofill_lbl.config(text="")
+            self._stall_autofill_lbl.config(text="")
+
+        def _clear_autofill_hints(_event=None) -> None:
+            self._sup_autofill_lbl.config(text="")
+            self._stall_autofill_lbl.config(text="")
+
+        cb.bind("<<ComboboxSelected>>",  _autofill_stall)
+        scb.bind("<<ComboboxSelected>>", _autofill_shop)
+        sv.trace_add("write",  lambda *_: _autofill_stall())
+        stv.trace_add("write", lambda *_: _autofill_shop())
+        cb.bind("<Key>",  _clear_autofill_hints)
+        scb.bind("<Key>", _clear_autofill_hints)
+
+        # ── Save controls (hidden until a row is selected) ────────────
+        # Only feedback label + Manage Suppliers remain here — the Save
+        # button now lives directly in the form above.
+        scf = self._save_controls_frame
+
+        tk.Frame(scf, bg=COLORS["border"], height=1).pack(fill=tk.X, pady=(0, 0))
+        self._save_status_lbl.pack(anchor=tk.W, padx=14, pady=(6, 4))
+
+        tk.Frame(scf, bg=COLORS["border"], height=1).pack(fill=tk.X)
+        ttk.Button(
+            scf,
+            text="Manage Suppliers\u2026" if self._lang == "en"
+            else "\u7ba1\u7406\u4f9b\u5e94\u5546\u2026",
+            command=lambda: _SuppliersManagerDialog(
+                self._d, FILE_SUPPLIER_CATALOG, self._lang,
+                on_close=self._reload_supplier_dropdowns,
+            ),
+            style="Tool.TButton",
+        ).pack(fill=tk.X, padx=14, pady=(10, 10))
+
+    def _reload_supplier_dropdowns(self) -> None:
+        """Re-read the Suppliers sheet and refresh the Supplier/Stall comboboxes."""
+        shops: list[str] = []
+        stalls: list[str] = []
+        shop_stalls: dict[str, str] = {}
+        stall_shops: dict[str, str] = {}
+        try:
+            import openpyxl as _xl
+            _wb = _xl.load_workbook(
+                FILE_SUPPLIER_CATALOG, read_only=True, data_only=True
+            )
+            if "Suppliers" in _wb.sheetnames:
+                _ws = _wb["Suppliers"]
+                _shop_ci = _stall_ci = None
+                for ci in range(1, 15):
+                    h = str(_ws.cell(1, ci).value or "").strip().lower()
+                    if h == "shop name":
+                        _shop_ci = ci
+                    elif h == "stall":
+                        _stall_ci = ci
+                for r in _ws.iter_rows(min_row=2, values_only=False):
+                    sv  = str(r[_shop_ci  - 1].value or "").strip() if _shop_ci  else ""
+                    stv = str(r[_stall_ci - 1].value or "").strip() if _stall_ci else ""
+                    if sv and sv not in shops:
+                        shops.append(sv)
+                    if stv and stv not in stalls:
+                        stalls.append(stv)
+                    if sv and stv:
+                        shop_stalls.setdefault(sv, stv)
+                        stall_shops.setdefault(stv, sv)
+            _wb.close()
+        except Exception:
+            pass
+
+        # Persist updated data on self
+        self._sup_shops       = shops
+        self._sup_stalls      = stalls
+        self._sup_shop_stalls = shop_stalls
+        self._sup_stall_shops = stall_shops
+
+        # Refresh live combobox widgets if the form is currently open
+        sup_cb   = self._edit_widgets.get("sup_cb")
+        stall_cb = self._edit_widgets.get("stall_cb")
+        if sup_cb is not None:
+            try:
+                sup_cb["values"] = shops
+            except Exception:
+                pass
+        if stall_cb is not None:
+            try:
+                stall_cb["values"] = stalls
+            except Exception:
+                pass
+
+    # ── Charms mode: permanent charm tile gallery ─────────────────────
+
+    def _build_charm_gallery(self) -> None:
+        """
+        Always-visible charm library panel (Charms mode only).
+
+        Layout uses grid so that the canvas row reliably fills
+        all vertical space between the header/filter and the save controls.
+        Every tile widget gets a <MouseWheel> binding (fixing the scroll bug),
+        plus <Enter>/<Leave> for hover-zoom.
+        """
+        TILE_W = 168
+        TILE_H = 138
+        TILE_IMG_SZ = 92
+        COLS = 2
+        BG = COLORS["card"]
+
+        outer = tk.Frame(self._mode_panel, bg=BG)
+        outer.pack(fill=tk.BOTH, expand=True)
+        # row 0=header label, row 1=action toolbar, row 2=filter,
+        # row 3=canvas (expands), row 4=save controls
+        outer.rowconfigure(3, weight=1)
+        outer.columnconfigure(0, weight=1)
+
+        # ── Row 0: section header (label only) ────────────────────────
+        lbl_row = tk.Frame(outer, bg=COLORS["strip"])
+        lbl_row.grid(row=0, column=0, sticky="ew")
+        tk.Label(lbl_row,
+                 text="\u2728  Charm Library \u2014 click a charm to assign it" if self._lang == "en"
+                 else "\u2728  \u6302\u4ef6\u5e93 \u2014 \u70b9\u51fb\u5373\u53ef\u5206\u914d",
+                 font=("Segoe UI", 9, "bold"), fg="#5b21b6",
+                 bg=COLORS["strip"]).pack(anchor=tk.W, padx=10, pady=4)
+
+        # ── Row 1: action toolbar ──────────────────────────────────────
+        toolbar_row = tk.Frame(outer, bg=BG)
+        toolbar_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(4, 2))
+        toolbar_row.columnconfigure(0, weight=1)
+        toolbar_row.columnconfigure(1, weight=1)
+        ttk.Button(toolbar_row,
+                   text="+ Import Photos" if self._lang == "en" else "+ \u5bfc\u5165\u6302\u4ef6\u7167\u7247",
+                   command=self._charm_import_photos,
+                   style="Tool.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ttk.Button(toolbar_row,
+                   text="Sort / Reorder" if self._lang == "en" else "\u91cd\u6392\u7f16\u7801",
+                   command=self._charm_reorder,
+                   style="Tool.TButton").grid(row=0, column=1, sticky="ew", padx=(3, 0))
+
+        # ── Row 2: SKU / code filter ───────────────────────────────────
+        filter_row = tk.Frame(outer, bg=BG)
+        filter_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 2))
+        filter_row.columnconfigure(0, weight=1)
+
+        self._charm_filter_var = tk.StringVar()
+        self._charm_filter_var.trace_add("write", lambda *_: self._layout_charm_tiles())
+        filter_entry = ttk.Entry(filter_row, textvariable=self._charm_filter_var,
+                                 font=("Segoe UI", 9))
+        filter_entry.grid(row=0, column=0, sticky="ew")
+        filter_entry.insert(0, "\U0001F50D  Filter by code or SKU\u2026" if self._lang == "en"
+                            else "\U0001F50D  \u6309\u7f16\u7801\u6216SKU\u641c\u7d22\u2026")
+        filter_entry.config(foreground=COLORS["muted"])
+
+        def _filter_focus_in(_):
+            if self._charm_filter_var.get().startswith("\U0001F50D"):
+                filter_entry.delete(0, tk.END)
+                filter_entry.config(foreground=COLORS["text"])
+        def _filter_focus_out(_):
+            if not filter_entry.get().strip():
+                filter_entry.delete(0, tk.END)
+                filter_entry.insert(0, "\U0001F50D  Filter by code or SKU\u2026" if self._lang == "en"
+                                    else "\U0001F50D  \u6309\u7f16\u7801\u6216SKU\u641c\u7d22\u2026")
+                filter_entry.config(foreground=COLORS["muted"])
+                self._charm_filter_var.set("")
+        filter_entry.bind("<FocusIn>", _filter_focus_in)
+        filter_entry.bind("<FocusOut>", _filter_focus_out)
+
+        clr_btn = tk.Button(filter_row, text="\u2715", font=("Segoe UI", 8),
+                            bg=BG, fg=COLORS["muted"], relief=tk.FLAT,
+                            bd=0, cursor="hand2", padx=4,
+                            command=lambda: [self._charm_filter_var.set(""),
+                                            filter_entry.delete(0, tk.END),
+                                            filter_entry.insert(0,
+                                                "\U0001F50D  Filter by code or SKU\u2026" if self._lang == "en"
+                                                else "\U0001F50D  \u6309\u7f16\u7801\u6216SKU\u641c\u7d22\u2026"),
+                                            filter_entry.config(foreground=COLORS["muted"])])
+        clr_btn.grid(row=0, column=1, padx=(4, 0))
+
+        # ── Row 3: scrollable canvas (fills remaining height) ──────────
+        canvas_wrap = tk.Frame(outer, bg=BG)
+        canvas_wrap.grid(row=3, column=0, sticky="nsew")
+        canvas_wrap.rowconfigure(0, weight=1)
+        canvas_wrap.columnconfigure(0, weight=1)
+
+        gallery_canvas = tk.Canvas(canvas_wrap, bg=BG,
+                                   highlightthickness=0, borderwidth=0)
+        gallery_vsb = ttk.Scrollbar(canvas_wrap, orient=tk.VERTICAL,
+                                    command=gallery_canvas.yview)
+        gallery_canvas.configure(yscrollcommand=gallery_vsb.set)
+        gallery_canvas.grid(row=0, column=0, sticky="nsew")
+        gallery_vsb.grid(row=0, column=1, sticky="ns")
+        self._gallery_canvas = gallery_canvas
+
+        grid_frame = tk.Frame(gallery_canvas, bg=BG)
+        self._charm_grid_frame = grid_frame
+        grid_win = gallery_canvas.create_window((0, 0), window=grid_frame, anchor=tk.NW)
+        grid_frame.grid_columnconfigure(0, weight=1)
+        grid_frame.grid_columnconfigure(1, weight=1)
+
+        def _sync_scroll(_e=None):
+            gallery_canvas.configure(scrollregion=gallery_canvas.bbox("all") or (0, 0, 0, 0))
+        grid_frame.bind("<Configure>", _sync_scroll)
+
+        def _fit_grid_width(e):
+            gallery_canvas.itemconfigure(grid_win, width=e.width)
+        gallery_canvas.bind("<Configure>", _fit_grid_width)
+
+        # Mousewheel helper — bound to EVERY tile widget to fix scroll dead zones
+        def _scroll(e):
+            gallery_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        self._gallery_scroll_fn = _scroll
+        gallery_canvas.bind("<MouseWheel>", _scroll)
+        grid_frame.bind("<MouseWheel>", _scroll)
+
+        # ── Hover-zoom state ───────────────────────────────────────────
+        self._tile_hover_after: list[object | None] = [None]
+        self._tile_hover_tip: tk.Toplevel | None = None
+        self._tile_hover_photo_ref: list[object] = []
+
+        # ── Build charm usage counts ───────────────────────────────────
+        usage: dict[str, int] = {}
+        for item in self._ch_items:
+            cc = item.get("charm_code", "")
+            if cc:
+                usage[cc] = usage.get(cc, 0) + 1
+
+        # ── Build tile widgets ─────────────────────────────────────────
+        self._charm_tile_info: dict[str, dict] = {}   # {code: {'tile':…, 'sku':…, 'photo':…}}
+
+        for code in self._charm_codes:
+            entry = self._charm_library.get(code)
+            sku_text = (entry.sku if entry and entry.sku else "")
+
+            tile = tk.Frame(grid_frame, bg="#f5f3ff", width=TILE_W, height=TILE_H,
+                            highlightthickness=2, highlightbackground="#e9d5ff",
+                            cursor="hand2")
+            tile.grid_propagate(False)
+
+            # Photo
+            photo_bytes = entry.photo_bytes if (entry and entry.photo_bytes) else None
+            ph = self._make_charm_card_photo(photo_bytes, max_dim=TILE_IMG_SZ) if photo_bytes else None
+            img_lbl = tk.Label(tile, bg="#f5f3ff", cursor="hand2")
+            if ph:
+                self._charm_lib_photo_ref.append(ph)
+                img_lbl.config(image=ph)
+            else:
+                img_lbl.config(text="\U0001F48E", font=("Segoe UI", 18), fg="#c4b5fd")
+            img_lbl.place(relx=0.5, rely=0.34, anchor=tk.CENTER)
+
+            # Code + SKU labels
+            code_lbl = tk.Label(tile, text=code, font=("Segoe UI", 8, "bold"),
+                                fg="#5b21b6", bg="#f5f3ff", cursor="hand2")
+            sku_short = sku_text[:18] if sku_text else ""
+            sku_lbl = tk.Label(tile, text=sku_short, font=("Segoe UI", 7),
+                               fg="#9333ea", bg="#f5f3ff", cursor="hand2")
+            code_lbl.place(relx=0.5, rely=0.72, anchor=tk.CENTER)
+            sku_lbl.place(relx=0.5, rely=0.87, anchor=tk.CENTER)
+
+            # Usage badge (top-right corner) — how many current orders use this charm
+            n_orders = usage.get(code, 0)
+            if n_orders:
+                badge = tk.Label(tile, text=f"\u00d7{n_orders}",
+                                 font=("Segoe UI", 7, "bold"),
+                                 fg="#ffffff", bg="#7c3aed", cursor="hand2",
+                                 padx=3, pady=1)
+                badge.place(relx=1.0, rely=0.0, anchor=tk.NE, x=-3, y=3)
+            else:
+                badge = None
+
+            all_widgets = [w for w in (tile, img_lbl, code_lbl, sku_lbl, badge) if w]
+
+            # Single click: select charm
+            def _click(_, c=code):
+                self._on_charm_tile_click(c)
+            # Double click: select charm AND immediately save
+            def _dblclick(_, c=code):
+                self._on_charm_tile_double_click(c)
+            for w in all_widgets:
+                w.bind("<Button-1>", _click)
+                w.bind("<Double-Button-1>", _dblclick)
+
+            # Mousewheel binding on every tile child (the critical scroll fix)
+            for w in all_widgets:
+                w.bind("<MouseWheel>", _scroll)
+
+            # Hover zoom — bind ONLY to the photo label, not the tile background or text
+            def _enter(_, c=code):
+                self._schedule_tile_hover(c)
+            def _leave(_):
+                self._cancel_tile_hover()
+            img_lbl.bind("<Enter>", _enter)
+            img_lbl.bind("<Leave>", _leave)
+
+            self._charm_tile_frames[code] = tile
+            self._charm_tile_info[code] = {
+                "tile": tile, "sku": sku_text, "photo_bytes": photo_bytes,
+            }
+
+        # Initial tile layout (all visible)
+        self._layout_charm_tiles()
+        # Guarantee scrollregion is set after rendering
+        self._d.after(120, _sync_scroll)
+
+        # ── Row 4: Save controls ───────────────────────────────────────
+        bottom = tk.Frame(outer, bg=BG)
+        bottom.grid(row=4, column=0, sticky="ew")
+
+        tk.Frame(bottom, bg=COLORS["border"], height=1).pack(fill=tk.X, pady=(6, 8))
+
+        shop_row = tk.Frame(bottom, bg=BG)
+        shop_row.pack(fill=tk.X, padx=8, pady=(0, 4))
+        tk.Label(shop_row,
+                 text="Charm Shop" if self._lang == "en" else "\u6302\u4ef6\u5e97\u94fa",
+                 font=("Segoe UI", 9, "bold"), fg=COLORS["muted"],
+                 bg=BG).pack(anchor=tk.W, pady=(0, 2))
+        shop_var = tk.StringVar()
+        shop_cb = ttk.Combobox(shop_row, textvariable=shop_var,
+                               values=[""] + self._charm_shops,
+                               font=("Segoe UI", 10))
+        shop_cb.pack(fill=tk.X)
+        self._edit_widgets["shop_var"] = shop_var
+        self._edit_widgets["shop_cb"] = shop_cb
+
+        btn_row = tk.Frame(bottom, bg=BG)
+        btn_row.pack(fill=tk.X, padx=8, pady=(6, 4))
+        save_btn = ttk.Button(btn_row,
+                              text="\U0001F4BE  Save" if self._lang == "en" else "\U0001F4BE  \u4fdd\u5b58",
+                              command=self._save, style="Tool.TButton")
+        save_btn.pack(side=tk.LEFT)
+        # "Clear charm" shortcut button
+        clear_btn = ttk.Button(btn_row,
+                               text="\u2715  Clear charm" if self._lang == "en" else "\u2715  \u6e05\u9664\u6302\u4ef6",
+                               command=self._clear_charm_assignment, style="Tool.TButton")
+        clear_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        self._save_status_lbl.config(bg=BG)
+        self._save_status_lbl.pack(anchor=tk.W, padx=8, pady=(0, 2))
+        self._edit_widgets["save_btn"] = save_btn
+
+        # No-selection hint
+        self._gallery_hint = tk.Label(
+            outer,
+            text="\u2190  Select an order on the left to assign a charm" if self._lang == "en"
+            else "\u2190  \u5728\u5de6\u4fa7\u9009\u62e9\u8ba2\u5355\u4ee5\u5206\u914d\u6302\u4ef6",
+            font=("Segoe UI", 9), fg=COLORS["muted"], bg=BG,
+            wraplength=290, justify=tk.CENTER,
+        )
+        self._gallery_hint.place(relx=0.5, rely=0.62, anchor=tk.CENTER)
+
+    # ── Recently-used pinned strip ────────────────────────────────────
+
+    def _rebuild_recently_used_row(self) -> None:
+        """No-op — recently-used strip has been removed."""
+
+    # ── Charm tile layout (filter-aware) ─────────────────────────────
+
+    def _layout_charm_tiles(self) -> None:
+        """Re-grid tiles that match the current filter query."""
+        if not hasattr(self, "_charm_tile_info"):
+            return
+        q = ""
+        if hasattr(self, "_charm_filter_var"):
+            raw = self._charm_filter_var.get().strip()
+            # Ignore the placeholder text
+            if not raw.startswith("\U0001F50D"):
+                q = raw.lower()
+
+        COLS = 2
+        seq = 0
+        for code, info in self._charm_tile_info.items():
+            tile = info["tile"]
+            matches = (not q) or (q in code.lower()) or (q in info["sku"].lower())
+            if matches:
+                tile.grid(row=seq // COLS, column=seq % COLS,
+                          padx=4, pady=4, sticky="nsew")
+                seq += 1
+            else:
+                tile.grid_remove()
+
+        if hasattr(self, "_gallery_canvas"):
+            self._d.after(50, lambda: self._gallery_canvas.configure(
+                scrollregion=self._gallery_canvas.bbox("all") or (0, 0, 0, 0)
+            ))
+
+    # ── Charm tile hover zoom ─────────────────────────────────────────
+
+    def _schedule_tile_hover(self, code: str) -> None:
+        self._cancel_tile_hover()
+        self._tile_hover_after[0] = self._d.after(250, lambda: self._show_tile_hover(code))
+
+    def _cancel_tile_hover(self) -> None:
+        if self._tile_hover_after[0] is not None:
+            self._d.after_cancel(self._tile_hover_after[0])
+            self._tile_hover_after[0] = None
+        if self._tile_hover_tip is not None:
+            try:
+                self._tile_hover_tip.destroy()
+            except Exception:
+                pass
+            self._tile_hover_tip = None
+        self._tile_hover_photo_ref.clear()
+
+    def _show_tile_hover(self, code: str) -> None:
+        if not self._pil_ok or Image is None or ImageTk is None:
+            return
+        info = self._charm_tile_info.get(code) if hasattr(self, "_charm_tile_info") else None
+        raw = info.get("photo_bytes") if info else None
+        if not raw:
+            return
+        entry = self._charm_library.get(code)
+        try:
+            im = Image.open(BytesIO(raw))
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.mode else "RGB")
+            if im.mode == "RGBA":
+                bg_im = Image.new("RGB", im.size, (255, 255, 255))
+                bg_im.paste(im, mask=im.split()[3])
+                im = bg_im
+            w, h = im.size
+            max_dim = 320
+            if w > max_dim or h > max_dim:
+                ratio = min(max_dim / w, max_dim / h)
+                im = im.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
+            ph = ImageTk.PhotoImage(im)
+            self._tile_hover_photo_ref.clear()
+            self._tile_hover_photo_ref.append(ph)
+        except Exception:
+            return
+
+        tip = tk.Toplevel(self._d)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tip.configure(bg="#ffffff", highlightthickness=2,
+                      highlightbackground="#7c3aed")
+        # Photo
+        tk.Label(tip, image=ph, bg="#ffffff", bd=0).pack()
+        # Code + SKU caption
+        caption = code
+        if entry and entry.sku:
+            caption += f"  ·  {entry.sku}"
+        tk.Label(tip, text=caption, font=("Segoe UI", 9, "bold"),
+                 fg="#5b21b6", bg="#f5f3ff", pady=4).pack(fill=tk.X)
+        tip.update_idletasks()
+
+        px = self._d.winfo_pointerx()
+        py = self._d.winfo_pointery()
+        sw = self._d.winfo_screenwidth()
+        sh = self._d.winfo_screenheight()
+        tw = tip.winfo_reqwidth()
+        th = tip.winfo_reqheight()
+        x = min(max(8, px + 16), sw - tw - 8)
+        y = min(max(8, py - th - 8), sh - th - 8)
+        tip.geometry(f"+{x}+{y}")
+        self._tile_hover_tip = tip
+
+    # ── Clear charm assignment ────────────────────────────────────────
+
+    def _row_num_for_item(self, d: dict) -> int | None:
+        """Resolve the Product Map row number for an item dict.
+
+        Tries the full normalized title first, then a 50-char prefix (backward
+        compat for items cached before the [:50] truncation was removed), then
+        a starts-with scan as a last resort for very long catalog titles.
+        """
+        # Primary key (full normalized order title)
+        row = self._title_to_row.get(d["norm_title"])
+        if row is not None:
+            return row
+        # Backward compat: title stored with [:50] truncation
+        short = d["norm_title"][:50]
+        row = self._title_to_row.get(short)
+        if row is not None:
+            return row
+        # Last resort: find any catalog key that starts with the item's norm_title
+        for key, r in self._title_to_row.items():
+            if key.startswith(d["norm_title"]) or d["norm_title"].startswith(key):
+                return r
+        return None
+
+    def _upload_photo_for_order(self) -> None:
+        """Open a file dialog to replace the product photo for the selected order.
+
+        The new image is:
+          1. Re-encoded as a JPEG and written to the Product Map sheet in
+             supplier_catalog.xlsx for the matched catalog row.
+          2. Applied immediately to EVERY in-memory order that shares the same
+             product title, so the tree thumbnails refresh live without a restart.
+          3. Stored in self._catalog_photos so subsequent _build_item_lists calls
+             (e.g. after re-generate) also pick up the new canonical image.
+        """
+        if not self._pil_ok or Image is None or ImageTk is None:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "PIL not available" if self._lang == "en" else "\u65e0\u6cd5\u5904\u7406\u56fe\u7247",
+                "Pillow library is required to upload photos."
+                if self._lang == "en" else
+                "\u9700\u8981 Pillow \u5e93\u624d\u80fd\u4e0a\u4f20\u56fe\u7247\u3002",
+            )
+            return
+
+        if update_product_map_photo is None:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Unavailable",
+                "Photo update function not imported — check installation."
+                if self._lang == "en" else
+                "\u56fe\u7247\u66f4\u65b0\u529f\u80fd\u672a\u5bfc\u5165\uff0c\u8bf7\u68c0\u67e5\u5b89\u88c5\u3002",
+            )
+            return
+
+        d = self._selected
+        if not d:
+            return
+
+        self._refresh_title_to_row()
+        row_num = self._row_num_for_item(d)
+        if row_num is None:
+            from tkinter import messagebox
+            messagebox.showwarning(
+                "Product not in catalog" if self._lang == "en"
+                else "\u4e0d\u5728\u76ee\u5f55\u4e2d",
+                ("This product has no catalog entry yet.\n"
+                 "Run a job first to add it to supplier_catalog.xlsx.")
+                if self._lang == "en" else
+                "\u6b64\u5546\u54c1\u5c1a\u672a\u5efa\u7acb\u76ee\u5f55\u6761\u76ee\uff0c\u8bf7\u5148\u8fd0\u884c\u4e00\u6b21\u4efb\u52a1\u5c06\u5176\u6dfb\u52a0\u5230 supplier_catalog.xlsx\u3002",
+            )
+            return
+
+        from tkinter import filedialog
+        path_str = filedialog.askopenfilename(
+            parent=self._d,
+            title="Choose product photo" if self._lang == "en" else "\u9009\u62e9\u5546\u54c1\u56fe\u7247",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path_str:
+            return
+
+        # ── Re-encode as JPEG ─────────────────────────────────────────────
+        try:
+            from io import BytesIO
+            im = Image.open(path_str)
+            if im.mode not in ("RGB",):
+                if im.mode == "RGBA":
+                    bg = Image.new("RGB", im.size, (255, 255, 255))
+                    bg.paste(im, mask=im.split()[3])
+                    im = bg
+                else:
+                    im = im.convert("RGB")
+            buf = BytesIO()
+            im.save(buf, format="JPEG", quality=90)
+            new_bytes = buf.getvalue()
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Image error" if self._lang == "en" else "\u56fe\u7247\u9519\u8bef",
+                f"Could not open image:\n{exc}",
+            )
+            return
+
+        # ── Write to supplier_catalog.xlsx ────────────────────────────────
+        try:
+            update_product_map_photo(FILE_SUPPLIER_CATALOG, row_num, new_bytes)
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Save error" if self._lang == "en" else "\u4fdd\u5b58\u9519\u8bef",
+                f"Failed to write photo to catalog:\n{exc}",
+            )
+            return
+
+        # ── Update canonical photo cache ──────────────────────────────────
+        norm = d["norm_title"]
+        self._catalog_photos[norm] = new_bytes
+        if norm[:50] not in self._catalog_photos or self._catalog_photos[norm[:50]] is not new_bytes:
+            self._catalog_photos[norm[:50]] = new_bytes
+
+        # ── Propagate to every in-memory order with the same product title ─
+        updated_count = 0
+        for item_list in (self._cg_items, self._ch_items):
+            for item_d in item_list:
+                if (item_d["norm_title"] == norm
+                        or item_d["norm_title"][:50] == norm[:50]):
+                    item_d["photo_bytes"] = new_bytes
+                    updated_count += 1
+
+        # ── Refresh the photo preview in the detail panel ─────────────────
+        ph = self._make_preview(new_bytes, max_dim=115)
+        if ph:
+            self._detail_photo_ref.clear()
+            self._detail_photo_ref.append(ph)
+            self._detail_photo_lbl.config(image=ph, text="", width=115, height=115)
+
+        # ── Refresh tree thumbnails (old refs cleared to avoid memory bloat) ─
+        self._tk_img_refs.clear()
+        self._populate_tree()
+
+        # ── Feedback ─────────────────────────────────────────────────────
+        if self._lang == "en":
+            msg = (f"\u2713 Photo saved  \u2014  updated {updated_count} "
+                   f"order{'s' if updated_count != 1 else ''}")
+        else:
+            msg = f"\u2713 \u56fe\u7247\u5df2\u4fdd\u5b58\uff0c\u5171\u66f4\u65b0 {updated_count} \u4e2a\u8ba2\u5355"
+        self._upload_photo_status.config(text=msg)
+
+    def _clear_charm_assignment(self) -> None:
+        """Remove the charm code (and optionally shop) for the selected order."""
+        d = self._selected
+        if not d or update_product_map_cells is None:
+            return
+        self._refresh_title_to_row()
+        row_num = self._row_num_for_item(d)
+        if row_num is None:
+            return
+        try:
+            update_product_map_cells(FILE_SUPPLIER_CATALOG, row_num,
+                                     charm_code="", charm_shop="")
+            d["charm_code"] = ""
+            d["charm_shop"] = ""
+            d["status"] = "needs_code"
+            self._selected_charm_code = ""
+            self._highlight_charm_tile("")
+            if "shop_var" in self._edit_widgets:
+                self._edit_widgets["shop_var"].set("")
+            self._save_status_lbl.config(
+                text="\u2713 Charm cleared" if self._lang == "en" else "\u2713 \u5df2\u6e05\u9664\u6302\u4ef6"
+            )
+            self._populate_tree()
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Error", str(e))
+
+    # ── Charm tile click ──────────────────────────────────────────────
+
+    # ── Import charm photos ─────────────────────────────────────────
+
+    def _charm_import_photos(self) -> None:
+        """Browse for charm photos, show the SKU dialog, then import into the workbook."""
+        from tkinter import filedialog as _fd
+
+        filetypes = [
+            ("Image files", "*.png *.jpg *.jpeg *.webp"),
+            ("All files", "*.*"),
+        ]
+        paths = _fd.askopenfilenames(
+            parent=self._d,
+            title="Select charm photo(s) to import" if self._lang == "en"
+                  else "\u9009\u62e9\u8981\u5bfc\u5165\u7684\u6302\u4ef6\u7167\u7247",
+            filetypes=filetypes,
+        )
+        if not paths:
+            return
+
+        # Stage every selected file as __incoming__<token>_<stem>.<ext>
+        charm_dir = DEFAULT_CHARM_IMAGES_DIR
+        charm_dir.mkdir(parents=True, exist_ok=True)
+        staged_files: list[Path] = []
+        for p in paths:
+            try:
+                src = Path(p)
+                if not src.is_file():
+                    continue
+                ext = src.suffix.lower()
+                if ext not in CHARM_IMAGE_EXTS:
+                    continue
+                stem = (
+                    re.sub(r"[^\w\-.]+", "_", src.stem, flags=re.UNICODE)
+                    .strip("._") or "photo"
+                )
+                name = f"{CHARM_INCOMING_PREFIX}{secrets.token_hex(4)}_{stem[:72]}{ext}"
+                dest = charm_dir / name
+                shutil.copy2(src, dest)
+                staged_files.append(dest)
+            except OSError:
+                continue
+
+        if not staged_files:
+            messagebox.showinfo(
+                "No files" if self._lang == "en" else "\u65e0\u6587\u4ef6",
+                "No valid image files were selected." if self._lang == "en"
+                else "\u672a\u9009\u62e9\u6709\u6548\u7684\u56fe\u7247\u6587\u4ef6\u3002",
+                parent=self._d,
+            )
+            return
+
+        # Show the SKU dialog — user can review/edit auto-generated SKUs
+        dlg = _CharmImportSkuDialog(self._d, staged_files, self._lang)
+
+        if not dlg.confirmed:
+            # User cancelled — remove the staged files so nothing is left over
+            for f in staged_files:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            return
+
+        sku_overrides: dict[str, str] = dlg.result   # {staged_stem: sku_text}
+        n_staged = len(staged_files)
+
+        self._save_status_lbl.config(
+            text=f"Importing {n_staged} photo(s)\u2026" if self._lang == "en"
+            else f"\u6b63\u5728\u5bfc\u5165 {n_staged} \u5f20\u7167\u7247\u2026",
+        )
+        self._d.update_idletasks()
+
+        def _work() -> None:
+            n_imported = 0
+            try:
+                if import_charm_screenshot_assets is not None:
+                    n_imported, imp_lines = import_charm_screenshot_assets(
+                        charm_dir,
+                        FILE_SUPPLIER_CATALOG,
+                        patterns=[CHARM_INCOMING_PATTERN],
+                        sku_overrides=sku_overrides,
+                    )
+                    for line in imp_lines:
+                        self._parent._log_q.put(line + "\n")
+                else:
+                    # Fallback to subprocess when direct import is unavailable
+                    import subprocess as _sp
+                    proc = _sp.run(
+                        [
+                            sys.executable, str(GENERATOR),
+                            "--project-dir", str(PROJECT_ROOT),
+                            "--import-charm-images",
+                            *charm_import_pattern_argv(),
+                        ],
+                        cwd=str(PROJECT_ROOT),
+                        capture_output=True, text=True,
+                        encoding="utf-8", errors="replace",
+                    )
+                    if proc.stdout:
+                        self._parent._log_q.put(proc.stdout)
+                    if proc.stderr:
+                        self._parent._log_q.put(proc.stderr)
+                    n_imported = n_staged
+            except Exception as e:
+                self._parent._log_q.put(f"Import error: {e}\n")
+            finally:
+                _n = n_imported or n_staged
+
+                def _done() -> None:
+                    self._rebuild_gallery()
+                    self._save_status_lbl.config(
+                        text=(
+                            f"\u2713 Imported {_n} charm(s)" if self._lang == "en"
+                            else f"\u2713 \u5df2\u5bfc\u5165 {_n} \u4e2a\u6302\u4ef6"
+                        ),
+                    )
+
+                self._d.after(0, _done)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    # ── Reorder charm codes ───────────────────────────────────────────
+
+    def _charm_reorder(self) -> None:
+        """Open the existing _CharmReorderDialog; rebuild gallery on close."""
+        if reorder_charm_library_rows is None or load_charm_library is None:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Unavailable",
+                "Charm reorder is not available (missing imports).",
+            )
+            return
+        if not FILE_SUPPLIER_CATALOG.exists():
+            from tkinter import messagebox
+            messagebox.showinfo("No catalog", str(FILE_SUPPLIER_CATALOG))
+            return
+        try:
+            entries = load_charm_library(FILE_SUPPLIER_CATALOG)
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Error", str(e))
+            return
+        if not entries:
+            from tkinter import messagebox
+            messagebox.showinfo(
+                "Empty" if self._lang == "en" else "\u7a7a",
+                "No charms in the library yet." if self._lang == "en"
+                else "\u6302\u4ef6\u5e93\u4e2d\u6682\u65e0\u6302\u4ef6\u3002",
+            )
+            return
+
+        charm_dir = DEFAULT_CHARM_IMAGES_DIR
+        # The reorder dialog is modal (grab_set) — execution blocks here until it closes
+        _CharmReorderDialog(self._parent, entries, FILE_SUPPLIER_CATALOG, charm_dir)
+        # After close: rebuild everything with the new code order
+        self._rebuild_gallery()
+        self._save_status_lbl.config(
+            text="\u2713 Charm codes reordered" if self._lang == "en"
+            else "\u2713 \u6302\u4ef6\u7f16\u7801\u5df2\u91cd\u6392",
+        )
+
+    # ── Rebuild gallery after import / reorder ────────────────────────
+
+    def _rebuild_gallery(self) -> None:
+        """Reload charm library from disk and rebuild the entire gallery + tree."""
+        try:
+            if load_charm_library is not None:
+                self._charm_library = load_charm_library(FILE_SUPPLIER_CATALOG)
+                self._charm_codes = list(self._charm_library.keys())
+            if load_charm_shops is not None:
+                shops = load_charm_shops(FILE_SUPPLIER_CATALOG)
+                self._charm_shops = [cs.shop_name for cs in shops if cs.shop_name]
+                self._charm_shop_stalls = {cs.shop_name: cs.stall for cs in shops if cs.shop_name and cs.stall}
+        except Exception:
+            pass
+        self._build_item_lists()
+        if self._mode == "charms":
+            self._build_mode_panel()
+        self._populate_tree()
+
+    def _on_charm_tile_click(self, code: str) -> None:
+        """Single click: select the charm tile and always enforce the canonical
+        shop — a charm code must always map to the same supplier."""
+        if "code_var" in self._edit_widgets:
+            self._edit_widgets["code_var"].set(code)
+        self._selected_charm_code = code
+        self._highlight_charm_tile(code)
+        canonical = self._canonical_charm_shop(code)
+        if canonical:
+            sv = self._edit_widgets.get("shop_var")
+            if sv:
+                sv.set(canonical)   # always override — never allow a different shop
+
+    def _on_charm_tile_double_click(self, code: str) -> None:
+        """Double click: select the charm and immediately save all selected orders."""
+        self._on_charm_tile_click(code)
+        if self._selected_indices:
+            self._save()
+
+    def _highlight_charm_tile(self, code: str) -> None:
+        """Give the selected tile a vivid purple border; reset all others."""
+        for c, tile in self._charm_tile_frames.items():
+            if c == code:
+                tile.config(highlightbackground="#7c3aed", highlightthickness=3,
+                            bg="#ede9fe")
+                for child in tile.winfo_children():
+                    child.config(bg="#ede9fe")
+            else:
+                tile.config(highlightbackground="#e9d5ff", highlightthickness=2,
+                            bg="#f5f3ff")
+                for child in tile.winfo_children():
+                    try:
+                        child.config(bg="#f5f3ff")
+                    except Exception:
+                        pass
+
+    # ── Compatibility shims for old code paths ────────────────────────
+
+    def _build_edit_fields(self) -> None:
+        """Legacy entry point — delegates to _build_mode_panel."""
+        self._build_mode_panel()
+
+    # ── Charm code photo preview ──────────────────────────────────────
+
+    def _update_charm_code_preview(self, code: str) -> None:
+        """Update the live charm photo preview card whenever the code changes."""
+        if not hasattr(self, "_charm_prev_img_lbl"):
+            return
+        entry = self._charm_library.get(code) if code else None
+        if entry is not None and entry.photo_bytes and self._pil_ok:
+            ph = self._make_charm_card_photo(entry.photo_bytes, max_dim=84)
+            if ph:
+                self._charm_lib_photo_ref.clear()
+                self._charm_lib_photo_ref.append(ph)
+                self._charm_prev_img_lbl.config(image=ph, text="")
+                self._charm_prev_code_lbl.config(text=code)
+                sku_parts = []
+                if entry.sku:
+                    sku_parts.append(entry.sku)
+                if entry.default_charm_shop:
+                    sku_parts.append(f"Default: {entry.default_charm_shop}")
+                if entry.notes:
+                    sku_parts.append(entry.notes)
+                self._charm_prev_sku_lbl.config(
+                    text="  |  ".join(sku_parts) if sku_parts else code,
+                )
+                return
+        # No photo or empty code — show placeholder
+        self._charm_lib_photo_ref.clear()
+        self._charm_prev_img_lbl.config(image="", text="")
+        if code and entry is not None:
+            self._charm_prev_code_lbl.config(text=code)
+            self._charm_prev_sku_lbl.config(
+                text=(entry.sku or "(no photo)") if entry else "(not in library)")
+        elif code:
+            self._charm_prev_code_lbl.config(text=code)
+            self._charm_prev_sku_lbl.config(text="Code not found in Charm Library")
+        else:
+            self._charm_prev_code_lbl.config(text="")
+            self._charm_prev_sku_lbl.config(text="Select a charm code above")
+
+    def _make_charm_card_photo(self, raw: bytes, max_dim: int = 84) -> object | None:
+        """Create a square-cropped thumbnail for the charm preview card."""
+        if not self._pil_ok or not raw or Image is None or ImageTk is None:
+            return None
+        try:
+            im = Image.open(BytesIO(raw))
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.mode else "RGB")
+            if im.mode == "RGBA":
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[3])
+                im = bg
+            w, h = im.size
+            if w > max_dim or h > max_dim:
+                ratio = min(max_dim / w, max_dim / h)
+                im = im.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
+            ph = ImageTk.PhotoImage(im)
+            return ph
+        except Exception:
+            return None
+
+    # ── Tree population ───────────────────────────────────────────────
+
+    def _populate_tree(self) -> None:
+        tree = self._tree
+        tree.delete(*tree.get_children())
+        self._tk_img_refs.clear()
+
+        items = self._cg_items if self._mode == "casegrip" else self._ch_items
+        filt   = self._active_filter
+        q      = self._search_var.get().strip().lower()
+
+        # ── 1. Filter ──────────────────────────────────────────────────
+        visible: list[tuple[int, dict]] = []
+        for orig_idx, d in enumerate(items):
+            if filt != "all" and d["status"] != filt:
+                continue
+            if q:
+                if q not in " ".join(str(v) for v in d.values()).lower():
+                    continue
+            visible.append((orig_idx, d))
+
+        # ── 2. Sort (stable) ───────────────────────────────────────────
+        sort_map = self._CH_SORT_MAP if self._mode == "charms" else self._CG_SORT_MAP
+        item_key = sort_map.get(self._sort_col, "")
+        if item_key:
+            reverse = (self._sort_dir == "desc")
+            if item_key == "stall":
+                # Rank by the exact row order of the Stall column in the
+                # Suppliers sheet of supplier_catalog.xlsx.
+                _stall_rank: dict[str, int] = {
+                    s: i for i, s in enumerate(self._sup_stalls)
+                }
+                _fallback = len(self._sup_stalls)
+                def _sort_key(pair: tuple):  # type: ignore[misc]
+                    s = str(pair[1].get("stall") or "").strip()
+                    return _stall_rank.get(s, _fallback)
+            elif item_key.startswith("_ps_"):
+                # Purchase-status sort: rank by _PSTATUS_SORT_ORDER priority.
+                # _ps_case / _ps_grip / _ps_charm
+                comp = item_key[4:]   # "case", "grip", or "charm"
+                _so = self._PSTATUS_SORT_ORDER
+                def _sort_key(pair: tuple):  # type: ignore[misc]
+                    d_ = pair[1]
+                    s = self._pstatuses.get(
+                        (d_.get("order", ""), (d_.get("norm_title") or "")[:50], comp),
+                        "Pending",
+                    )
+                    return _so.get(s, 99)
+            else:
+                def _sort_key(pair: tuple) -> str:  # type: ignore[misc]
+                    v = pair[1].get(item_key, "") or ""
+                    s = str(v).strip()
+                    return s.lower() if s else "\uffff"
+            visible.sort(key=_sort_key, reverse=reverse)
+
+        # ── 3. Render ──────────────────────────────────────────────────
+        labels = self._FILTER_LABELS.get(self._lang, self._FILTER_LABELS["en"])
+        for seq, (orig_idx, d) in enumerate(visible, start=1):
+            # Purchase status takes visual priority over supplier-match status
+            ps = self._worst_pstatus(d)
+            if ps != "Pending":
+                base_tag = self._PSTATUS_TAG.get(ps, d["status"])
+            else:
+                base_tag = d["status"]
+            tag = base_tag if seq % 2 == 1 else f"alt_{base_tag}"
+            thumb = self._thumb(d.get("photo_bytes"))
+            kw: dict = {}
+            if thumb is not None:
+                kw["image"] = thumb
+                kw["text"] = ""
+            else:
+                kw["text"] = "\u2014"
+            st_text = labels.get(d["status"], d["status"])
+            title_short = d["title"]
+            if len(title_short) > 52:
+                title_short = title_short[:50] + "\u2026"
+            raw_notes = (d.get("private_notes") or "").strip()
+            notes_short = (raw_notes[:38] + "\u2026") if len(raw_notes) > 40 else raw_notes
+
+            # Compute per-component purchase status display text.
+            # Use [:50] to match the key format used by generate_shopping_route.py.
+            _order  = d.get("order", "")
+            _norm   = (d.get("norm_title") or "")[:50]
+            _pd     = self._PSTATUS_DISPLAY
+
+            if self._mode == "casegrip":
+                # Show purchase status in Case / Grip cells; "—" when N/A
+                if d["case"]:
+                    _cs = self._pstatuses.get((_order, _norm, "case"), "Pending")
+                    case_cell = _pd.get(_cs, _cs)
+                else:
+                    case_cell = "\u2014"
+                if d["grip"]:
+                    _gs = self._pstatuses.get((_order, _norm, "grip"), "Pending")
+                    grip_cell = _pd.get(_gs, _gs)
+                else:
+                    grip_cell = "\u2014"
+                vals = (seq, f"#{d['order']}", title_short,
+                        d["supplier"] or "\u2014", d["stall"] or "\u2014",
+                        case_cell, grip_cell, d["phone"],
+                        d["qty"], st_text, notes_short)
+            else:
+                _chps = self._pstatuses.get((_order, _norm, "charm"), "Pending")
+                charm_buy_cell = _pd.get(_chps, _chps)
+                vals = (seq, f"#{d['order']}", title_short,
+                        d.get("charm_code") or "\u2014",
+                        d.get("charm_shop") or "\u2014",
+                        d.get("stall") or "\u2014",
+                        d["qty"], st_text, charm_buy_cell, notes_short)
+            tree.insert("", tk.END, iid=str(orig_idx), values=vals, tags=(tag,), **kw)
+
+        # Update column heading sort indicators
+        self._refresh_sort_indicators()
+
+    # ── Selection → detail panel ──────────────────────────────────────
+
+    def _on_select(self, _event=None) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            self._clear_detail()
+            return
+
+        items = self._cg_items if self._mode == "casegrip" else self._ch_items
+
+        # Collect all selected valid indices
+        indices = []
+        for iid in sel:
+            try:
+                idx = int(iid)
+                if 0 <= idx < len(items):
+                    indices.append(idx)
+            except ValueError:
+                pass
+        if not indices:
+            return
+
+        self._selected_indices = indices
+        # Primary item = the most recently clicked (last in selection)
+        primary = items[indices[-1]]
+        self._selected = primary
+
+        n = len(indices)
+        is_multi = n > 1
+
+        # ── Show compact order-info strip ──────────────────────────────
+        self._order_info_frame.pack(fill=tk.X, before=self._mode_panel)
+
+        if is_multi:
+            # Multi-selection summary
+            total_qty = sum(items[i]["qty"] for i in indices)
+            if self._lang == "en":
+                self._detail_title.config(
+                    text=f"{n} orders selected  \u2014  batch assign charm"
+                )
+                self._detail_meta.config(
+                    text=f"Total qty: {total_qty}  \u2022  Ctrl+click or Shift+click to add/remove"
+                )
+            else:
+                self._detail_title.config(
+                    text=f"\u5df2\u9009 {n} \u4e2a\u8ba2\u5355 \u2014 \u6279\u91cf\u5206\u914d\u6302\u4ef6"
+                )
+                self._detail_meta.config(
+                    text=f"\u603b\u6570\u91cf: {total_qty}  \u2022  Ctrl/Shift \u70b9\u51fb\u6dfb\u52a0\u9009\u62e9"
+                )
+            self._detail_notes.config(text="")
+            # Hide photo frame for multi-select
+            self._detail_photo_frame.pack_forget()
+        else:
+            d = primary
+            self._detail_title.config(text=d["title"])
+            parts = [f"Order #{d['order']}"]
+            if d.get("phone"):
+                parts.append(d["phone"])
+            parts.append(f"Qty: {d['qty']}")
+            if d.get("buyer"):
+                parts.append(d["buyer"])
+            if d.get("etsy_shop"):
+                parts.append(d["etsy_shop"])
+            self._detail_meta.config(text="  \u2022  ".join(parts))
+            notes = d.get("private_notes", "")
+            self._detail_notes.config(text=f"\U0001F4CB {notes}" if notes else "")
+
+            # ── Photo preview ──────────────────────────────────────────
+            self._upload_photo_status.config(text="")
+            raw = d.get("photo_bytes")
+            if raw and self._pil_ok:
+                ph = self._make_preview(raw, max_dim=115)
+                if ph:
+                    self._detail_photo_ref.clear()
+                    self._detail_photo_ref.append(ph)
+                    self._detail_photo_lbl.config(image=ph, text="", width=115, height=115)
+                else:
+                    self._detail_photo_lbl.config(
+                        image="",
+                        text="No photo" if self._lang == "en" else "\u65e0\u56fe\u7247",
+                        width=16, height=4,
+                    )
+            else:
+                self._detail_photo_ref.clear()
+                self._detail_photo_lbl.config(
+                    image="",
+                    text="No photo" if self._lang == "en" else "\u65e0\u56fe\u7247",
+                    width=16, height=4,
+                )
+            self._detail_photo_frame.pack(
+                fill=tk.X, before=self._order_info_sep
+            )
+
+        # ── Show save controls ─────────────────────────────────────────
+        if self._mode == "casegrip":
+            self._save_controls_frame.pack(fill=tk.X, padx=12, pady=(8, 0))
+
+        self._save_status_lbl.config(text="")
+
+        # ── Populate edit fields ───────────────────────────────────────
+        if self._mode == "casegrip":
+            # For multi-select in CG mode, pre-fill from primary only if uniform
+            sups  = {items[i].get("supplier", "") for i in indices}
+            stalls = {items[i].get("stall", "") for i in indices}
+            self._edit_widgets["sup_var"].set(next(iter(sups)) if len(sups) == 1 else "")
+            self._edit_widgets["stall_var"].set(next(iter(stalls)) if len(stalls) == 1 else "")
+        else:
+            # For charms: show current code only if all selected have the same one
+            codes = {items[i].get("charm_code", "") for i in indices}
+            charm_code = next(iter(codes)) if len(codes) == 1 else ""
+            shops = {items[i].get("charm_shop", "") for i in indices}
+            if "shop_var" in self._edit_widgets:
+                self._edit_widgets["shop_var"].set(next(iter(shops)) if len(shops) == 1 else "")
+            # Highlight the shared charm tile (or deselect if mixed)
+            self._selected_charm_code = charm_code
+            self._highlight_charm_tile(charm_code)
+            if self._gallery_hint is not None:
+                self._gallery_hint.place_forget()
+
+
+    def _clear_detail(self) -> None:
+        """Reset the panel to its default no-selection state."""
+        self._selected = None
+        self._selected_indices = []
+        self._order_info_frame.pack_forget()
+        self._save_controls_frame.pack_forget()
+        self._detail_title.config(text="")
+        self._detail_meta.config(text="")
+        self._detail_notes.config(text="")
+        self._save_status_lbl.config(text="")
+        # Clear photo preview
+        self._detail_photo_frame.pack_forget()
+        self._detail_photo_lbl.config(image="", text="")
+        self._detail_photo_ref.clear()
+        self._upload_photo_status.config(text="")
+        self._highlight_charm_tile("")
+        self._selected_charm_code = ""
+        if self._mode == "charms" and self._gallery_hint is not None:
+            self._gallery_hint.place(relx=0.5, rely=0.55, anchor=tk.CENTER)
+
+    # ── Purchase status helpers ───────────────────────────────────────
+
+    def _worst_pstatus(self, d: dict) -> str:
+        """Return the worst purchase status for a tree row.
+
+        For CG items computes the worst across all present components (case, grip).
+        For charm items returns the single charm status.
+        "Pending" is the default when no explicit status is stored.
+        Priority (worst-first): Out of Production > Out of Stock > Pending > Purchased.
+        """
+        order = d.get("order", "")
+        norm  = (d.get("norm_title") or "")[:50]   # must match xlsx [:50] key format
+        if self._mode == "casegrip":
+            present: list[str] = []
+            if d.get("case"):
+                present.append(self._pstatuses.get((order, norm, "case"), "Pending"))
+            if d.get("grip"):
+                present.append(self._pstatuses.get((order, norm, "grip"), "Pending"))
+            if not present:
+                return "Pending"
+            for p in self._PSTATUS_PRIORITY:
+                if p in present:
+                    return p
+            return present[0]
+        else:
+            return self._pstatuses.get((order, norm, "charm"), "Pending")
+
+
+    def _load_pstatuses_cache(self) -> None:
+        """Load persisted purchase statuses from the JSON cache file."""
+        import json as _json
+        cache_path = OUTPUT_DIR / "route_statuses_cache.json"
+        if not cache_path.exists():
+            return
+        try:
+            with open(cache_path, encoding="utf-8") as fh:
+                raw: dict = _json.load(fh)
+            for k_str, val in raw.items():
+                parts = k_str.split("\x00", 2)
+                if len(parts) == 3 and val in self._PURCHASE_STATUSES:
+                    order_num, norm_title, comp = parts
+                    # Enforce [:50] so keys always match the xlsx round-trip format
+                    self._pstatuses[(order_num, norm_title[:50], comp)] = val
+        except Exception:
+            pass
+
+    def _save_pstatuses_cache(self) -> None:
+        """Write all current purchase statuses to the JSON cache file."""
+        import json as _json
+        cache_path = OUTPUT_DIR / "route_statuses_cache.json"
+        try:
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            raw = {"\x00".join(k): v for k, v in self._pstatuses.items()}
+            with open(cache_path, "w", encoding="utf-8") as fh:
+                _json.dump(raw, fh, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    # ── Canonical charm-shop lookup ───────────────────────────────────
+
+    def _canonical_charm_shop(self, charm_code: str) -> str:
+        """Return the single authoritative charm shop for *charm_code*, or ''
+        if none has been established yet.
+
+        Priority order (mirrors normalize_catalog_charm_shops):
+          1. Charm Library's ``default_charm_shop`` — set by the user or the
+             pipeline normaliser; this is the ground-truth.
+          2. Any existing ``charm_shop`` already assigned to an order with this
+             code in the current session (first-found wins).
+
+        Callers should use this to enforce the rule: one code → one shop.
+        """
+        if not charm_code:
+            return ""
+        lib_entry = self._charm_library.get(charm_code)
+        if lib_entry and getattr(lib_entry, "default_charm_shop", ""):
+            return lib_entry.default_charm_shop
+        for item_d in self._ch_items:
+            if item_d.get("charm_code") == charm_code:
+                shop = (item_d.get("charm_shop") or "").strip()
+                if shop:
+                    return shop
+        return ""
+
+    # ── Row-mapping refresh ───────────────────────────────────────────
+
+    def _refresh_title_to_row(self) -> None:
+        """Re-read the Product Map and rebuild title_to_row from scratch.
+
+        The catalog may be sorted or rebuilt between when the dashboard first
+        opens and when the user clicks Save.  A stale mapping can point a
+        product title to the wrong row — in the worst case to the merged TOTAL
+        row — causing ``'MergedCell' object attribute 'value' is read-only``.
+
+        This is called at the start of every save operation so the row numbers
+        are always current without requiring the user to close and reopen the
+        dashboard.
+        """
+        if list_product_map_rows_for_picker is None or not FILE_SUPPLIER_CATALOG.exists():
+            return
+        try:
+            new_map: dict[str, int] = {}
+            for pr in list_product_map_rows_for_picker(FILE_SUPPLIER_CATALOG):
+                full_key = _normalize(pr.title)
+                new_map[full_key] = pr.row_num
+                new_map[full_key[:50]] = pr.row_num
+            self._title_to_row = new_map
+        except Exception:
+            pass   # keep the existing mapping if the refresh fails
+
+    # ── Save (single or batch) ────────────────────────────────────────
+
+    def _save(self) -> None:
+        if not self._selected_indices or update_product_map_cells is None:
+            return
+        items = self._cg_items if self._mode == "casegrip" else self._ch_items
+
+        # Always refresh the row mapping before writing so stale row numbers
+        # (from catalog sorts / rebuilds that happened since the dashboard opened)
+        # never reach update_product_map_cells.
+        self._refresh_title_to_row()
+
+        # ── Resolve what to write ──────────────────────────────────────
+        if self._mode == "casegrip":
+            new_sup   = self._edit_widgets["sup_var"].get().strip()
+            new_stall = self._edit_widgets["stall_var"].get().strip()
+            new_code  = new_shop = ""
+        else:
+            new_code = self._selected_charm_code
+            new_shop = self._edit_widgets["shop_var"].get().strip()
+            new_sup  = new_stall = ""
+            if not new_code:
+                from tkinter import messagebox
+                messagebox.showwarning(
+                    "No charm selected" if self._lang == "en" else "\u672a\u9009\u62e9\u6302\u4ef6",
+                    "Click a charm tile in the gallery to select a charm code." if self._lang == "en"
+                    else "\u8bf7\u5728\u6302\u4ef6\u5e93\u4e2d\u70b9\u51fb\u4e00\u4e2a\u6302\u4ef6\u56fe\u683c\u3002",
+                )
+                return
+            # ── Enforce canonical shop (1:1 rule) ─────────────────────
+            # A charm code must always map to the same shop.  Override
+            # whatever is in the dropdown with the established canonical
+            # shop so this invariant can never be violated from the UI.
+            _canonical = self._canonical_charm_shop(new_code)
+            if _canonical:
+                if new_shop and new_shop != _canonical:
+                    # Silently correct the mismatch — the tile-click handler
+                    # should have already set the right shop, but guard here
+                    # as a second line of defence.
+                    new_shop = _canonical
+                    sv = self._edit_widgets.get("shop_var")
+                    if sv:
+                        sv.set(new_shop)
+                elif not new_shop:
+                    new_shop = _canonical
+                    sv = self._edit_widgets.get("shop_var")
+                    if sv:
+                        sv.set(new_shop)
+
+        # ── Batch loop — write every selected row ──────────────────────
+        skipped: list[str] = []
+        saved_count = 0
+        errors: list[str] = []
+
+        for idx in self._selected_indices:
+            if idx < 0 or idx >= len(items):
+                continue
+            d = items[idx]
+            row_num = self._row_num_for_item(d)
+            if row_num is None:
+                skipped.append(d["title"][:40])
+                continue
+            try:
+                if self._mode == "casegrip":
+                    update_product_map_cells(
+                        FILE_SUPPLIER_CATALOG, row_num,
+                        shop_name=new_sup, stall=new_stall,
+                    )
+                    d["supplier"] = new_sup
+                    d["stall"]    = new_stall
+                    d["status"]   = "ready" if (new_sup or new_stall) else d["status"]
+                else:
+                    update_product_map_cells(
+                        FILE_SUPPLIER_CATALOG, row_num,
+                        charm_code=new_code, charm_shop=new_shop,
+                    )
+                    d["charm_code"] = new_code
+                    d["charm_shop"] = new_shop
+                    if new_code and new_shop:
+                        d["status"] = "assigned"
+                    elif not new_code:
+                        d["status"] = "needs_code"
+                    else:
+                        d["status"] = "needs_shop"
+                saved_count += 1
+            except Exception as e:
+                errors.append(str(e))
+
+        # ── Feedback ───────────────────────────────────────────────────
+        if errors:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Batch save — errors",
+                f"{saved_count} saved, {len(errors)} failed:\n" + "\n".join(errors[:5]),
+            )
+        elif skipped:
+            from tkinter import messagebox
+            messagebox.showwarning(
+                "Batch save — not found",
+                f"{saved_count} saved.\n"
+                f"{len(skipped)} product(s) not in catalog:\n" + "\n".join(skipped[:5]),
+            )
+
+        if saved_count:
+            n = len(self._selected_indices)
+            if self._lang == "en":
+                msg = (f"\u2713 Saved {saved_count} order{'s' if n > 1 else ''}"
+                       if saved_count == n else
+                       f"\u2713 Saved {saved_count} / {n}")
+            else:
+                msg = f"\u2713 \u5df2\u4fdd\u5b58 {saved_count} \u4e2a\u8ba2\u5355"
+            self._save_status_lbl.config(text=msg)
+
+            # After a successful charm save, run the catalog normaliser so that
+            # any sibling product-map rows sharing the same charm code are also
+            # corrected to use the canonical shop — enforcing 1:1 consistency
+            # on disk without the user having to do anything extra.
+            if self._mode == "charms" and normalize_catalog_charm_shops is not None:
+                try:
+                    normalize_catalog_charm_shops(FILE_SUPPLIER_CATALOG)
+                except Exception:
+                    pass   # normalisation is best-effort; never block the UI
+
+            self._populate_tree()
+
+    # ── Hover zoom ────────────────────────────────────────────────────
+
+    # ── Inline cell status-picker ─────────────────────────────────────
+
+    def _on_tree_cell_click(self, event: tk.Event) -> None:
+        """On ButtonRelease-1: if a purchase-status column was clicked, show
+        the inline floating status picker anchored to that cell."""
+        region = self._tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+
+        col_id = self._tree.identify_column(event.x)   # e.g. "#6"
+        iid    = self._tree.identify_row(event.y)
+        if not col_id or not iid:
+            return
+
+        # Map "#N" (1-based, excluding icon col) to column name
+        try:
+            col_n = int(col_id.lstrip("#")) - 1     # 0-based index
+        except ValueError:
+            return
+        columns = list(self._tree["columns"])
+        if col_n < 0 or col_n >= len(columns):
+            return
+        col_name = columns[col_n]
+
+        # Only act on purchase-status columns
+        if self._mode == "casegrip":
+            ps_col_comp = {"case": "case", "grip": "grip"}
+        else:
+            ps_col_comp = {"buy_status": "charm"}
+        comp = ps_col_comp.get(col_name)
+        if comp is None:
+            return
+
+        items = self._cg_items if self._mode == "casegrip" else self._ch_items
+        try:
+            item_idx = int(iid)
+        except ValueError:
+            return
+        if item_idx < 0 or item_idx >= len(items):
+            return
+        d = items[item_idx]
+
+        # Skip N/A cells (component absent from this order)
+        if comp == "case" and not d.get("case"):
+            return
+        if comp == "grip" and not d.get("grip"):
+            return
+
+        # Get cell bounding box (relative to the tree widget)
+        try:
+            bbox = self._tree.bbox(iid, col_name)
+        except Exception:
+            return
+        if not bbox:
+            return      # row may be scrolled out of view
+
+        self._show_status_popup(bbox, item_idx, comp, d)
+
+    def _show_status_popup(
+        self, bbox: tuple, item_idx: int, comp: str, d: dict
+    ) -> None:
+        """Minimalist, card-style floating status picker anchored to a cell."""
+        bx, by, bw, bh = bbox
+        order   = d.get("order", "")
+        norm    = (d.get("norm_title") or "")[:50]   # must match xlsx [:50] key format
+        current = self._pstatuses.get((order, norm, comp), "Pending")
+
+        # ── Design tokens ─────────────────────────────────────────────
+        BG          = "#ffffff"
+        BORDER      = "#e2e8f0"
+        TEXT        = "#1e293b"
+        TEXT_MUTED  = "#94a3b8"
+        HOV_BG      = "#f1f5f9"
+        SEL_TEXT    = "#1e293b"
+        PW          = max(bw, 192)
+        ROW_H       = 36
+        PAD_X       = 12
+
+        # Dot colour and current-row tint per status
+        _DOT: dict[str, str] = {
+            "Pending":           "#94a3b8",
+            "Purchased":         "#16a34a",
+            "Out of Stock":      "#d97706",
+            "Out of Production": "#dc2626",
+        }
+        _TINT: dict[str, str] = {
+            "Pending":           "#f8fafc",
+            "Purchased":         "#f0fdf4",
+            "Out of Stock":      "#fffbeb",
+            "Out of Production": "#fef2f2",
+        }
+
+        # ── Build window ─────────────────────────────────────────────
+        # Two nested frames fake a drop-shadow: dark outer shell sits 2 px
+        # below+right of the white card, giving a subtle depth cue.
+        shadow = tk.Toplevel(self._d)
+        shadow.wm_overrideredirect(True)
+        shadow.attributes("-topmost", True)
+        shadow.configure(bg="#cbd5e1")          # shadow colour
+
+        popup = tk.Frame(shadow, bg=BORDER)     # 1 px border ring
+        popup.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        card = tk.Frame(popup, bg=BG)
+        card.pack(fill=tk.BOTH, expand=True)
+
+        # ── Option rows ───────────────────────────────────────────────
+        for i, status in enumerate(self._PURCHASE_STATUSES):
+            is_sel   = (status == current)
+            row_bg   = _TINT[status] if is_sel else BG
+            dot_col  = _DOT[status]
+            txt_font = ("Segoe UI", 9, "bold") if is_sel else ("Segoe UI", 9)
+
+            # Thin separator between rows (skip before first)
+            if i > 0:
+                tk.Frame(card, bg=BORDER, height=1).pack(fill=tk.X)
+
+            row_f = tk.Frame(card, bg=row_bg, cursor="hand2")
+            row_f.pack(fill=tk.X)
+
+            # 3 px left accent bar for the current selection
+            accent_col = dot_col if is_sel else row_bg
+            accent = tk.Frame(row_f, bg=accent_col, width=3)
+            accent.pack(side=tk.LEFT, fill=tk.Y)
+
+            # Coloured dot
+            dot = tk.Label(
+                row_f, text="●",
+                font=("Segoe UI", 7),
+                fg=dot_col, bg=row_bg,
+                padx=PAD_X - 4, pady=0, cursor="hand2",
+            )
+            dot.pack(side=tk.LEFT)
+
+            # Status label
+            lbl = tk.Label(
+                row_f, text=status,
+                font=txt_font,
+                fg=SEL_TEXT, bg=row_bg,
+                pady=0, anchor=tk.W, cursor="hand2",
+            )
+            lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            # Checkmark for current
+            chk = tk.Label(
+                row_f,
+                text="\u2713" if is_sel else "",
+                font=("Segoe UI", 9, "bold"),
+                fg=dot_col, bg=row_bg,
+                padx=PAD_X, pady=0, cursor="hand2",
+            )
+            chk.pack(side=tk.RIGHT)
+
+            # Fixed row height via inner padding
+            for w in (dot, lbl, chk):
+                w.configure(pady=(ROW_H - 18) // 2)
+
+            def _cmd(s=status, sw_=shadow):
+                sw_.destroy()
+                self._apply_status_from_popup(item_idx, comp, s)
+
+            def _enter(_, rf=row_f, ac=accent, dl=dot, ll=lbl, ck=chk,
+                       s=status, dc=dot_col):
+                rf.configure(bg=HOV_BG)
+                ac.configure(bg=dc)
+                for w in (dl, ll, ck):
+                    w.configure(bg=HOV_BG)
+
+            def _leave(_, rf=row_f, ac=accent, dl=dot, ll=lbl, ck=chk,
+                       s=status, dc=dot_col):
+                rb = _TINT[s] if s == current else BG
+                ab = dc if s == current else rb
+                rf.configure(bg=rb)
+                ac.configure(bg=ab)
+                for w in (dl, ll, ck):
+                    w.configure(bg=rb)
+
+            for w in (row_f, accent, dot, lbl, chk):
+                w.bind("<Button-1>", lambda _e, fn=_cmd: fn())
+                w.bind("<Enter>",    _enter)
+                w.bind("<Leave>",    _leave)
+
+        # ── Position ─────────────────────────────────────────────────
+        shadow.update_idletasks()
+        ph  = shadow.winfo_reqheight()
+        tx  = self._tree.winfo_rootx()
+        ty  = self._tree.winfo_rooty()
+        # Align left edge with cell; drop 4 px below cell bottom
+        px  = tx + bx
+        py  = ty + by + bh + 4
+
+        sw_ = shadow.winfo_screenwidth()
+        sh_ = shadow.winfo_screenheight()
+        if px + PW > sw_:
+            px = sw_ - PW - 6
+        if py + ph > sh_:
+            py = ty + by - ph - 4       # flip above when near screen bottom
+
+        # Shadow offset: the shadow shell is 2 px larger on right+bottom
+        shadow.geometry(f"{PW + 2}x{ph + 2}+{px}+{py}")
+        popup.place(x=0, y=0, width=PW, height=ph)
+
+        # ── Grab + dismiss ────────────────────────────────────────────
+        shadow.grab_set()
+        shadow.focus_set()
+
+        def _dismiss_if_outside(event: tk.Event) -> None:
+            hit = shadow.winfo_containing(event.x_root, event.y_root)
+            if hit is None or not str(hit).startswith(str(shadow)):
+                shadow.destroy()
+
+        shadow.bind("<Button-1>", _dismiss_if_outside)
+        shadow.bind("<Escape>",   lambda _: shadow.destroy())
+
+    def _apply_status_from_popup(
+        self, item_idx: int, comp: str, status: str
+    ) -> None:
+        """Persist a status selected via the inline cell picker."""
+        items = self._cg_items if self._mode == "casegrip" else self._ch_items
+        if item_idx < 0 or item_idx >= len(items):
+            return
+        d = items[item_idx]
+        # Truncate norm_title to 50 chars — matches the [:50] key format used
+        # by generate_shopping_route.py when writing and reading the xlsx, so
+        # that our JSON cache and the xlsx status round-trip use identical keys.
+        k = (d.get("order", ""), (d.get("norm_title") or "")[:50], comp)
+
+        if status == "Pending":
+            self._pstatuses.pop(k, None)
+        else:
+            self._pstatuses[k] = status
+        self._save_pstatuses_cache()
+
+        # Repopulate and restore selection + scroll position
+        prev_sel = set(self._tree.selection())
+        self._populate_tree()
+        iid = str(item_idx)
+        try:
+            self._tree.selection_set(iid)
+            self._tree.see(iid)
+        except Exception:
+            for s in prev_sel:
+                try:
+                    self._tree.selection_set(s)
+                except Exception:
+                    pass
+
+
+    # ── Hover zoom ────────────────────────────────────────────────────
+
+    def _on_tree_motion(self, _e: tk.Event | None = None) -> None:
+        tree = self._tree
+        if self._hover_after_id[0] is not None:
+            self._d.after_cancel(self._hover_after_id[0])
+            self._hover_after_id[0] = None
+        try:
+            lx = tree.winfo_pointerx() - tree.winfo_rootx()
+            ly = tree.winfo_pointery() - tree.winfo_rooty()
+        except Exception:
+            return
+        if tree.identify_column(lx) != "#0":
+            self._hide_hover()
+            return
+        iid = tree.identify_row(ly)
+        if not iid:
+            self._hide_hover()
+            return
+        if iid == self._hover_active_iid[0] and self._hover_tip is not None:
+            return
+        self._hide_hover()
+        self._hover_after_id[0] = self._d.after(250, lambda i=iid: self._show_hover(i))
+
+    def _show_hover(self, iid: str) -> None:
+        if Image is None or ImageTk is None:
+            return
+        try:
+            idx = int(iid)
+        except ValueError:
+            return
+        items = self._cg_items if self._mode == "casegrip" else self._ch_items
+        if idx < 0 or idx >= len(items):
+            return
+        raw = items[idx].get("photo_bytes")
+        if not raw:
+            return
+        try:
+            im = Image.open(BytesIO(raw))
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.mode else "RGB")
+            if im.mode == "RGBA":
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[3])
+                im = bg
+            w, h = im.size
+            # Always scale to target — upscale small thumbnails AND downscale large originals.
+            # Cap at half the shorter screen dimension so the popup never obscures too much.
+            _sw = self._d.winfo_screenwidth()
+            _sh = self._d.winfo_screenheight()
+            max_dim = min(480, max(320, min(_sw, _sh) // 2))
+            ratio = min(max_dim / w, max_dim / h)
+            new_w, new_h = max(1, int(w * ratio)), max(1, int(h * ratio))
+            if (new_w, new_h) != (w, h):
+                resample = (Image.Resampling.LANCZOS if ratio <= 1.0
+                            else Image.Resampling.BICUBIC)   # BICUBIC smoother for upscale
+                im = im.resize((new_w, new_h), resample)
+            ph = ImageTk.PhotoImage(im)
+            self._hover_photo.clear()
+            self._hover_photo.append(ph)
+        except Exception:
+            return
+
+        self._hover_active_iid[0] = iid
+        tip = tk.Toplevel(self._d)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tip.configure(bg="#ffffff", highlightthickness=2,
+                      highlightbackground=COLORS["accent"])
+        tk.Label(tip, image=ph, bg="#ffffff", bd=0).pack()
+        tip.update_idletasks()
+
+        px = self._d.winfo_pointerx()
+        py = self._d.winfo_pointery()
+        sw = self._d.winfo_screenwidth()
+        sh = self._d.winfo_screenheight()
+        tw = tip.winfo_reqwidth()
+        th = tip.winfo_reqheight()
+        # Position above cursor so the popup doesn't block the row being hovered
+        x = min(max(12, px + 16), sw - tw - 12)
+        y = min(max(12, py - th - 12), sh - th - 12)
+        # Fall back below cursor if there isn't room above
+        if y < 12:
+            y = min(py + 16, sh - th - 12)
+        tip.geometry(f"+{x}+{y}")
+        self._hover_tip = tip
+
+    def _hide_hover(self) -> None:
+        if self._hover_after_id[0] is not None:
+            self._d.after_cancel(self._hover_after_id[0])
+            self._hover_after_id[0] = None
+        self._hover_active_iid[0] = None
+        if self._hover_tip is not None:
+            try:
+                self._hover_tip.destroy()
+            except Exception:
+                pass
+            self._hover_tip = None
+
+    # ── Regenerate ────────────────────────────────────────────────────
+
+    def _regen(self) -> None:
+        if self._parent._run_busy:
+            return
+        self._parent._run_busy = True
+        self._parent._set_chrome_busy(True)
+        self._parent._append_log("Regenerating shopping route...\n")
+        cmd = [sys.executable, str(GENERATOR), "--project-dir", str(PROJECT_ROOT), "--refresh-catalog"]
+
+        def _work():
+            try:
+                proc = subprocess.run(
+                    cmd, cwd=str(PROJECT_ROOT),
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                )
+                if proc.stdout:
+                    self._parent._log_q.put(proc.stdout)
+                if proc.stderr:
+                    self._parent._log_q.put(proc.stderr)
+            except Exception as e:
+                self._parent._log_q.put(str(e))
+            finally:
+                def _done():
+                    self._parent._run_busy = False
+                    self._parent._set_chrome_busy(False)
+                    self._save_status.config(
+                        text="\u2713 Route regenerated" if self._lang == "en"
+                        else "\u2713 \u5df2\u91cd\u65b0\u751f\u6210"
+                    )
+                    self._save_status_lbl.config(
+                        text="\u2713 Route regenerated" if self._lang == "en"
+                        else "\u2713 \u5df2\u91cd\u65b0\u751f\u6210"
+                    )
+                self._parent.after(0, _done)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    # ── Manual order add ─────────────────────────────────────────────
+
+    def _open_add_manual_order(self) -> None:
+        """Open the Add Manual Order dialog."""
+        if Order is None or OrderItem is None or ResolvedItem is None or save_cache is None:
+            from tkinter import messagebox as _mb
+            _mb.showerror(
+                self._t("msg_missing_title") if hasattr(self, "_t") else "Missing imports",
+                "Cannot add a manual order: core imports are unavailable.",
+            )
+            return
+        _AddManualOrderDialog(
+            self._d,
+            lang=self._lang,
+            supplier_shops=self._sup_shops,
+            supplier_stalls=self._sup_stalls,
+            supplier_shop_stalls=self._sup_shop_stalls,
+            supplier_stall_shops=self._sup_stall_shops,
+            charm_codes=self._charm_codes,
+            charm_shop_names=self._charm_shops,
+            charm_shop_stalls=self._charm_shop_stalls,
+            on_submit=self._commit_manual_order,
+        )
+
+    def _commit_manual_order(self, payload: dict) -> None:
+        """Build a ResolvedItem from the dialog payload, append to cache + tree."""
+        # Build Order / OrderItem / ResolvedItem
+        order = Order(
+            order_number=payload["order_number"],
+            etsy_shop="Manual",
+            buyer_name=payload.get("buyer", "").strip(),
+            order_date="",
+            private_notes=payload.get("private_notes", "").strip(),
+        )
+        item = OrderItem(
+            title=payload["title"],
+            quantity=payload["qty"],
+            phone_model=payload.get("phone", "").strip(),
+            style=payload["style"],
+            photo_bytes=payload["photo_bytes"],
+        )
+        order.items.append(item)
+
+        # Build a CatalogEntry when any of the supplier/charm fields are provided
+        supplier = None
+        sup_shop   = payload.get("supplier", "").strip()
+        sup_stall  = payload.get("stall", "").strip()
+        charm_code = payload.get("charm_code", "").strip()
+        charm_shop = payload.get("charm_shop", "").strip()
+        if sup_shop or sup_stall or charm_code or charm_shop:
+            try:
+                from generate_shopping_route import CatalogEntry as _CE
+                supplier = _CE(
+                    product_title=payload["title"],
+                    shop_name=sup_shop,
+                    stall=sup_stall,
+                    charm_code=charm_code,
+                    charm_shop=charm_shop,
+                )
+            except ImportError:
+                supplier = None
+
+        resolved = ResolvedItem(order=order, item=item, supplier=supplier)
+        self._items.append(resolved)
+
+        # Persist the updated cache
+        try:
+            _existing_pdfs: set[str] = set()
+            if load_cache is not None and FILE_ORDERS_CACHE.exists():
+                try:
+                    _, _existing_pdfs = load_cache(FILE_ORDERS_CACHE)
+                except Exception:
+                    _existing_pdfs = set()
+            save_cache(FILE_ORDERS_CACHE, self._items, _existing_pdfs)
+        except Exception as e:
+            from tkinter import messagebox as _mb
+            _mb.showwarning(
+                "Cache warning" if self._lang == "en" else "\u7f13\u5b58\u8b66\u544a",
+                f"Order added in-memory but failed to persist to cache:\n{e}",
+            )
+
+        # Rebuild + refresh UI
+        self._build_item_lists()
+        self._populate_tree()
+        self._save_status.config(
+            text="\u2713 Order added" if self._lang == "en"
+            else "\u2713 \u5df2\u6dfb\u52a0\u8ba2\u5355"
+        )
+        self._d.after(3000, lambda: self._save_status.config(text=""))
+
+
+class _AddManualOrderDialog:
+    """Modal dialog to manually add an order to the dashboard.
+
+    Mandatory fields: product image + at least one of case/grip/charm.
+    All other fields (title, qty, phone, supplier, stall, charm code,
+    charm shop, buyer, private notes) are optional.
+    Submits a payload dict back via ``on_submit`` callback.
+    """
+
+    _MAX_PREVIEW = 160
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        lang: str,
+        supplier_shops: list[str],
+        supplier_stalls: list[str],
+        supplier_shop_stalls: dict[str, str],
+        supplier_stall_shops: dict[str, str],
+        charm_codes: list[str],
+        charm_shop_names: list[str],
+        charm_shop_stalls: dict[str, str],
+        on_submit,
+    ) -> None:
+        self._lang = lang
+        self._sup_shops = supplier_shops
+        self._sup_stalls = supplier_stalls
+        self._sup_shop_stalls = supplier_shop_stalls
+        self._sup_stall_shops = supplier_stall_shops
+        self._charm_codes = charm_codes
+        self._charm_shops = charm_shop_names
+        self._charm_shop_stalls = charm_shop_stalls
+        self._on_submit = on_submit
+        self._photo_bytes: bytes | None = None
+        self._preview_photo: object | None = None
+        self._pil_ok = Image is not None and ImageTk is not None
+
+        d = tk.Toplevel(parent)
+        self._d = d
+        d.title("Add Manual Order" if lang == "en" else "\u6dfb\u52a0\u8ba2\u5355")
+        d.transient(parent)
+        d.grab_set()
+        d.configure(bg=COLORS["app"])
+        d.geometry("560x720")
+        d.minsize(520, 640)
+        d.grid_columnconfigure(0, weight=1)
+        d.grid_rowconfigure(1, weight=1)
+
+        # ── Hero ──────────────────────────────────────────────────────
+        hero = tk.Frame(d, bg=COLORS["hero"], highlightthickness=0)
+        hero.grid(row=0, column=0, sticky="ew")
+        tk.Label(
+            hero,
+            text="Add Manual Order" if lang == "en" else "\u6dfb\u52a0\u8ba2\u5355",
+            font=("Segoe UI", 13, "bold"), fg="#ffffff", bg=COLORS["hero"],
+        ).pack(anchor=tk.W, padx=16, pady=(10, 2))
+        tk.Label(
+            hero,
+            text=("Image and at least one of Case / Grip / Charm are required."
+                  if lang == "en"
+                  else "\u5fc5\u586b\u9879\uff1a\u56fe\u7247 \u4ee5\u53ca "
+                       "\u624b\u673a\u58f3 / \u652f\u67b6 / \u6302\u4ef6 \u81f3\u5c11\u4e00\u9879"),
+            font=("Segoe UI", 9), fg="#dbeafe", bg=COLORS["hero"],
+        ).pack(anchor=tk.W, padx=16, pady=(0, 10))
+
+        # ── Scrollable body ────────────────────────────────────────────
+        body_wrap = tk.Frame(d, bg=COLORS["app"])
+        body_wrap.grid(row=1, column=0, sticky="nsew")
+        body_wrap.grid_columnconfigure(0, weight=1)
+        body_wrap.grid_rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(body_wrap, bg=COLORS["app"],
+                           highlightthickness=0, borderwidth=0)
+        vsb = ttk.Scrollbar(body_wrap, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        body = tk.Frame(canvas, bg=COLORS["app"])
+        body_win = canvas.create_window((0, 0), window=body, anchor=tk.NW)
+        body.bind("<Configure>",
+                  lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(body_win, width=e.width))
+
+        def _scroll(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind("<MouseWheel>", _scroll)
+        body.bind("<MouseWheel>", _scroll)
+
+        # ── Section: Image (required) ──────────────────────────────────
+        sec_img = self._section(body, "IMAGE *" if lang == "en" else "\u56fe\u7247 *")
+        img_row = tk.Frame(sec_img, bg=COLORS["card"])
+        img_row.pack(fill=tk.X, padx=14, pady=(0, 10))
+
+        self._photo_card = tk.Frame(
+            img_row, bg="#f1f5f9", width=self._MAX_PREVIEW,
+            height=self._MAX_PREVIEW, cursor="hand2",
+            highlightthickness=1, highlightbackground="#cbd5e1",
+        )
+        self._photo_card.pack(side=tk.LEFT)
+        self._photo_card.pack_propagate(False)
+        self._photo_hint = tk.Label(
+            self._photo_card,
+            text="\U0001F5BC\n\nClick to upload" if lang == "en"
+            else "\U0001F5BC\n\n\u70b9\u51fb\u4e0a\u4f20",
+            font=("Segoe UI", 9), fg="#94a3b8", bg="#f1f5f9",
+            justify=tk.CENTER, cursor="hand2",
+        )
+        self._photo_hint.pack(expand=True)
+        self._photo_card.bind("<Button-1>", lambda _e: self._pick_image())
+        self._photo_hint.bind("<Button-1>", lambda _e: self._pick_image())
+
+        img_btns = tk.Frame(img_row, bg=COLORS["card"])
+        img_btns.pack(side=tk.LEFT, padx=(14, 0), fill=tk.Y)
+        tk.Label(
+            img_btns,
+            text="Product photo (JPG / PNG / WEBP)" if lang == "en"
+            else "\u4ea7\u54c1\u7167\u7247\uff08JPG / PNG / WEBP\uff09",
+            font=("Segoe UI", 9, "bold"), fg="#334155", bg=COLORS["card"],
+            wraplength=240, justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(4, 6))
+        ttk.Button(
+            img_btns,
+            text="Browse\u2026" if lang == "en" else "\u9009\u62e9\u6587\u4ef6\u2026",
+            command=self._pick_image, style="Tool.TButton",
+        ).pack(anchor=tk.W, pady=(0, 4))
+        self._clear_img_btn = ttk.Button(
+            img_btns,
+            text="Clear" if lang == "en" else "\u6e05\u9664",
+            command=self._clear_image, style="Tool.TButton",
+        )
+        self._clear_img_btn.pack(anchor=tk.W)
+        self._clear_img_btn.state(["disabled"])
+
+        # ── Section: Product ───────────────────────────────────────────
+        sec_prod = self._section(body, "PRODUCT" if lang == "en" else "\u4ea7\u54c1")
+        self._title_var = self._text_field(
+            sec_prod, "Title" if lang == "en" else "\u6807\u9898", ""
+        )
+        pg_row = tk.Frame(sec_prod, bg=COLORS["card"])
+        pg_row.pack(fill=tk.X, padx=14, pady=(0, 6))
+        pg_row.columnconfigure(0, weight=3)
+        pg_row.columnconfigure(1, weight=1)
+        # Phone model
+        phone_col = tk.Frame(pg_row, bg=COLORS["card"])
+        phone_col.grid(row=0, column=0, sticky=tk.EW, padx=(0, 6))
+        tk.Label(phone_col,
+                 text="Phone Model" if lang == "en" else "\u624b\u673a\u578b\u53f7",
+                 font=("Segoe UI", 7, "bold"), fg="#94a3b8",
+                 bg=COLORS["card"]).pack(anchor=tk.W, pady=(0, 3))
+        self._phone_var = tk.StringVar()
+        ttk.Entry(phone_col, textvariable=self._phone_var,
+                  font=("Segoe UI", 10)).pack(fill=tk.X)
+        # Qty
+        qty_col = tk.Frame(pg_row, bg=COLORS["card"])
+        qty_col.grid(row=0, column=1, sticky=tk.EW)
+        tk.Label(qty_col,
+                 text="Qty" if lang == "en" else "\u6570\u91cf",
+                 font=("Segoe UI", 7, "bold"), fg="#94a3b8",
+                 bg=COLORS["card"]).pack(anchor=tk.W, pady=(0, 3))
+        self._qty_var = tk.StringVar(value="1")
+        ttk.Spinbox(qty_col, from_=1, to=999, textvariable=self._qty_var,
+                    font=("Segoe UI", 10)).pack(fill=tk.X)
+        tk.Frame(sec_prod, bg=COLORS["card"], height=6).pack(fill=tk.X)
+
+        # ── Section: Components (mandatory — need ≥1) ──────────────────
+        sec_comp = self._section(
+            body,
+            "COMPONENTS *" if lang == "en" else "\u7ec4\u4ef6 *",
+            hint="Select at least one" if lang == "en" else "\u81f3\u5c11\u9009\u62e9\u4e00\u9879",
+        )
+        comp_row = tk.Frame(sec_comp, bg=COLORS["card"])
+        comp_row.pack(fill=tk.X, padx=14, pady=(0, 10))
+        self._case_var  = tk.BooleanVar(value=False)
+        self._grip_var  = tk.BooleanVar(value=False)
+        self._charm_var = tk.BooleanVar(value=False)
+        for i, (var, en, zh) in enumerate([
+            (self._case_var,  "Case",  "\u624b\u673a\u58f3"),
+            (self._grip_var,  "Grip",  "\u652f\u67b6"),
+            (self._charm_var, "Charm", "\u6302\u4ef6"),
+        ]):
+            cb = tk.Checkbutton(
+                comp_row, text=(en if lang == "en" else zh),
+                variable=var, font=("Segoe UI", 10),
+                bg=COLORS["card"], fg="#1e293b",
+                activebackground=COLORS["card"],
+                selectcolor="#ffffff",
+                padx=8, pady=4, cursor="hand2",
+            )
+            cb.grid(row=0, column=i, sticky=tk.W, padx=(0, 14))
+
+        # ── Section: Supplier (optional) ───────────────────────────────
+        sec_sup = self._section(body, "SUPPLIER" if lang == "en" else "\u4f9b\u5e94\u5546",
+                                hint="Optional" if lang == "en" else "\u9009\u586b")
+        sup_row = tk.Frame(sec_sup, bg=COLORS["card"])
+        sup_row.pack(fill=tk.X, padx=14, pady=(0, 10))
+        sup_row.columnconfigure(0, weight=1)
+        sup_row.columnconfigure(1, weight=1)
+        tk.Label(sup_row, text="Supplier" if lang == "en" else "\u4f9b\u5e94\u5546",
+                 font=("Segoe UI", 7, "bold"), fg="#94a3b8",
+                 bg=COLORS["card"]).grid(row=0, column=0, sticky=tk.W, pady=(0, 3))
+        tk.Label(sup_row, text="Stall" if lang == "en" else "\u6444\u4f4d",
+                 font=("Segoe UI", 7, "bold"), fg="#94a3b8",
+                 bg=COLORS["card"]).grid(row=0, column=1, sticky=tk.W,
+                                          padx=(6, 0), pady=(0, 3))
+        self._supplier_var = tk.StringVar()
+        self._stall_var    = tk.StringVar()
+        sup_cb = ttk.Combobox(sup_row, textvariable=self._supplier_var,
+                              values=self._sup_shops, font=("Segoe UI", 10))
+        sup_cb.grid(row=1, column=0, sticky=tk.EW)
+        stall_cb = ttk.Combobox(sup_row, textvariable=self._stall_var,
+                                values=self._sup_stalls, font=("Segoe UI", 10))
+        stall_cb.grid(row=1, column=1, sticky=tk.EW, padx=(6, 0))
+        # Bidirectional autofill
+        sup_cb.bind("<<ComboboxSelected>>",
+                    lambda _e: self._autofill_pair("sup"))
+        stall_cb.bind("<<ComboboxSelected>>",
+                      lambda _e: self._autofill_pair("stall"))
+
+        # ── Section: Charm details (shown only if charm is checked) ────
+        self._charm_section = self._section(
+            body, "CHARM DETAILS" if lang == "en" else "\u6302\u4ef6\u4fe1\u606f",
+            hint="Optional" if lang == "en" else "\u9009\u586b",
+        )
+        chc_row = tk.Frame(self._charm_section, bg=COLORS["card"])
+        chc_row.pack(fill=tk.X, padx=14, pady=(0, 10))
+        chc_row.columnconfigure(0, weight=1)
+        chc_row.columnconfigure(1, weight=1)
+        tk.Label(chc_row, text="Charm Code" if lang == "en" else "\u6302\u4ef6\u7f16\u7801",
+                 font=("Segoe UI", 7, "bold"), fg="#94a3b8",
+                 bg=COLORS["card"]).grid(row=0, column=0, sticky=tk.W, pady=(0, 3))
+        tk.Label(chc_row, text="Charm Shop" if lang == "en" else "\u6302\u4ef6\u5e97\u94fa",
+                 font=("Segoe UI", 7, "bold"), fg="#94a3b8",
+                 bg=COLORS["card"]).grid(row=0, column=1, sticky=tk.W,
+                                          padx=(6, 0), pady=(0, 3))
+        self._charm_code_var = tk.StringVar()
+        self._charm_shop_var = tk.StringVar()
+        ttk.Combobox(chc_row, textvariable=self._charm_code_var,
+                     values=self._charm_codes,
+                     font=("Segoe UI", 10)).grid(row=1, column=0, sticky=tk.EW)
+        ttk.Combobox(chc_row, textvariable=self._charm_shop_var,
+                     values=self._charm_shops,
+                     font=("Segoe UI", 10)).grid(row=1, column=1, sticky=tk.EW,
+                                                  padx=(6, 0))
+
+        # ── Section: Extras (optional) ─────────────────────────────────
+        sec_extra = self._section(body, "EXTRAS" if lang == "en" else "\u5176\u4ed6",
+                                  hint="Optional" if lang == "en" else "\u9009\u586b")
+        self._buyer_var = self._text_field(
+            sec_extra, "Buyer Name" if lang == "en" else "\u4e70\u5bb6\u59d3\u540d", ""
+        )
+        # Private notes — multi-line
+        tk.Label(sec_extra,
+                 text="Private Notes" if lang == "en" else "\u79c1\u4eba\u5907\u6ce8",
+                 font=("Segoe UI", 7, "bold"), fg="#94a3b8",
+                 bg=COLORS["card"]).pack(anchor=tk.W, padx=14, pady=(0, 3))
+        self._notes_text = tk.Text(sec_extra, height=3, font=("Segoe UI", 10),
+                                   wrap=tk.WORD, relief=tk.SOLID, bd=1)
+        self._notes_text.pack(fill=tk.X, padx=14, pady=(0, 10))
+
+        # ── Error label ────────────────────────────────────────────────
+        self._error_lbl = tk.Label(
+            body, text="", font=("Segoe UI", 9, "bold"),
+            fg="#dc2626", bg=COLORS["app"], anchor=tk.W,
+        )
+        self._error_lbl.pack(fill=tk.X, padx=14, pady=(4, 0))
+
+        # ── Footer actions ─────────────────────────────────────────────
+        foot = tk.Frame(d, bg=COLORS["card"], highlightthickness=1,
+                        highlightbackground=COLORS["border"])
+        foot.grid(row=2, column=0, sticky="ew")
+        inner = tk.Frame(foot, bg=COLORS["card"])
+        inner.pack(fill=tk.X, padx=14, pady=10)
+        ttk.Button(
+            inner, text="Cancel" if lang == "en" else "\u53d6\u6d88",
+            command=d.destroy, style="Tool.TButton",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(
+            inner, text="Add Order" if lang == "en" else "\u6dfb\u52a0\u8ba2\u5355",
+            command=self._submit, style="Tool.TButton",
+        ).pack(side=tk.RIGHT)
+
+        d.bind("<Escape>", lambda _e: d.destroy())
+
+    # ── Small builders ────────────────────────────────────────────────
+
+    def _section(self, parent: tk.Misc, title: str, *, hint: str = "") -> tk.Frame:
+        """Build a card-style section with a header row; return the card frame."""
+        outer = tk.Frame(parent, bg=COLORS["app"])
+        outer.pack(fill=tk.X, padx=14, pady=(10, 0))
+        card = tk.Frame(outer, bg=COLORS["card"],
+                        highlightthickness=1,
+                        highlightbackground=COLORS["border"])
+        card.pack(fill=tk.X)
+        hdr = tk.Frame(card, bg=COLORS["card"])
+        hdr.pack(fill=tk.X, padx=14, pady=(10, 6))
+        tk.Label(hdr, text=title, font=("Segoe UI", 8, "bold"),
+                 fg="#475569", bg=COLORS["card"]).pack(side=tk.LEFT)
+        if hint:
+            tk.Label(hdr, text=f"  {hint}", font=("Segoe UI", 8),
+                     fg="#94a3b8", bg=COLORS["card"]).pack(side=tk.LEFT)
+        return card
+
+    def _text_field(self, parent: tk.Misc, label: str, default: str) -> tk.StringVar:
+        """Label + entry pair; return the StringVar."""
+        tk.Label(parent, text=label,
+                 font=("Segoe UI", 7, "bold"), fg="#94a3b8",
+                 bg=COLORS["card"]).pack(anchor=tk.W, padx=14, pady=(0, 3))
+        var = tk.StringVar(value=default)
+        ttk.Entry(parent, textvariable=var,
+                  font=("Segoe UI", 10)).pack(fill=tk.X, padx=14, pady=(0, 8))
+        return var
+
+    # ── Image handling ────────────────────────────────────────────────
+
+    def _pick_image(self) -> None:
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            parent=self._d,
+            title="Choose product image" if self._lang == "en"
+            else "\u9009\u62e9\u4ea7\u54c1\u56fe\u7247",
+            filetypes=[
+                ("Images", "*.jpg *.jpeg *.png *.webp *.bmp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except OSError as e:
+            self._error_lbl.config(text=f"Could not read file: {e}")
+            return
+
+        # Normalize to JPEG bytes when PIL is available so the dashboard
+        # thumbnail pipeline reliably decodes the result.
+        if self._pil_ok and Image is not None:
+            try:
+                from io import BytesIO
+                im = Image.open(BytesIO(raw))
+                if im.mode != "RGB":
+                    if "A" in im.mode:
+                        bg = Image.new("RGB", im.size, (255, 255, 255))
+                        bg.paste(im, mask=im.split()[-1])
+                        im = bg
+                    else:
+                        im = im.convert("RGB")
+                buf = BytesIO()
+                im.save(buf, format="JPEG", quality=90)
+                raw = buf.getvalue()
+            except Exception:
+                pass   # fall back to original bytes
+
+        self._photo_bytes = raw
+        self._render_preview()
+        self._clear_img_btn.state(["!disabled"])
+        self._error_lbl.config(text="")
+
+    def _render_preview(self) -> None:
+        """Show a thumbnail inside the image-upload card."""
+        for w in self._photo_card.winfo_children():
+            w.destroy()
+        if not self._pil_ok or not self._photo_bytes or Image is None or ImageTk is None:
+            tk.Label(
+                self._photo_card,
+                text="[image loaded]" if self._lang == "en" else "[\u5df2\u52a0\u8f7d]",
+                font=("Segoe UI", 9), fg="#16a34a", bg="#f1f5f9",
+            ).pack(expand=True)
+            return
+        try:
+            from io import BytesIO
+            im = Image.open(BytesIO(self._photo_bytes))
+            if im.mode != "RGB":
+                im = im.convert("RGB")
+            im.thumbnail((self._MAX_PREVIEW - 8, self._MAX_PREVIEW - 8),
+                         Image.Resampling.LANCZOS)
+            ph = ImageTk.PhotoImage(im)
+            self._preview_photo = ph
+            tk.Label(self._photo_card, image=ph, bg="#f1f5f9",
+                     cursor="hand2").pack(expand=True)
+        except Exception:
+            tk.Label(self._photo_card, text="[image]",
+                     bg="#f1f5f9").pack(expand=True)
+
+    def _clear_image(self) -> None:
+        self._photo_bytes = None
+        self._preview_photo = None
+        for w in self._photo_card.winfo_children():
+            w.destroy()
+        self._photo_hint = tk.Label(
+            self._photo_card,
+            text="\U0001F5BC\n\nClick to upload" if self._lang == "en"
+            else "\U0001F5BC\n\n\u70b9\u51fb\u4e0a\u4f20",
+            font=("Segoe UI", 9), fg="#94a3b8", bg="#f1f5f9",
+            justify=tk.CENTER, cursor="hand2",
+        )
+        self._photo_hint.pack(expand=True)
+        self._photo_hint.bind("<Button-1>", lambda _e: self._pick_image())
+        self._clear_img_btn.state(["disabled"])
+
+    # ── Autofill ──────────────────────────────────────────────────────
+
+    def _autofill_pair(self, source: str) -> None:
+        """Autofill the other of (supplier, stall) if mapping is known."""
+        if source == "sup":
+            shop = self._supplier_var.get().strip()
+            if shop and not self._stall_var.get().strip():
+                st = self._sup_shop_stalls.get(shop, "")
+                if st:
+                    self._stall_var.set(st)
+        else:
+            stall = self._stall_var.get().strip()
+            if stall and not self._supplier_var.get().strip():
+                sh = self._sup_stall_shops.get(stall, "")
+                if sh:
+                    self._supplier_var.set(sh)
+
+    # ── Submit ────────────────────────────────────────────────────────
+
+    def _submit(self) -> None:
+        """Validate inputs and invoke ``on_submit`` with a payload dict."""
+        # Mandatory: image
+        if not self._photo_bytes:
+            self._error_lbl.config(
+                text="Product image is required."
+                if self._lang == "en"
+                else "\u4ea7\u54c1\u56fe\u7247\u4e3a\u5fc5\u586b\u9879\u3002"
+            )
+            return
+
+        # Mandatory: at least one component
+        has_case  = self._case_var.get()
+        has_grip  = self._grip_var.get()
+        has_charm = self._charm_var.get()
+        if not (has_case or has_grip or has_charm):
+            self._error_lbl.config(
+                text="Select at least one of Case / Grip / Charm."
+                if self._lang == "en"
+                else "\u8bf7\u81f3\u5c11\u52fe\u9009 \u624b\u673a\u58f3 / \u652f\u67b6 / \u6302\u4ef6 \u4e4b\u4e00\u3002"
+            )
+            return
+
+        # Qty validation
+        try:
+            qty = int(self._qty_var.get().strip() or "1")
+            if qty < 1:
+                raise ValueError
+        except ValueError:
+            self._error_lbl.config(
+                text="Quantity must be a positive integer."
+                if self._lang == "en"
+                else "\u6570\u91cf\u5fc5\u987b\u4e3a\u6b63\u6574\u6570\u3002"
+            )
+            return
+
+        # Build style string (contains "Case"/"Grip"/"Charm" tokens)
+        style_parts: list[str] = []
+        if has_case:  style_parts.append("Case")
+        if has_grip:  style_parts.append("Grip")
+        if has_charm: style_parts.append("Charm")
+        style = " + ".join(style_parts)
+
+        # Default title when blank
+        title = self._title_var.get().strip()
+        if not title:
+            title = f"Manual order ({style})"
+
+        # Synthesize a unique order number. Pattern MAN-<timestamp><rand>
+        import time as _time, random as _random
+        order_number = f"MAN{int(_time.time())}{_random.randint(10, 99)}"
+
+        payload = {
+            "order_number": order_number,
+            "title": title,
+            "qty": qty,
+            "phone": self._phone_var.get().strip(),
+            "style": style,
+            "photo_bytes": self._photo_bytes,
+            "supplier": self._supplier_var.get().strip(),
+            "stall": self._stall_var.get().strip(),
+            "charm_code": self._charm_code_var.get().strip() if has_charm else "",
+            "charm_shop": self._charm_shop_var.get().strip() if has_charm else "",
+            "buyer": self._buyer_var.get().strip(),
+            "private_notes": self._notes_text.get("1.0", tk.END).strip(),
+        }
+
+        try:
+            self._on_submit(payload)
+        except Exception as e:
+            self._error_lbl.config(text=f"Failed to add: {e}")
+            return
+
+        self._d.destroy()
 
 
 class _ProductMapEditorDialog:
@@ -4090,6 +7441,573 @@ class _CharmPickerPopup:
         self._hide_charm_hover()
 
 
+class _CharmImportSkuDialog:
+    """
+    Modal dialog shown between photo staging and workbook import.
+
+    Displays a thumbnail + editable SKU entry for each staged photo,
+    pre-populated with an auto-suggestion derived from the filename.
+    Confirmed SKUs are stored in ``self.result`` as ``{staged_stem: sku_text}``.
+    ``self.confirmed`` is True when the user clicked Import, False if cancelled.
+    """
+
+    _THUMB = 72
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        staged_files: list,   # list[Path]
+        lang: str,
+    ) -> None:
+        self.result: dict[str, str] = {}
+        self.confirmed: bool = False
+        self._lang = lang
+        self._sku_vars: list[tuple] = []    # [(Path, tk.StringVar), ...]
+        self._tk_img_refs: list[object] = []
+
+        d = tk.Toplevel(parent)
+        d.title(
+            "Set SKU for Imported Charms" if lang == "en"
+            else "\u8bbe\u7f6e\u5bfc\u5165\u6302\u4ef6\u7684SKU"
+        )
+        d.transient(parent)
+        d.grab_set()
+        d.configure(bg=COLORS["app"])
+        d.minsize(600, 360)
+        d.grid_columnconfigure(0, weight=1)
+        d.grid_rowconfigure(1, weight=1)
+
+        # ── Hero ──────────────────────────────────────────────────────────
+        hero = tk.Frame(d, bg=COLORS["hero"], highlightthickness=0)
+        hero.grid(row=0, column=0, sticky="ew")
+        tk.Label(
+            hero,
+            text=(
+                "Set SKU for Imported Charms" if lang == "en"
+                else "\u8bbe\u7f6e\u5bfc\u5165\u6302\u4ef6\u7684SKU"
+            ),
+            font=("Segoe UI", 12, "bold"),
+            fg="#ffffff", bg=COLORS["hero"],
+        ).pack(anchor=tk.W, padx=14, pady=(10, 2))
+        tk.Label(
+            hero,
+            text=(
+                "Review and edit the auto-generated SKU for each photo.  "
+                "SKUs are derived from the filename — edit any you want to change.  "
+                "Leave blank to fill later in Excel."
+            ) if lang == "en" else (
+                "\u68c0\u67e5\u5e76\u7f16\u8f91\u6bcf\u5f20\u7167\u7247\u7684\u81ea\u52a8SKU\u3002"
+                "SKU\u6839\u636e\u6587\u4ef6\u540d\u751f\u6210\uff0c\u53ef\u81ea\u7531\u4fee\u6539\uff0c"
+                "\u7559\u7a7a\u5219\u7a0d\u540e\u5728Excel\u4e2d\u586b\u5199\u3002"
+            ),
+            wraplength=640, justify=tk.LEFT,
+            font=("Segoe UI", 9), fg="#e2e8f0", bg=COLORS["hero"],
+        ).pack(anchor=tk.W, padx=14, pady=(0, 8))
+
+        # ── Scrollable body ────────────────────────────────────────────────
+        body_wrap = tk.Frame(d, bg=COLORS["app"])
+        body_wrap.grid(row=1, column=0, sticky="nsew")
+        body_wrap.grid_rowconfigure(0, weight=1)
+        body_wrap.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(body_wrap, bg=COLORS["app"], highlightthickness=0)
+        vsb = ttk.Scrollbar(body_wrap, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        inner = tk.Frame(canvas, bg=COLORS["app"])
+        _win = canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+
+        def _sync(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all") or (0, 0, 0, 0))
+            canvas.itemconfig(_win, width=canvas.winfo_width())
+
+        inner.bind("<Configure>", _sync)
+        canvas.bind("<Configure>", _sync)
+
+        def _scroll(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<MouseWheel>", _scroll)
+        inner.bind("<MouseWheel>", _scroll)
+
+        # Column header strip
+        hdr = tk.Frame(inner, bg=COLORS["strip"])
+        hdr.pack(fill=tk.X)
+        tk.Label(
+            hdr, text="Photo" if lang == "en" else "\u7167\u7247",
+            font=("Segoe UI", 8, "bold"), bg=COLORS["strip"], width=9,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(
+            hdr,
+            text="Original filename" if lang == "en" else "\u539f\u59cb\u6587\u4ef6\u540d",
+            font=("Segoe UI", 8, "bold"), bg=COLORS["strip"], anchor=tk.W,
+        ).pack(side=tk.LEFT, padx=8, expand=True, fill=tk.X)
+        tk.Label(
+            hdr,
+            text="SKU (Column C)" if lang == "en" else "SKU\uff08C\u5217\uff09",
+            font=("Segoe UI", 8, "bold"), bg=COLORS["strip"], width=26, anchor=tk.W,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+        # One row per staged file
+        for i, path in enumerate(staged_files):
+            row_bg = "#ffffff" if i % 2 == 0 else "#f8f7ff"
+            row_f = tk.Frame(
+                inner, bg=row_bg,
+                highlightthickness=1,
+                highlightbackground=COLORS["border"],
+            )
+            row_f.pack(fill=tk.X, padx=4, pady=2)
+            row_f.bind("<MouseWheel>", _scroll)
+
+            # Thumbnail
+            ph = self._make_thumb(path)
+            if ph:
+                self._tk_img_refs.append(ph)
+                lbl = tk.Label(row_f, image=ph, bg=row_bg,
+                               width=self._THUMB + 6, height=self._THUMB + 6)
+            else:
+                lbl = tk.Label(row_f, text="\U0001f48e",
+                               font=("Segoe UI", 22), fg="#c4b5fd", bg=row_bg,
+                               width=5, height=3)
+            lbl.pack(side=tk.LEFT, padx=(6, 2), pady=4)
+            lbl.bind("<MouseWheel>", _scroll)
+
+            # Original name hint
+            display = re.sub(r"^__incoming__[0-9a-fA-F]+_", "", path.stem)
+            if len(display) > 34:
+                display = display[:33] + "\u2026"
+            name_lbl = tk.Label(
+                row_f, text=display,
+                font=("Segoe UI", 9), fg=COLORS["text"], bg=row_bg,
+                anchor=tk.W, justify=tk.LEFT,
+            )
+            name_lbl.pack(side=tk.LEFT, padx=6, expand=True, fill=tk.X)
+            name_lbl.bind("<MouseWheel>", _scroll)
+
+            # Editable SKU entry (pre-filled with auto-suggestion)
+            sku_var = tk.StringVar(value=_auto_sku_from_stem(path.stem))
+            entry = ttk.Entry(
+                row_f, textvariable=sku_var,
+                width=28, font=("Segoe UI", 9),
+            )
+            entry.pack(side=tk.RIGHT, padx=(4, 8), pady=6)
+            entry.bind("<MouseWheel>", _scroll)
+
+            self._sku_vars.append((path, sku_var))
+
+        # ── Footer ────────────────────────────────────────────────────────
+        foot = tk.Frame(d, bg=COLORS["app"])
+        foot.grid(row=2, column=0, sticky="ew", padx=14, pady=10)
+
+        ttk.Button(
+            foot,
+            text="Cancel" if lang == "en" else "\u53d6\u6d88",
+            command=lambda: self._cancel(d),
+            style="Tool.TButton",
+        ).pack(side=tk.LEFT)
+
+        tk.Button(
+            foot,
+            text="\u2191 Import \u2192" if lang == "en" else "\u5bfc\u5165 \u2192",
+            command=lambda: self._ok(d),
+            bg=COLORS["run"], fg="#ffffff",
+            activebackground=COLORS.get("run_hover", COLORS["run"]),
+            activeforeground="#ffffff",
+            font=("Segoe UI", 10, "bold"),
+            padx=18, pady=6, cursor="hand2",
+            relief=tk.FLAT, borderwidth=0, highlightthickness=0,
+        ).pack(side=tk.RIGHT)
+
+        d.bind("<Return>", lambda _e: self._ok(d))
+        d.bind("<Escape>", lambda _e: self._cancel(d))
+
+        # Size and centre
+        n = len(staged_files)
+        h = min(120 + n * (self._THUMB + 18) + 120, 620)
+        w = 720
+        sw, sh = d.winfo_screenwidth(), d.winfo_screenheight()
+        d.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        d.wait_window(d)
+
+    # ------------------------------------------------------------------ helpers
+
+    def _make_thumb(self, path) -> object | None:
+        if Image is None or ImageTk is None:
+            return None
+        try:
+            im = Image.open(path)
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.mode else "RGB")
+            if im.mode == "RGBA":
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[3])
+                im = bg
+            im.thumbnail((self._THUMB, self._THUMB), Image.Resampling.LANCZOS)
+            return ImageTk.PhotoImage(im)
+        except Exception:
+            return None
+
+    def _ok(self, d: tk.Toplevel) -> None:
+        self.result = {p.stem: var.get().strip() for p, var in self._sku_vars}
+        self.confirmed = True
+        d.destroy()
+
+    def _cancel(self, d: tk.Toplevel) -> None:
+        self.confirmed = False
+        d.destroy()
+
+
+# ======================================================================
+class _CharmEditSkuDialog:
+    """
+    Modal dialog for reviewing and editing SKUs of all existing charm library
+    entries.  Shows every charm as a scrollable row:
+
+        [photo thumbnail]  [code]  [SKU entry (pre-filled with current value)]
+
+    Two filter modes let the user work through all charms or only those with
+    a blank SKU.  On "Save", the changes are written to column C via
+    ``write_charm_library_skus``.  ``self.confirmed`` is True when the user
+    saved, False when cancelled.
+    """
+
+    _THUMB = 64
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        entries: dict,          # dict[str, CharmLibraryEntry]
+        catalog_path,           # Path
+        lang: str,
+        on_save_callback=None,  # called(updated_entries) after a successful save
+    ) -> None:
+        self.confirmed: bool = False
+        self._lang = lang
+        self._entries = entries
+        self._catalog_path = catalog_path
+        self._on_save_callback = on_save_callback
+        self._sku_vars: list[tuple] = []    # [(code, current_sku, tk.StringVar), ...]
+        self._tk_img_refs: list[object] = []
+        self._row_frames: list[tk.Frame] = []
+
+        d = tk.Toplevel(parent)
+        d.title(
+            "Edit Charm SKUs" if lang == "en"
+            else "\u7f16\u8f91\u6302\u4ef6SKU"
+        )
+        d.transient(parent)
+        d.grab_set()
+        d.configure(bg=COLORS["app"])
+        d.minsize(660, 420)
+        d.grid_columnconfigure(0, weight=1)
+        d.grid_rowconfigure(2, weight=1)
+        self._d = d
+
+        # ── Hero ──────────────────────────────────────────────────────────
+        hero = tk.Frame(d, bg=COLORS["hero"], highlightthickness=0)
+        hero.grid(row=0, column=0, sticky="ew")
+        tk.Label(
+            hero,
+            text="Edit Charm SKUs" if lang == "en" else "\u7f16\u8f91\u6302\u4ef6SKU",
+            font=("Segoe UI", 12, "bold"),
+            fg="#ffffff", bg=COLORS["hero"],
+        ).pack(anchor=tk.W, padx=14, pady=(10, 2))
+        tk.Label(
+            hero,
+            text=(
+                "Edit the SKU (column C) for each charm.  "
+                "Changes are written to the Excel workbook when you click Save.  "
+                "Leave a field blank to clear its SKU."
+            ) if lang == "en" else (
+                "\u7f16\u8f91\u6bcf\u4e2a\u6302\u4ef6\u7684SKU\uff08C\u5217\uff09\u3002"
+                "\u70b9\u51fb\u300c\u4fdd\u5b58\u300d\u5c06\u66f4\u6539\u5199\u5165Excel\u3002"
+                "\u7559\u7a7a\u8868\u793a\u6e05\u9664\u8be5SKU\u3002"
+            ),
+            wraplength=660, justify=tk.LEFT,
+            font=("Segoe UI", 9), fg="#e2e8f0", bg=COLORS["hero"],
+        ).pack(anchor=tk.W, padx=14, pady=(0, 8))
+
+        # ── Filter bar ────────────────────────────────────────────────────
+        fbar = tk.Frame(d, bg=COLORS["strip"])
+        fbar.grid(row=1, column=0, sticky="ew")
+
+        self._show_all_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            fbar,
+            text=(
+                "Show only charms with blank SKU" if lang == "en"
+                else "\u4ec5\u663e\u793aSKU\u4e3a\u7a7a\u7684\u6302\u4ef6"
+            ),
+            variable=self._show_all_var,
+            command=self._apply_filter,
+            bg=COLORS["strip"], font=("Segoe UI", 9),
+            fg=COLORS["text"], activebackground=COLORS["strip"],
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=10, pady=4)
+
+        n_blank = sum(1 for e in entries.values() if not (e.sku or "").strip())
+        tk.Label(
+            fbar,
+            text=(
+                f"{n_blank} charm(s) with blank SKU  /  {len(entries)} total"
+                if lang == "en"
+                else f"SKU\u4e3a\u7a7a\uff1a{n_blank}\u4e2a\uff0f\u5171 {len(entries)}\u4e2a"
+            ),
+            font=("Segoe UI", 8), fg=COLORS["muted"], bg=COLORS["strip"],
+        ).pack(side=tk.RIGHT, padx=10)
+
+        # ── Scrollable body ────────────────────────────────────────────────
+        body_wrap = tk.Frame(d, bg=COLORS["app"])
+        body_wrap.grid(row=2, column=0, sticky="nsew")
+        body_wrap.grid_rowconfigure(0, weight=1)
+        body_wrap.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(body_wrap, bg=COLORS["app"], highlightthickness=0)
+        vsb = ttk.Scrollbar(body_wrap, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        self._canvas = canvas
+
+        inner = tk.Frame(canvas, bg=COLORS["app"])
+        _win = canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+        self._inner = inner
+
+        def _sync(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all") or (0, 0, 0, 0))
+            canvas.itemconfig(_win, width=canvas.winfo_width())
+
+        inner.bind("<Configure>", _sync)
+        canvas.bind("<Configure>", _sync)
+
+        def _scroll(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<MouseWheel>", _scroll)
+        inner.bind("<MouseWheel>", _scroll)
+        self._scroll_fn = _scroll
+
+        # Column headers
+        hdr = tk.Frame(inner, bg=COLORS["strip"])
+        hdr.pack(fill=tk.X)
+        tk.Label(
+            hdr, text="Photo" if lang == "en" else "\u7167\u7247",
+            font=("Segoe UI", 8, "bold"), bg=COLORS["strip"], width=8,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(
+            hdr, text="Code" if lang == "en" else "\u7f16\u7801",
+            font=("Segoe UI", 8, "bold"), bg=COLORS["strip"], width=10,
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Label(
+            hdr,
+            text="SKU (Column C) — edit here" if lang == "en"
+            else "SKU\uff08C\u5217\uff09\u2014\u5728\u6b64\u5904\u7f16\u8f91",
+            font=("Segoe UI", 8, "bold"), bg=COLORS["strip"], anchor=tk.W,
+        ).pack(side=tk.LEFT, padx=4, expand=True, fill=tk.X)
+
+        # Build one row per entry
+        for i, (code, entry) in enumerate(entries.items()):
+            row_bg = "#ffffff" if i % 2 == 0 else "#f8f7ff"
+            row_f = tk.Frame(
+                inner, bg=row_bg,
+                highlightthickness=1,
+                highlightbackground=COLORS["border"],
+            )
+            row_f.pack(fill=tk.X, padx=4, pady=2)
+            row_f.bind("<MouseWheel>", _scroll)
+
+            # Thumbnail from embedded photo bytes
+            ph = self._make_thumb(entry.photo_bytes if hasattr(entry, "photo_bytes") else None)
+            if ph:
+                self._tk_img_refs.append(ph)
+                lbl = tk.Label(row_f, image=ph, bg=row_bg,
+                               width=self._THUMB + 6, height=self._THUMB + 6)
+            else:
+                lbl = tk.Label(row_f, text="\U0001f48e",
+                               font=("Segoe UI", 18), fg="#c4b5fd", bg=row_bg,
+                               width=4, height=2)
+            lbl.pack(side=tk.LEFT, padx=(6, 2), pady=4)
+            lbl.bind("<MouseWheel>", _scroll)
+
+            # Code label
+            tk.Label(
+                row_f, text=code,
+                font=("Segoe UI", 9, "bold"), fg="#5b21b6", bg=row_bg,
+                width=10, anchor=tk.W,
+            ).pack(side=tk.LEFT, padx=4)
+
+            # Editable SKU entry
+            current = (entry.sku or "").strip() if hasattr(entry, "sku") else ""
+            sku_var = tk.StringVar(value=current)
+            entry_widget = ttk.Entry(
+                row_f, textvariable=sku_var,
+                font=("Segoe UI", 9),
+            )
+            entry_widget.pack(side=tk.LEFT, padx=(4, 8), pady=6, expand=True, fill=tk.X)
+            entry_widget.bind("<MouseWheel>", _scroll)
+
+            self._sku_vars.append((code, current, sku_var))
+            self._row_frames.append((row_f, code, current))
+
+        # ── Footer ────────────────────────────────────────────────────────
+        foot = tk.Frame(d, bg=COLORS["app"])
+        foot.grid(row=3, column=0, sticky="ew", padx=14, pady=10)
+
+        ttk.Button(
+            foot,
+            text="Cancel" if lang == "en" else "\u53d6\u6d88",
+            command=lambda: self._cancel(d),
+            style="Tool.TButton",
+        ).pack(side=tk.LEFT)
+
+        n_changed_lbl = tk.Label(
+            foot, text="",
+            font=("Segoe UI", 8), fg=COLORS["muted"], bg=COLORS["app"],
+        )
+        n_changed_lbl.pack(side=tk.LEFT, padx=12)
+        self._n_changed_lbl = n_changed_lbl
+
+        # Wire up trace to show live "N change(s)" count
+        for _, _, sv in self._sku_vars:
+            sv.trace_add("write", lambda *_: self._update_change_count())
+
+        tk.Button(
+            foot,
+            text="\U0001f4be  Save SKUs" if lang == "en" else "\U0001f4be  \u4fdd\u5b58SKU",
+            command=lambda: self._save(d),
+            bg=COLORS["run"], fg="#ffffff",
+            activebackground=COLORS.get("run_hover", COLORS["run"]),
+            activeforeground="#ffffff",
+            font=("Segoe UI", 10, "bold"),
+            padx=18, pady=6, cursor="hand2",
+            relief=tk.FLAT, borderwidth=0, highlightthickness=0,
+        ).pack(side=tk.RIGHT)
+
+        d.bind("<Escape>", lambda _e: self._cancel(d))
+
+        # Initial filter state and sizing
+        self._show_all_var.set(True)
+        self._apply_filter()
+
+        h = min(160 + len(entries) * (self._THUMB + 14) + 100, 700)
+        w = 760
+        sw, sh = d.winfo_screenwidth(), d.winfo_screenheight()
+        d.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        d.wait_window(d)
+
+    # ------------------------------------------------------------------ helpers
+
+    def _make_thumb(self, photo_bytes: bytes | None) -> object | None:
+        if not photo_bytes or Image is None or ImageTk is None:
+            return None
+        try:
+            im = Image.open(BytesIO(photo_bytes))
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.mode else "RGB")
+            if im.mode == "RGBA":
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[3])
+                im = bg
+            im.thumbnail((self._THUMB, self._THUMB), Image.Resampling.LANCZOS)
+            return ImageTk.PhotoImage(im)
+        except Exception:
+            return None
+
+    def _apply_filter(self) -> None:
+        """Show only blank-SKU rows or all rows based on the checkbox."""
+        show_blank_only = self._show_all_var.get()
+        for row_f, code, _current in self._row_frames:
+            # Find the corresponding sku_var
+            sku_now = next(
+                (sv.get() for c, _orig, sv in self._sku_vars if c == code), ""
+            )
+            original = next(
+                (orig for c, orig, _sv in self._sku_vars if c == code), ""
+            )
+            if show_blank_only and original.strip():
+                row_f.pack_forget()
+            else:
+                row_f.pack(fill=tk.X, padx=4, pady=2)
+
+    def _update_change_count(self) -> None:
+        n = sum(
+            1 for code, orig, sv in self._sku_vars
+            if sv.get().strip() != orig.strip()
+        )
+        if n:
+            self._n_changed_lbl.config(
+                text=(
+                    f"{n} change(s) pending"
+                    if self._lang == "en"
+                    else f"{n} \u9879\u5f85\u4fdd\u5b58"
+                )
+            )
+        else:
+            self._n_changed_lbl.config(text="")
+
+    def _save(self, d: tk.Toplevel) -> None:
+        """Collect changed SKUs and write them to the workbook."""
+        code_to_sku = {
+            code: sv.get().strip()
+            for code, orig, sv in self._sku_vars
+            if sv.get().strip() != orig.strip()
+        }
+        if not code_to_sku:
+            messagebox.showinfo(
+                "No changes" if self._lang == "en" else "\u65e0\u66f4\u6539",
+                "No SKUs were changed." if self._lang == "en"
+                else "\u6ca1\u6709SKU\u88ab\u4fee\u6539\u3002",
+                parent=self._d,
+            )
+            return
+
+        if write_charm_library_skus is None:
+            messagebox.showerror(
+                "Unavailable" if self._lang == "en" else "\u4e0d\u53ef\u7528",
+                "write_charm_library_skus is not available.",
+                parent=self._d,
+            )
+            return
+
+        try:
+            n, lines = write_charm_library_skus(self._catalog_path, code_to_sku)
+        except Exception as e:
+            messagebox.showerror(
+                "Save failed" if self._lang == "en" else "\u4fdd\u5b58\u5931\u8d25",
+                str(e), parent=self._d,
+            )
+            return
+
+        if n:
+            messagebox.showinfo(
+                "Saved" if self._lang == "en" else "\u5df2\u4fdd\u5b58",
+                (
+                    f"Updated {n} SKU(s) in the workbook.\n\n"
+                    + "\n".join(lines[-6:])
+                ) if self._lang == "en" else (
+                    f"\u5df2\u66f4\u65b0 {n} \u4e2aSKU\u3002\n\n"
+                    + "\n".join(lines[-6:])
+                ),
+                parent=self._d,
+            )
+            self.confirmed = True
+            if self._on_save_callback is not None:
+                self._on_save_callback()
+        else:
+            messagebox.showinfo(
+                "No updates" if self._lang == "en" else "\u65e0\u66f4\u65b0",
+                "\n".join(lines) or "Nothing was updated.",
+                parent=self._d,
+            )
+
+    def _cancel(self, d: tk.Toplevel) -> None:
+        self.confirmed = False
+        d.destroy()
+
+
+# ======================================================================
 class _CharmReorderDialog:
     """
     Modal dialog that lets the user drag-and-drop (or use arrow buttons) to
@@ -4121,6 +8039,17 @@ class _CharmReorderDialog:
 
         pil_ok = Image is not None and ImageTk is not None
         self._pil_ok = pil_ok
+
+        # Load charm shop names for the shop combobox
+        self._charm_shop_names: list[str] = []
+        try:
+            if load_charm_shops is not None:
+                self._charm_shop_names = [
+                    cs.shop_name for cs in load_charm_shops(catalog_path)
+                    if cs.shop_name
+                ]
+        except Exception:
+            pass
 
         d = tk.Toplevel(parent)
         self._d = d
@@ -4214,6 +8143,65 @@ class _CharmReorderDialog:
         ttk.Button(btn_col, text=self._t("reorder_btn_bottom"),
                    command=self._move_bottom, **btn_cfg).pack(pady=(0, 0))
 
+        # Separator + Delete button (danger-styled)
+        tk.Frame(btn_col, bg=COLORS["border"], height=1,
+                 highlightthickness=0).pack(fill=tk.X, pady=(14, 10))
+        sty_d = ttk.Style(d)
+        sty_d.configure("ReorderDanger.TButton", font=("Segoe UI", 10), padding=(8, 6))
+        sty_d.map("ReorderDanger.TButton",
+                  background=[("active", "#fee2e2"), ("disabled", "#f3f4f6")],
+                  foreground=[("active", "#b91c1c"), ("disabled", "#9ca3af")])
+        self._delete_btn = ttk.Button(
+            btn_col,
+            text="\u2716 Delete" if self._lang == "en" else "\u2716 \u5220\u9664",
+            command=self._delete_charm,
+            style="ReorderDanger.TButton",
+            width=14,
+            state="disabled",
+        )
+        self._delete_btn.pack(pady=(0, 0))
+        # Enable/disable the delete button based on tree selection
+        tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+        # ── Shop edit section (below delete) ─────────────────────────────
+        tk.Frame(btn_col, bg=COLORS["border"], height=1,
+                 highlightthickness=0).pack(fill=tk.X, pady=(14, 8))
+
+        tk.Label(btn_col,
+                 text="Default Shop" if self._lang == "en" else "\u9ed8\u8ba4\u6302\u4ef6\u5e97",
+                 font=("Segoe UI", 8, "bold"), fg=COLORS["muted"],
+                 bg=COLORS["app"]).pack(anchor=tk.W)
+
+        self._shop_var = tk.StringVar()
+        self._shop_cb  = ttk.Combobox(btn_col, textvariable=self._shop_var,
+                                      values=[""] + self._charm_shop_names,
+                                      font=("Segoe UI", 9), width=14, state="disabled")
+        self._shop_cb.pack(fill=tk.X, pady=(2, 4))
+
+        self._set_shop_btn = ttk.Button(
+            btn_col,
+            text="Set Shop" if self._lang == "en" else "\u8bbe\u7f6e\u5e97\u94fa",
+            command=self._set_charm_shop,
+            style="Tool.TButton", width=14, state="disabled",
+        )
+        self._set_shop_btn.pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Button(btn_col,
+                   text="Manage Shops\u2026" if self._lang == "en" else "\u7ba1\u7406\u5e97\u94fa\u2026",
+                   command=self._open_shops_manager,
+                   style="Tool.TButton", width=14).pack(fill=tk.X, pady=(0, 0))
+
+        # ── SKU edit section ──────────────────────────────────────────────
+        tk.Frame(btn_col, bg=COLORS["border"], height=1,
+                 highlightthickness=0).pack(fill=tk.X, pady=(14, 10))
+        ttk.Button(
+            btn_col,
+            text="\u270f\ufe0f  Edit SKUs\u2026" if self._lang == "en"
+            else "\u270f\ufe0f  \u7f16\u8f91SKU\u2026",
+            command=self._open_sku_editor,
+            style="Tool.TButton", width=14,
+        ).pack(fill=tk.X)
+
         # ── Row 2: footer buttons ─────────────────────────────────────────
         foot = tk.Frame(d, bg=COLORS["app"])
         foot.grid(row=2, column=0, sticky="ew", padx=14, pady=12)
@@ -4245,6 +8233,18 @@ class _CharmReorderDialog:
         tree.bind("<ButtonPress-1>",   self._on_drag_start)
         tree.bind("<B1-Motion>",       self._on_drag_motion)
         tree.bind("<ButtonRelease-1>", self._on_drag_release)
+
+        # ── Hover-zoom bindings ───────────────────────────────────────────
+        self._hover_tip_win:    list[tk.Toplevel | None] = [None]
+        self._hover_after_id:   list[object | None]      = [None]
+        self._hover_active_iid: list[str | None]         = [None]
+        self._hover_photo:      list[object]             = []
+        tree.bind("<Motion>", self._on_hover_motion)
+        tree.bind("<Leave>",  self._hide_hover)
+
+        # Block the caller until the dialog is closed so that any post-close
+        # logic (e.g. _rebuild_gallery) runs only after the user is done.
+        d.wait_window(d)
 
     # ------------------------------------------------------------------ helpers
 
@@ -4394,6 +8394,324 @@ class _CharmReorderDialog:
 
     # ------------------------------------------------------------------ apply
 
+    # ── Hover-zoom ────────────────────────────────────────────────────
+
+    def _hide_hover(self, _event=None) -> None:
+        if self._hover_after_id[0] is not None:
+            try:
+                self._d.after_cancel(self._hover_after_id[0])
+            except (tk.TclError, ValueError):
+                pass
+            self._hover_after_id[0] = None
+        self._hover_active_iid[0] = None
+        tip = self._hover_tip_win[0]
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+            self._hover_tip_win[0] = None
+
+    def _on_hover_motion(self, _e: tk.Event | None = None) -> None:
+        if not self._pil_ok:
+            return
+        tree = self._tree
+        px, py = tree.winfo_pointerx(), tree.winfo_pointery()
+        lx, ly = px - tree.winfo_rootx(), py - tree.winfo_rooty()
+        if lx < 0 or ly < 0 or lx >= tree.winfo_width() or ly >= tree.winfo_height():
+            self._hide_hover()
+            return
+        # Only activate over the photo column (#0)
+        if tree.identify_column(lx) != "#0":
+            self._hide_hover()
+            return
+        iid = tree.identify_row(ly)
+        if not iid:
+            self._hide_hover()
+            return
+        code = iid.removeprefix("charm_")
+        entry = self._entries.get(code)
+        if entry is None or not entry.photo_bytes:
+            self._hide_hover()
+            return
+        if iid == self._hover_active_iid[0]:
+            return   # already showing
+        self._hide_hover()
+        self._hover_active_iid[0] = iid
+        self._hover_after_id[0] = self._d.after(
+            220, lambda i=iid: self._show_hover(i)
+        )
+
+    def _show_hover(self, iid: str) -> None:
+        self._hover_after_id[0] = None
+        if Image is None or ImageTk is None:
+            return
+        tree = self._tree
+        px, py = tree.winfo_pointerx(), tree.winfo_pointery()
+        lx, ly = px - tree.winfo_rootx(), py - tree.winfo_rooty()
+        if (lx < 0 or ly < 0 or lx >= tree.winfo_width()
+                or ly >= tree.winfo_height()
+                or tree.identify_row(ly) != iid):
+            return
+        code  = iid.removeprefix("charm_")
+        entry = self._entries.get(code)
+        raw   = entry.photo_bytes if entry else None
+        if not raw:
+            return
+        try:
+            im = Image.open(BytesIO(raw))
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.mode else "RGB")
+            if im.mode == "RGBA":
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[3])
+                im = bg
+            w, h = im.size
+            # Always scale to a useful preview size (up- and down-scale)
+            _sw = self._d.winfo_screenwidth()
+            _sh = self._d.winfo_screenheight()
+            max_dim = min(400, max(260, min(_sw, _sh) // 3))
+            ratio   = min(max_dim / w, max_dim / h)
+            nw, nh  = max(1, int(w * ratio)), max(1, int(h * ratio))
+            if (nw, nh) != (w, h):
+                resample = (Image.Resampling.LANCZOS if ratio <= 1.0
+                            else Image.Resampling.BICUBIC)
+                im = im.resize((nw, nh), resample)
+            ph = ImageTk.PhotoImage(im)
+            self._hover_photo.clear()
+            self._hover_photo.append(ph)
+        except Exception:
+            return
+        tip = tk.Toplevel(self._d)
+        tip.overrideredirect(True)
+        try:
+            tip.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tip.configure(bg="#ffffff", highlightthickness=2,
+                      highlightbackground=COLORS["accent"])
+        tk.Label(tip, image=ph, bg="#ffffff", bd=0,
+                 highlightthickness=0, relief=tk.FLAT).pack()
+        tip.update_idletasks()
+        sw, sh = tip.winfo_screenwidth(), tip.winfo_screenheight()
+        tw, th = tip.winfo_reqwidth(), tip.winfo_reqheight()
+        # Position above cursor so popup doesn't cover the row being hovered
+        x = min(max(12, px + 16), sw - tw - 12)
+        y = min(max(12, py - th - 8), sh - th - 12)
+        if y < 12:
+            y = min(py + 16, sh - th - 12)
+        tip.geometry(f"+{x}+{y}")
+        self._hover_tip_win[0] = tip
+
+    def _on_tree_select(self, _event=None) -> None:
+        """Enable action buttons when a row is selected; pre-fill the shop combobox."""
+        sel = self._tree.selection()
+        has_sel = bool(sel)
+        self._delete_btn.config(state="normal" if has_sel else "disabled")
+        self._shop_cb.config(state="readonly" if has_sel else "disabled")
+        self._set_shop_btn.config(state="normal" if has_sel else "disabled")
+        if has_sel:
+            code  = self._iid_to_code.get(sel[0], "")
+            entry = self._entries.get(code)
+            self._shop_var.set(entry.default_charm_shop if entry and entry.default_charm_shop else "")
+
+    def _set_charm_shop(self) -> None:
+        """Update the Default Shop for the selected charm in memory and in the XLSX."""
+        sel = self._tree.selection()
+        if not sel:
+            return
+        iid  = sel[0]
+        code = self._iid_to_code.get(iid, "")
+        if not code:
+            return
+        new_shop = self._shop_var.get().strip()
+
+        # Update in-memory entry
+        entry = self._entries.get(code)
+        if entry is not None:
+            entry.default_charm_shop = new_shop
+        # Reflect in the tree
+        self._tree.set(iid, "shop", new_shop or "\u2014")
+
+        # Write col D of the matching Charm Library row
+        try:
+            if backup_supplier_catalog_before_write is not None:
+                backup_supplier_catalog_before_write(self._catalog_path, "set_charm_shop")
+            import openpyxl as _xl
+            wb = _xl.load_workbook(self._catalog_path)
+            if CHARM_LIBRARY_SHEET in wb.sheetnames:
+                ws = wb[CHARM_LIBRARY_SHEET]
+                for r in range(2, ws.max_row + 1):
+                    if str(ws.cell(r, 2).value or "").strip() == code:
+                        ws.cell(r, 4).value = new_shop or None
+                        break
+            wb.save(self._catalog_path)
+            wb.close()
+        except Exception as e:
+            messagebox.showerror(
+                "Save failed" if self._lang == "en" else "\u4fdd\u5b58\u5931\u8d25",
+                str(e), parent=self._d,
+            )
+
+    def _reload_shop_combobox(self) -> None:
+        """Refresh the shop combobox values after the Charm Shops list changes."""
+        try:
+            if load_charm_shops is not None:
+                self._charm_shop_names = [
+                    cs.shop_name for cs in load_charm_shops(self._catalog_path)
+                    if cs.shop_name
+                ]
+        except Exception:
+            pass
+        self._shop_cb["values"] = [""] + self._charm_shop_names
+
+    def _open_shops_manager(self) -> None:
+        """Open the Charm Shops manager dialog (add / edit / remove shops)."""
+        _CharmShopsManagerDialog(self._d, self._catalog_path,
+                                 self._lang, on_close=self._reload_shop_combobox)
+
+    def _open_sku_editor(self) -> None:
+        """Open the SKU editor dialog so the user can fill/update charm SKUs."""
+        def _after_save() -> None:
+            # Reload entries from disk to pick up the freshly written SKUs,
+            # then repopulate the tree so column C reflects the new values.
+            if load_charm_library is not None:
+                try:
+                    updated = load_charm_library(self._catalog_path)
+                    if updated:
+                        self._entries = updated
+                except Exception:
+                    pass
+            self._populate()
+
+        _CharmEditSkuDialog(
+            self._d,
+            self._entries,
+            self._catalog_path,
+            self._lang,
+            on_save_callback=_after_save,
+        )
+
+    def _delete_charm(self) -> None:
+        """Delete the selected charm from the Charm Library and clear Product Map refs."""
+        sel = self._tree.selection()
+        if not sel:
+            return
+        iid  = sel[0]
+        code = self._iid_to_code.get(iid, "")
+        if not code:
+            return
+
+        entry      = self._entries.get(code)
+        sku_txt    = f"  ({entry.sku})" if entry and entry.sku else ""
+
+        if self._lang == "en":
+            msg = (
+                f"Permanently delete charm {code}{sku_txt}?\n\n"
+                f"This will:\n"
+                f"  \u2022 Remove its row and photo from the Charm Library\n"
+                f"  \u2022 Clear this Charm Code from every Product Map row that references it\n\n"
+                f"A backup is created automatically before any change is made."
+            )
+            title = "Delete Charm"
+        else:
+            msg = (
+                f"\u6c38\u4e45\u5220\u9664\u6302\u4ef6 {code}{sku_txt}\uff1f\n\n"
+                f"\u64cd\u4f5c\u5185\u5bb9\uff1a\n"
+                f"  \u2022 \u5220\u9664\u6302\u4ef6\u5e93\u4e2d\u7684\u884c\u4e0e\u7167\u7247\n"
+                f"  \u2022 \u6e05\u9664\u5546\u54c1\u8868\u4e2d\u6240\u6709\u5f15\u7528\u6b64\u6302\u4ef6\u7f16\u7801\u7684\u884c\n\n"
+                f"\u5199\u5165\u524d\u81ea\u52a8\u521b\u5efa\u5907\u4efd\u3002"
+            )
+            title = "\u5220\u9664\u6302\u4ef6"
+
+        if not messagebox.askyesno(title, msg, icon="warning", parent=self._d):
+            return
+
+        # Backup
+        try:
+            if backup_supplier_catalog_before_write is not None:
+                backup_supplier_catalog_before_write(self._catalog_path, "delete_charm")
+        except Exception:
+            pass
+
+        # Write changes via openpyxl
+        try:
+            import openpyxl as _xl
+            wb = _xl.load_workbook(self._catalog_path)
+
+            # 1. Clear the charm's row in Charm Library (col B = charm code).
+            #    We intentionally do NOT use delete_rows() because openpyxl
+            #    shifts cell data but does NOT reliably shift image anchors,
+            #    corrupting the photo-to-row mapping for every row below.
+            #    Instead we clear cell values + remove the image.  The empty
+            #    row is invisible to load_charm_library (skips empty col B)
+            #    and gets compacted by the next reorder_charm_library_rows.
+            if CHARM_LIBRARY_SHEET in wb.sheetnames:
+                ws_lib = wb[CHARM_LIBRARY_SHEET]
+                target_row: int | None = None
+                for r in range(2, ws_lib.max_row + 1):
+                    if str(ws_lib.cell(r, 2).value or "").strip() == code:
+                        target_row = r
+                        break
+                if target_row is not None:
+                    for c in range(1, 6):
+                        ws_lib.cell(target_row, c).value = None
+                    ws_lib._images = [
+                        img for img in list(getattr(ws_lib, "_images", []) or [])
+                        if not (
+                            hasattr(img, "anchor")
+                            and hasattr(img.anchor, "_from")
+                            and getattr(img.anchor._from, "row", None) == target_row - 1
+                        )
+                    ]
+
+            # 2. Clear Charm Code (col G) in Product Map for all matching rows
+            if CATALOG_SHEET in wb.sheetnames:
+                ws_cat = wb[CATALOG_SHEET]
+                for r in range(2, ws_cat.max_row + 1):
+                    if str(ws_cat.cell(r, 7).value or "").strip() == code:
+                        ws_cat.cell(r, 7).value = None
+
+            wb.save(self._catalog_path)
+            wb.close()
+        except Exception as e:
+            messagebox.showerror(
+                "Delete failed" if self._lang == "en" else "\u5220\u9664\u5931\u8d25",
+                str(e), parent=self._d,
+            )
+            return
+
+        # Remove disk image files for this charm code
+        if self._charm_images and self._charm_images.is_dir():
+            for ext in (".png", ".jpg", ".jpeg", ".webp"):
+                img_path = self._charm_images / f"{code}{ext}"
+                try:
+                    if img_path.exists():
+                        img_path.unlink()
+                except OSError:
+                    pass
+
+        # Remove from in-memory entries and refresh the tree
+        self._entries.pop(code, None)
+        self._tree.delete(iid)
+        self._iid_to_code.pop(iid, None)
+        self._refresh_new_codes()
+        self._delete_btn.config(state="disabled")
+        self._shop_cb.config(state="disabled")
+        self._set_shop_btn.config(state="disabled")
+        self._shop_var.set("")
+
+        # Briefly show confirmation in the footer area
+        info_lbl = tk.Label(
+            self._d,
+            text=f"\u2716  {code} deleted" if self._lang == "en"
+                 else f"\u2716  {code} \u5df2\u5220\u9664",
+            font=("Segoe UI", 9, "bold"), fg="#b91c1c",
+            bg=COLORS["app"],
+        )
+        info_lbl.grid(row=2, column=0, sticky="w", padx=20)
+        self._d.after(3000, info_lbl.destroy)
+
     def _apply(self) -> None:
         if not messagebox.askyesno(
             self._t("reorder_confirm_title"),
@@ -4414,22 +8732,812 @@ class _CharmReorderDialog:
                 self._catalog_path,
                 new_order,
                 charm_images_dir=self._charm_images,
+                caller_entries=self._entries,
             )
             summary = "\n".join(lines)
             msg = f"{self._t('reorder_done')}\n\n{summary}"
             messagebox.showinfo(self._t("reorder_title"), msg, parent=self._d)
-            # Refresh the tree to reflect the now-applied order (codes updated)
-            try:
-                updated = load_charm_library(self._catalog_path)
-                self._entries = updated
-            except Exception:
-                pass
+
+            self._refresh_entries_after_apply(new_order)
             self._populate()
         except Exception as e:
             messagebox.showerror(self._t("file_open_fail_title"), str(e), parent=self._d)
         finally:
             self._d.config(cursor=prev_cursor)
             self._apply_btn.config(state=tk.NORMAL)
+
+    def _refresh_entries_after_apply(self, new_order: list[str]) -> None:
+        """Rebuild ``self._entries`` to reflect the just-saved reorder.
+
+        Primary strategy: reload from disk (authoritative source, includes
+        refreshed embedded photos).  Retry once after a short delay to
+        handle Windows/OneDrive file-sync latency.
+
+        Fallback: build in-memory from the pre-apply entries using the
+        same sequential-code logic that ``reorder_charm_library_rows``
+        applied, so the tree is always correct even if disk I/O fails.
+        """
+        import re as _re2, time, copy
+
+        # -- Fallback: in-memory rebuild from pre-apply state ---------------
+        old_entries = dict(self._entries)
+        all_old_codes = list(old_entries.keys())
+
+        pfx = "CH-"
+        for c in all_old_codes:
+            m = _re2.match(r"^([A-Za-z]+-+)(\d+)$", c.strip())
+            if m:
+                pfx = m.group(1).upper()
+                break
+
+        widths: list[int] = []
+        for c in all_old_codes:
+            m = _re2.match(
+                rf"^{_re2.escape(pfx)}(\d+)$", c.strip(), _re2.IGNORECASE
+            )
+            if m:
+                widths.append(len(m.group(1)))
+        w = max(widths) if widths else 5
+        w = max(w, len(str(len(new_order))), 5)
+
+        rebuilt: dict = {}
+        for seq, old_code in enumerate(new_order, start=1):
+            if old_code in old_entries:
+                new_code = f"{pfx}{seq:0{w}d}"
+                ent = copy.copy(old_entries[old_code])
+                ent.code = new_code
+                rebuilt[new_code] = ent
+
+        self._entries = rebuilt
+
+        # -- Primary: reload from disk (with one retry) --------------------
+        for attempt in range(2):
+            try:
+                if attempt > 0:
+                    time.sleep(0.3)
+                disk = load_charm_library(self._catalog_path)
+                if disk and len(disk) == len(rebuilt):
+                    self._entries = disk
+                    return
+            except Exception:
+                pass
+
+
+# ======================================================================
+# Charm Shops Manager Dialog — add, edit, and remove charm shop entries
+# ======================================================================
+
+class _CharmShopsManagerDialog:
+    """Simple modal dialog for managing the Charm Shops reference list."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        catalog_path: Path,
+        lang: str,
+        on_close: object = None,
+    ) -> None:
+        self._catalog_path = catalog_path
+        self._lang         = lang
+        self._on_close     = on_close
+        self._shops: list[dict] = []   # [{name, stall, notes}]
+
+        d = tk.Toplevel(parent)
+        self._d = d
+        d.title("Manage Charm Shops" if lang == "en" else "\u7ba1\u7406\u6302\u4ef6\u5e97\u94fa")
+        d.transient(parent)
+        d.grab_set()
+        d.configure(bg=COLORS["app"])
+        d.geometry("560x420")
+        d.minsize(480, 340)
+        d.grid_columnconfigure(0, weight=1)
+        d.grid_rowconfigure(1, weight=1)
+
+        # Hero
+        hero = tk.Frame(d, bg=COLORS["hero"], highlightthickness=0)
+        hero.grid(row=0, column=0, sticky="ew")
+        tk.Label(hero,
+                 text="Charm Shops" if lang == "en" else "\u6302\u4ef6\u5e97\u94fa",
+                 font=("Segoe UI", 12, "bold"), fg="#ffffff",
+                 bg=COLORS["hero"]).pack(anchor=tk.W, padx=14, pady=(10, 2))
+        tk.Label(hero,
+                 text="Add, remove or edit rows that appear in the 'Charm Shop' dropdowns."
+                      if lang == "en" else
+                      "\u6dfb\u52a0\u3001\u5220\u9664\u6216\u7f16\u8f91\u5728\u300c\u6302\u4ef6\u5e97\u94fa\u300d\u4e0b\u62c9\u5217\u8868\u4e2d\u663e\u793a\u7684\u884c\u3002",
+                 font=("Segoe UI", 9), fg="#e2e8f0",
+                 bg=COLORS["hero"]).pack(anchor=tk.W, padx=14, pady=(0, 8))
+
+        # Body: Treeview + buttons
+        body = tk.Frame(d, bg=COLORS["app"])
+        body.grid(row=1, column=0, sticky="nsew", padx=14, pady=(10, 0))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        # Treeview
+        tf = tk.Frame(body, bg=COLORS["app"])
+        tf.grid(row=0, column=0, sticky="nsew")
+        tf.grid_rowconfigure(0, weight=1)
+        tf.grid_columnconfigure(0, weight=1)
+
+        cols = ("name", "stall", "notes")
+        self._tree = ttk.Treeview(tf, columns=cols, show="headings", selectmode="browse")
+        vsb = ttk.Scrollbar(tf, orient=tk.VERTICAL, command=self._tree.yview)
+        self._tree.configure(yscrollcommand=vsb.set)
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        self._tree.heading("name",  text="Shop Name" if lang == "en" else "\u5e97\u540d")
+        self._tree.heading("stall", text="Stall"      if lang == "en" else "\u6444\u4f4d")
+        self._tree.heading("notes", text="Notes"      if lang == "en" else "\u5907\u6ce8")
+        self._tree.column("name",  width=180, stretch=False)
+        self._tree.column("stall", width=80,  stretch=False, anchor=tk.CENTER)
+        self._tree.column("notes", width=240, stretch=True)
+        self._tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        # Side buttons
+        btn_col = tk.Frame(body, bg=COLORS["app"])
+        btn_col.grid(row=0, column=1, sticky="n", padx=(8, 0))
+        btn_w = dict(style="Tool.TButton", width=12)
+        self._add_btn = ttk.Button(btn_col,
+                                   text="+ Add" if lang == "en" else "+ \u6dfb\u52a0",
+                                   command=self._add_shop, **btn_w)
+        self._add_btn.pack(pady=(0, 4))
+        self._edit_btn = ttk.Button(btn_col,
+                                    text="Edit" if lang == "en" else "\u7f16\u8f91",
+                                    command=self._edit_shop, state="disabled", **btn_w)
+        self._edit_btn.pack(pady=(0, 4))
+
+        sty_r = ttk.Style(d)
+        sty_r.configure("ShopDanger.TButton", font=("Segoe UI", 10), padding=(8, 6))
+        sty_r.map("ShopDanger.TButton",
+                  background=[("active", "#fee2e2"), ("disabled", "#f3f4f6")],
+                  foreground=[("active", "#b91c1c"), ("disabled", "#9ca3af")])
+        self._remove_btn = ttk.Button(btn_col,
+                                      text="Remove" if lang == "en" else "\u5220\u9664",
+                                      command=self._remove_shop,
+                                      style="ShopDanger.TButton",
+                                      width=12, state="disabled")
+        self._remove_btn.pack(pady=(12, 0))
+
+        # Footer
+        foot = tk.Frame(d, bg=COLORS["app"])
+        foot.grid(row=2, column=0, sticky="ew", padx=14, pady=10)
+        ttk.Button(foot,
+                   text="Close" if lang == "en" else "\u5173\u95ed",
+                   command=self._close, style="Tool.TButton").pack(side=tk.RIGHT)
+
+        self._load()
+        d.protocol("WM_DELETE_WINDOW", self._close)
+
+    # ── Helpers ────────────────────────────────────────────────────────
+
+    def _load(self) -> None:
+        """Load current Charm Shops from the catalog."""
+        self._shops.clear()
+        try:
+            if load_charm_shops is not None:
+                for cs in load_charm_shops(self._catalog_path):
+                    self._shops.append(
+                        {"name": cs.shop_name, "stall": cs.stall, "notes": cs.notes}
+                    )
+        except Exception:
+            pass
+        self._repopulate()
+
+    def _repopulate(self) -> None:
+        self._tree.delete(*self._tree.get_children())
+        for s in self._shops:
+            self._tree.insert("", tk.END, values=(
+                s["name"], s["stall"], s["notes"],
+            ))
+
+    def _on_select(self, _event=None) -> None:
+        has = bool(self._tree.selection())
+        self._edit_btn.config(state="normal" if has else "disabled")
+        self._remove_btn.config(state="normal" if has else "disabled")
+
+    def _write(self) -> None:
+        """Overwrite the Charm Shops sheet with current in-memory list."""
+        try:
+            if backup_supplier_catalog_before_write is not None:
+                backup_supplier_catalog_before_write(self._catalog_path, "manage_charm_shops")
+            import openpyxl as _xl
+            wb = _xl.load_workbook(self._catalog_path)
+            if CHARM_SHOPS_SHEET not in wb.sheetnames:
+                wb.close()
+                return
+            ws = wb[CHARM_SHOPS_SHEET]
+            # Clear all data rows (keep row 1 headers or instruction row)
+            for r in range(ws.max_row, 1, -1):
+                row_val = str(ws.cell(r, 1).value or "").strip().lower()
+                if "charm shops" in row_val or "quick guide" in row_val:
+                    continue
+                ws.delete_rows(r, 1)
+            # Find insert position (first empty after headers)
+            insert_row = 2
+            ws.cell(insert_row - 1, 1)   # ensure we're at row 2
+            for r in range(2, ws.max_row + 2):
+                insert_row = r
+                if ws.cell(r, 1).value is None:
+                    break
+            for s in self._shops:
+                ws.cell(insert_row, 1).value = s["name"]  or None
+                ws.cell(insert_row, 2).value = s["stall"] or None
+                ws.cell(insert_row, 3).value = s["notes"] or None
+                insert_row += 1
+            wb.save(self._catalog_path)
+            wb.close()
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Save failed" if self._lang == "en" else "\u4fdd\u5b58\u5931\u8d25",
+                str(e), parent=self._d,
+            )
+
+    # ── Add / Edit ─────────────────────────────────────────────────────
+
+    def _shop_form(self, title: str, name: str = "", stall: str = "",
+                   notes: str = "") -> dict | None:
+        """Show a modal form for a shop entry; returns dict or None if cancelled."""
+        top = tk.Toplevel(self._d)
+        top.title(title)
+        top.transient(self._d)
+        top.grab_set()
+        top.configure(bg=COLORS["app"])
+        top.resizable(False, False)
+        result: list[dict | None] = [None]
+
+        f = tk.Frame(top, bg=COLORS["app"])
+        f.pack(fill=tk.BOTH, expand=True, padx=18, pady=16)
+        f.columnconfigure(1, weight=1)
+
+        def _lbl(row: int, text: str):
+            tk.Label(f, text=text, font=("Segoe UI", 9, "bold"),
+                     fg=COLORS["muted"], bg=COLORS["app"]).grid(
+                row=row, column=0, sticky=tk.W, padx=(0, 8), pady=4)
+
+        _lbl(0, "Shop Name *" if self._lang == "en" else "\u5e97\u540d *")
+        name_var = tk.StringVar(value=name)
+        name_ent = ttk.Entry(f, textvariable=name_var, font=("Segoe UI", 10), width=24)
+        name_ent.grid(row=0, column=1, sticky="ew", pady=4)
+
+        _lbl(1, "Stall" if self._lang == "en" else "\u6444\u4f4d")
+        stall_var = tk.StringVar(value=stall)
+        ttk.Entry(f, textvariable=stall_var, font=("Segoe UI", 10), width=24).grid(
+            row=1, column=1, sticky="ew", pady=4)
+
+        _lbl(2, "Notes" if self._lang == "en" else "\u5907\u6ce8")
+        notes_var = tk.StringVar(value=notes)
+        ttk.Entry(f, textvariable=notes_var, font=("Segoe UI", 10), width=24).grid(
+            row=2, column=1, sticky="ew", pady=4)
+
+        err_lbl = tk.Label(f, text="", font=("Segoe UI", 8),
+                           fg="#b91c1c", bg=COLORS["app"])
+        err_lbl.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+
+        btn_row = tk.Frame(f, bg=COLORS["app"])
+        btn_row.grid(row=4, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def _ok():
+            n = name_var.get().strip()
+            if not n:
+                err_lbl.config(text="Shop name is required." if self._lang == "en"
+                                else "\u5e97\u540d\u4e0d\u80fd\u4e3a\u7a7a\u3002")
+                return
+            result[0] = {"name": n, "stall": stall_var.get().strip(),
+                         "notes": notes_var.get().strip()}
+            top.destroy()
+
+        ttk.Button(btn_row, text="Cancel" if self._lang == "en" else "\u53d6\u6d88",
+                   command=top.destroy, style="Tool.TButton").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="OK",
+                   command=_ok, style="Tool.TButton").pack(side=tk.LEFT)
+
+        name_ent.focus_set()
+        top.bind("<Return>", lambda _: _ok())
+        top.bind("<Escape>", lambda _: top.destroy())
+        top.wait_window()
+        return result[0]
+
+    def _add_shop(self) -> None:
+        data = self._shop_form(
+            "Add Charm Shop" if self._lang == "en" else "\u6dfb\u52a0\u6302\u4ef6\u5e97\u94fa"
+        )
+        if data is None:
+            return
+        self._shops.append(data)
+        self._repopulate()
+        self._write()
+
+    def _edit_shop(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        idx = self._tree.index(sel[0])
+        s   = self._shops[idx]
+        data = self._shop_form(
+            "Edit Charm Shop" if self._lang == "en" else "\u7f16\u8f91\u6302\u4ef6\u5e97\u94fa",
+            name=s["name"], stall=s["stall"], notes=s["notes"],
+        )
+        if data is None:
+            return
+        self._shops[idx] = data
+        self._repopulate()
+        self._write()
+
+    def _remove_shop(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        idx  = self._tree.index(sel[0])
+        name = self._shops[idx]["name"]
+        from tkinter import messagebox
+        if not messagebox.askyesno(
+            "Remove shop" if self._lang == "en" else "\u5220\u9664\u5e97\u94fa",
+            f"Remove '{name}' from the Charm Shops list?"
+            if self._lang == "en" else
+            f"\u5220\u9664\u300c{name}\u300d\uff1f",
+            parent=self._d,
+        ):
+            return
+        del self._shops[idx]
+        self._repopulate()
+        self._write()
+        self._edit_btn.config(state="disabled")
+        self._remove_btn.config(state="disabled")
+
+    def _close(self) -> None:
+        self._d.destroy()
+        if callable(self._on_close):
+            self._on_close()
+
+
+class _SuppliersManagerDialog:
+    """
+    Modal dialog for managing the Suppliers reference list.
+
+    Reads and writes the *Suppliers* sheet in supplier_catalog.xlsx
+    (columns: ID | Shop Name | Mall | Floor | Stall | Address | Contact | Notes).
+
+    Rows are always displayed and persisted in stall-ascending order
+    (floor → stall code → shop name), mirroring the shopping-route sort.
+
+    Calling pattern mirrors ``_CharmShopsManagerDialog``:
+        _SuppliersManagerDialog(parent, catalog_path, lang, on_close=callback)
+    ``on_close`` is called (no args) after any write so the dashboard can
+    refresh its supplier dropdowns.
+    """
+
+    # ── Column indices in the Suppliers sheet (1-based) ───────────────
+    _C_ID      = 1   # A
+    _C_SHOP    = 2   # B  — Shop Name
+    _C_MALL    = 3   # C  — Mall
+    _C_FLOOR   = 4   # D  — Floor
+    _C_STALL   = 5   # E  — Stall
+    _C_ADDR    = 6   # F  — Address
+    _C_CONTACT = 7   # G  — Contact
+    _C_NOTES   = 8   # H  — Notes
+
+    @staticmethod
+    def _stall_sort_key(row: dict) -> tuple:
+        """
+        Sort key: floor-ascending → stall code → shop name.
+        Mirrors ``_stall_floor`` from generate_shopping_route.py without
+        requiring an import of that private function.
+        """
+        import re as _re
+        stall = (row.get("stall") or "").strip()
+        shop  = (row.get("shop")  or "").strip().lower()
+
+        if not stall or stall in ("\u2014", "???"):
+            floor_n = 999
+        elif _re.match(r"^A2", stall, _re.IGNORECASE):
+            floor_n = 2
+        else:
+            m = _re.match(r"^(\d)", stall)
+            if m:
+                floor_n = int(m.group(1))
+            else:
+                m = _re.search(r"(\d)[A-Za-z]", stall)
+                floor_n = int(m.group(1)) if m else 999
+
+        return (floor_n, stall.lower(), shop)
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        catalog_path,           # Path
+        lang: str,
+        on_close: object = None,
+    ) -> None:
+        self._catalog_path = catalog_path
+        self._lang         = lang
+        self._on_close     = on_close
+        self._rows: list[dict] = []
+        # {id, shop, mall, floor, stall, addr, contact, notes}
+
+        d = tk.Toplevel(parent)
+        self._d = d
+        d.title(
+            "Manage Suppliers" if lang == "en"
+            else "\u7ba1\u7406\u4f9b\u5e94\u5546"
+        )
+        d.transient(parent)
+        d.grab_set()
+        d.configure(bg=COLORS["app"])
+        d.geometry("680x460")
+        d.minsize(560, 360)
+        d.grid_columnconfigure(0, weight=1)
+        d.grid_rowconfigure(1, weight=1)
+
+        # ── Hero ──────────────────────────────────────────────────────
+        hero = tk.Frame(d, bg=COLORS["hero"], highlightthickness=0)
+        hero.grid(row=0, column=0, sticky="ew")
+        tk.Label(
+            hero,
+            text="Manage Suppliers" if lang == "en" else "\u7ba1\u7406\u4f9b\u5e94\u5546",
+            font=("Segoe UI", 12, "bold"), fg="#ffffff", bg=COLORS["hero"],
+        ).pack(anchor=tk.W, padx=14, pady=(10, 2))
+        tk.Label(
+            hero,
+            text=(
+                "Add, edit or remove supplier entries that appear in the "
+                "\u2018Supplier\u2019 and \u2018Stall\u2019 dropdowns."
+            ) if lang == "en" else (
+                "\u6dfb\u52a0\u3001\u7f16\u8f91\u6216\u5220\u9664\u5728\u300c\u4f9b\u5e94\u5546"
+                "\u300d\u548c\u300c\u6444\u4f4d\u300d\u4e0b\u62c9\u5217\u8868\u4e2d\u663e\u793a"
+                "\u7684\u4f9b\u5e94\u5546\u6761\u76ee\u3002"
+            ),
+            font=("Segoe UI", 9), fg="#e2e8f0", bg=COLORS["hero"],
+        ).pack(anchor=tk.W, padx=14, pady=(0, 8))
+
+        # ── Body: treeview + side buttons ─────────────────────────────
+        body = tk.Frame(d, bg=COLORS["app"])
+        body.grid(row=1, column=0, sticky="nsew", padx=14, pady=(10, 0))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        tf = tk.Frame(body, bg=COLORS["app"])
+        tf.grid(row=0, column=0, sticky="nsew")
+        tf.grid_rowconfigure(0, weight=1)
+        tf.grid_columnconfigure(0, weight=1)
+
+        cols = ("shop", "stall", "mall", "notes")
+        self._tree = ttk.Treeview(
+            tf, columns=cols, show="headings", selectmode="browse"
+        )
+        vsb = ttk.Scrollbar(tf, orient=tk.VERTICAL, command=self._tree.yview)
+        self._tree.configure(yscrollcommand=vsb.set)
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        _T = lambda en, zh: en if lang == "en" else zh
+        self._tree.heading("shop",  text=_T("Shop Name", "\u5e97\u540d"))
+        self._tree.heading("stall", text=_T("Stall",     "\u6444\u4f4d"))
+        self._tree.heading("mall",  text=_T("Mall",      "\u5546\u573a"))
+        self._tree.heading("notes", text=_T("Notes",     "\u5907\u6ce8"))
+        self._tree.column("shop",  width=200, stretch=False)
+        self._tree.column("stall", width=80,  stretch=False, anchor=tk.CENTER)
+        self._tree.column("mall",  width=120, stretch=False)
+        self._tree.column("notes", width=200, stretch=True)
+        self._tree.bind("<<TreeviewSelect>>", self._on_select)
+        self._tree.bind("<Double-Button-1>",  lambda _: self._edit_entry())
+
+        # Side buttons
+        btn_col = tk.Frame(body, bg=COLORS["app"])
+        btn_col.grid(row=0, column=1, sticky="n", padx=(8, 0))
+        _bw = dict(style="Tool.TButton", width=14)
+        self._add_btn  = ttk.Button(
+            btn_col,
+            text=_T("+ Add",   "+ \u6dfb\u52a0"),
+            command=self._add_entry, **_bw,
+        )
+        self._add_btn.pack(pady=(0, 4))
+        self._edit_btn = ttk.Button(
+            btn_col,
+            text=_T("Edit",    "\u7f16\u8f91"),
+            command=self._edit_entry, state="disabled", **_bw,
+        )
+        self._edit_btn.pack(pady=(0, 4))
+
+        sty = ttk.Style(d)
+        sty.configure("SupDanger.TButton", font=("Segoe UI", 10), padding=(8, 6))
+        sty.map(
+            "SupDanger.TButton",
+            background=[("active", "#fee2e2"), ("disabled", "#f3f4f6")],
+            foreground=[("active", "#b91c1c"), ("disabled", "#9ca3af")],
+        )
+        self._remove_btn = ttk.Button(
+            btn_col,
+            text=_T("Remove",  "\u5220\u9664"),
+            command=self._remove_entry,
+            style="SupDanger.TButton", width=14, state="disabled",
+        )
+        self._remove_btn.pack(pady=(12, 0))
+
+        # ── Footer ────────────────────────────────────────────────────
+        foot = tk.Frame(d, bg=COLORS["app"])
+        foot.grid(row=2, column=0, sticky="ew", padx=14, pady=10)
+        ttk.Button(
+            foot,
+            text=_T("Close", "\u5173\u95ed"),
+            command=self._close,
+            style="Tool.TButton",
+        ).pack(side=tk.RIGHT)
+
+        self._load()
+        d.protocol("WM_DELETE_WINDOW", self._close)
+
+    # ── Data helpers ──────────────────────────────────────────────────
+
+    def _load(self) -> None:
+        """Read the Suppliers sheet into ``self._rows``, sorted by stall."""
+        self._rows.clear()
+        try:
+            import openpyxl as _xl
+            wb = _xl.load_workbook(self._catalog_path, read_only=True, data_only=True)
+            if "Suppliers" not in wb.sheetnames:
+                wb.close()
+                self._repopulate()
+                return
+            ws = wb["Suppliers"]
+            # Detect header row column positions dynamically for robustness
+            ci_shop = ci_stall = ci_mall = ci_floor = None
+            ci_addr = ci_contact = ci_notes = ci_id = None
+            for ci in range(1, 15):
+                h = str(ws.cell(1, ci).value or "").strip().lower()
+                if h == "id":             ci_id      = ci
+                elif h == "shop name":    ci_shop    = ci
+                elif h == "mall":         ci_mall    = ci
+                elif h == "floor":        ci_floor   = ci
+                elif h == "stall":        ci_stall   = ci
+                elif h == "address":      ci_addr    = ci
+                elif h == "contact":      ci_contact = ci
+                elif h == "notes":        ci_notes   = ci
+            # Fall back to fixed positions from _SUPPLIERS_HEADER_ROW
+            ci_id      = ci_id      or 1
+            ci_shop    = ci_shop    or 2
+            ci_mall    = ci_mall    or 3
+            ci_floor   = ci_floor   or 4
+            ci_stall   = ci_stall   or 5
+            ci_addr    = ci_addr    or 6
+            ci_contact = ci_contact or 7
+            ci_notes   = ci_notes   or 8
+
+            def _cv(row, ci): return str(row[ci - 1].value or "").strip()
+
+            for row in ws.iter_rows(min_row=2, values_only=False):
+                shop = _cv(row, ci_shop)
+                if not shop:
+                    continue
+                self._rows.append({
+                    "id":      _cv(row, ci_id),
+                    "shop":    shop,
+                    "mall":    _cv(row, ci_mall),
+                    "floor":   _cv(row, ci_floor),
+                    "stall":   _cv(row, ci_stall),
+                    "addr":    _cv(row, ci_addr),
+                    "contact": _cv(row, ci_contact),
+                    "notes":   _cv(row, ci_notes),
+                })
+            wb.close()
+        except Exception:
+            pass
+        # Always display in stall-ascending order
+        self._rows.sort(key=self._stall_sort_key)
+        self._repopulate()
+
+    def _repopulate(self) -> None:
+        self._tree.delete(*self._tree.get_children())
+        for row in self._rows:
+            self._tree.insert("", tk.END, values=(
+                row["shop"], row["stall"], row["mall"], row["notes"],
+            ))
+
+    def _on_select(self, _event=None) -> None:
+        has = bool(self._tree.selection())
+        self._edit_btn.config(state="normal" if has else "disabled")
+        self._remove_btn.config(state="normal" if has else "disabled")
+
+    def _write(self) -> None:
+        """Sort rows by stall, overwrite Suppliers data rows, preserve header row 1."""
+        # Sort in memory first so the dialog display and file stay in sync
+        self._rows.sort(key=self._stall_sort_key)
+        self._repopulate()
+
+        try:
+            if backup_supplier_catalog_before_write is not None:
+                backup_supplier_catalog_before_write(
+                    self._catalog_path, "manage_suppliers"
+                )
+            import openpyxl as _xl
+            wb = _xl.load_workbook(self._catalog_path)
+            if "Suppliers" not in wb.sheetnames:
+                # Create the sheet with standard headers
+                ws = wb.create_sheet("Suppliers", 0)
+                for ci, h in enumerate(
+                    ("ID", "Shop Name", "Mall", "Floor", "Stall",
+                     "Address", "Contact", "Notes"), 1
+                ):
+                    ws.cell(1, ci).value = h
+            else:
+                ws = wb["Suppliers"]
+                # Clear all data rows (keep row 1 = header)
+                for r in range(ws.max_row, 1, -1):
+                    ws.delete_rows(r, 1)
+
+            # Write rows in sorted order with fresh sequential IDs
+            for seq, row in enumerate(self._rows, start=1):
+                ws.cell(seq + 1, self._C_ID).value      = str(seq)
+                ws.cell(seq + 1, self._C_SHOP).value    = row["shop"]    or None
+                ws.cell(seq + 1, self._C_MALL).value    = row["mall"]    or None
+                ws.cell(seq + 1, self._C_FLOOR).value   = row["floor"]   or None
+                ws.cell(seq + 1, self._C_STALL).value   = row["stall"]   or None
+                ws.cell(seq + 1, self._C_ADDR).value    = row["addr"]    or None
+                ws.cell(seq + 1, self._C_CONTACT).value = row["contact"] or None
+                ws.cell(seq + 1, self._C_NOTES).value   = row["notes"]   or None
+
+            wb.save(self._catalog_path)
+            wb.close()
+        except Exception as e:
+            messagebox.showerror(
+                "Save failed" if self._lang == "en" else "\u4fdd\u5b58\u5931\u8d25",
+                str(e), parent=self._d,
+            )
+
+    # ── Entry form ────────────────────────────────────────────────────
+
+    def _entry_form(
+        self, title: str,
+        shop: str = "", mall: str = "", floor_: str = "", stall: str = "",
+        addr: str = "", contact: str = "", notes: str = "",
+    ) -> dict | None:
+        """Modal inline form; returns a dict of values or None if cancelled."""
+        top = tk.Toplevel(self._d)
+        top.title(title)
+        top.transient(self._d)
+        top.grab_set()
+        top.configure(bg=COLORS["app"])
+        top.resizable(False, False)
+        result: list[dict | None] = [None]
+
+        f = tk.Frame(top, bg=COLORS["app"])
+        f.pack(fill=tk.BOTH, expand=True, padx=18, pady=16)
+        f.columnconfigure(1, weight=1)
+
+        _T = lambda en, zh: en if self._lang == "en" else zh
+
+        def _lbl(row: int, text: str) -> None:
+            tk.Label(
+                f, text=text, font=("Segoe UI", 9, "bold"),
+                fg=COLORS["muted"], bg=COLORS["app"],
+            ).grid(row=row, column=0, sticky=tk.W, padx=(0, 10), pady=(6, 2))
+
+        def _entry(row: int, val: str, width: int = 26) -> tk.StringVar:
+            sv = tk.StringVar(value=val)
+            ttk.Entry(f, textvariable=sv, font=("Segoe UI", 10), width=width).grid(
+                row=row, column=1, sticky="ew", pady=(6, 2),
+            )
+            return sv
+
+        _lbl(0, _T("Shop Name *", "\u5e97\u540d *"))
+        shop_v    = _entry(0, shop)
+        _lbl(1, _T("Stall",       "\u6444\u4f4d"))
+        stall_v   = _entry(1, stall)
+        _lbl(2, _T("Mall",        "\u5546\u573a"))
+        mall_v    = _entry(2, mall)
+        _lbl(3, _T("Floor",       "\u697c\u5c42"))
+        floor_v   = _entry(3, floor_)
+        _lbl(4, _T("Address",     "\u5730\u5740"))
+        addr_v    = _entry(4, addr)
+        _lbl(5, _T("Contact",     "\u8054\u7cfb\u65b9\u5f0f"))
+        contact_v = _entry(5, contact)
+        _lbl(6, _T("Notes",       "\u5907\u6ce8"))
+        notes_v   = _entry(6, notes)
+
+        err_lbl = tk.Label(
+            f, text="", font=("Segoe UI", 8), fg="#b91c1c", bg=COLORS["app"],
+        )
+        err_lbl.grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+
+        btn_row = tk.Frame(f, bg=COLORS["app"])
+        btn_row.grid(row=8, column=0, columnspan=2, sticky="e", pady=(14, 0))
+
+        def _ok() -> None:
+            n = shop_v.get().strip()
+            if not n:
+                err_lbl.config(
+                    text=_T("Shop name is required.", "\u5e97\u540d\u4e0d\u80fd\u4e3a\u7a7a\u3002")
+                )
+                return
+            result[0] = {
+                "shop":    n,
+                "stall":   stall_v.get().strip(),
+                "mall":    mall_v.get().strip(),
+                "floor":   floor_v.get().strip(),
+                "addr":    addr_v.get().strip(),
+                "contact": contact_v.get().strip(),
+                "notes":   notes_v.get().strip(),
+            }
+            top.destroy()
+
+        ttk.Button(
+            btn_row,
+            text=_T("Cancel", "\u53d6\u6d88"),
+            command=top.destroy, style="Tool.TButton",
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(
+            btn_row, text="OK", command=_ok, style="Tool.TButton",
+        ).pack(side=tk.LEFT)
+
+        # Focus first field and bind keyboard shortcuts
+        f.winfo_children()[1].focus_set()   # the Shop Name Entry
+        top.bind("<Return>", lambda _: _ok())
+        top.bind("<Escape>", lambda _: top.destroy())
+        top.wait_window()
+        return result[0]
+
+    # ── CRUD actions ──────────────────────────────────────────────────
+
+    def _add_entry(self) -> None:
+        data = self._entry_form(
+            "Add Supplier" if self._lang == "en" else "\u6dfb\u52a0\u4f9b\u5e94\u5546"
+        )
+        if data is None:
+            return
+        # Preserve id as empty; _write will re-sequence on save
+        data["id"] = ""
+        self._rows.append(data)
+        self._repopulate()
+        # Select the newly added row
+        children = self._tree.get_children()
+        if children:
+            self._tree.selection_set(children[-1])
+            self._tree.see(children[-1])
+        self._write()
+
+    def _edit_entry(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        idx = self._tree.index(sel[0])
+        row = self._rows[idx]
+        data = self._entry_form(
+            "Edit Supplier" if self._lang == "en" else "\u7f16\u8f91\u4f9b\u5e94\u5546",
+            shop=row["shop"],    mall=row["mall"],  floor_=row["floor"],
+            stall=row["stall"],  addr=row["addr"],  contact=row["contact"],
+            notes=row["notes"],
+        )
+        if data is None:
+            return
+        data["id"] = row["id"]  # keep original ID
+        self._rows[idx] = data
+        self._repopulate()
+        self._write()
+
+    def _remove_entry(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        idx  = self._tree.index(sel[0])
+        name = self._rows[idx]["shop"]
+        if not messagebox.askyesno(
+            "Remove supplier" if self._lang == "en" else "\u5220\u9664\u4f9b\u5e94\u5546",
+            (f"Remove \u2018{name}\u2019 from the Suppliers list?"
+             if self._lang == "en" else
+             f"\u5220\u9664\u300c{name}\u300d\uff1f"),
+            parent=self._d,
+        ):
+            return
+        del self._rows[idx]
+        self._repopulate()
+        self._edit_btn.config(state="disabled")
+        self._remove_btn.config(state="disabled")
+        self._write()
+
+    def _close(self) -> None:
+        self._d.destroy()
+        if callable(self._on_close):
+            self._on_close()
 
 
 def main() -> None:

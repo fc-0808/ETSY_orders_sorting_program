@@ -255,29 +255,14 @@ FILLED_ENTRY_MATCH_THRESHOLD = 85
 # catalog row so the user can track it individually (price, category, etc.).
 #
 # Any match whose score falls below SAME_PRODUCT_THRESHOLD is therefore treated
-# as a *variant* of the matched entry: the item is still routed to that supplier's
-# stall, but a new amber row is added with ALL supplier fields LEFT EMPTY so the
-# user verifies and fills in the correct Shop Name, Stall, and Price manually.
+# as a *variant* of the matched entry: the item is still routed to that
+# supplier's stall (correct location), but update_catalog() also appends a new
+# amber row pre-filled with the inferred shop_name / stall so the user only
+# needs to add Category and Price.
 #
 # Rationale for 97: exact same product title → 100; one-word phone-model
 # variation ("13" added/removed) → ~97; colour/style variant → 93–95.
 SAME_PRODUCT_THRESHOLD = 97
-
-# Catalog note-hint threshold
-# ----------------------------------------
-# Controls when update_catalog() annotates a new amber catalog row with a
-# "possible match" hint showing the closest existing entry.
-#
-# IMPORTANT: this threshold NEVER causes supplier/stall cells to be pre-filled.
-# New catalog rows always have empty Shop Name and Stall so the user must verify
-# and fill them in manually.  The hint is purely informational context.
-#
-# Set equal to SAME_PRODUCT_THRESHOLD so that only near-identical titles (≥ 97)
-# trigger the hint.  Scores of 85-96 are too ambiguous for even a hint — phone
-# case titles share so many common tokens that completely different products
-# routinely reach scores of 85-93, and pre-assigning (or even hinting) the wrong
-# supplier causes wasted trips to the wrong stall.
-VARIANT_HINT_THRESHOLD = SAME_PRODUCT_THRESHOLD
 
 # Photo display dimensions used in both the route Excel and the catalog
 PHOTO_PX    = 155   # square thumbnail px (enlarged for better visibility)
@@ -881,31 +866,6 @@ def _unmerge_any_spanning_column(ws, col_idx: int) -> None:
                 ws.unmerge_cells(str(rng))
             except ValueError:
                 pass
-
-
-def _unmerge_row_cells(ws, row_num: int) -> None:
-    """Unmerge every merged-cell range that overlaps *row_num*.
-
-    openpyxl represents non-anchor cells of a merged range as read-only
-    ``MergedCell`` objects.  Any attempt to set ``.value`` on them raises::
-
-        AttributeError: 'MergedCell' object attribute 'value' is read-only
-
-    This happens when a data-row write targets a row that is (or was) part of
-    a merge — most commonly the TOTAL row (merged A:H across all columns) after
-    a catalog sort/rebuild shifted it into the row-number that a stale
-    ``title_to_row`` dict still maps to a product.  Unmerging before the write
-    turns every cell in the range back into a normal writable ``Cell``.
-    """
-    ranges_to_unmerge = [
-        str(mr) for mr in ws.merged_cells.ranges
-        if mr.min_row <= row_num <= mr.max_row
-    ]
-    for range_str in ranges_to_unmerge:
-        try:
-            ws.unmerge_cells(range_str)
-        except (KeyError, ValueError):
-            pass
 
 
 def _fix_product_map_total_merge(ws, end_col: int | None = None) -> None:
@@ -1813,8 +1773,8 @@ def _needs_own_catalog_row(r: ResolvedItem) -> bool:
 
     SAME_PRODUCT_THRESHOLD (97) is the cutoff: scores above it are treated as
     the exact same product (no new row needed); scores below it trigger a new
-    amber row with ALL supplier fields left empty so the user fills in the
-    correct Shop Name, Stall, and Price manually.
+    amber row that is pre-filled with the inferred supplier info so the user
+    only has to add Category and Price.
     """
     if r.supplier is None:
         return True
@@ -1932,22 +1892,18 @@ def update_catalog(path: Path, resolved: list[ResolvedItem]) -> int:
     for r in to_add:
         row = ws.max_row + 1
 
-        # Supplier info is NEVER auto-assigned to new catalog rows.
-        # Even if a fuzzy match exists, phone-case titles share so many
-        # common tokens that scores of 85-96 are unreliable — pre-filling
-        # the wrong stall sends the buyer to the wrong shop.
-        # We only record the closest match as a read-only hint in the note
-        # column (H) when the score is very high (>= VARIANT_HINT_THRESHOLD),
-        # so the user has context while still filling in the correct values.
-        hint_shop  = ""
-        hint_stall = ""
-        has_hint   = False
+        # Determine whether we have inferred supplier info from a high-confidence
+        # partial match (variant product from the same stall).  If so, pre-fill
+        # Shop Name and Stall so the user only needs to add Price (and charm if needed).
+        inferred_shop  = ""
+        inferred_stall = ""
+        is_variant     = False
         if (r.supplier
                 and (r.supplier.shop_name or r.supplier.stall)
-                and r.match_score >= VARIANT_HINT_THRESHOLD):
-            hint_shop  = r.supplier.shop_name or ""
-            hint_stall = r.supplier.stall     or ""
-            has_hint   = True
+                and r.match_score >= FILLED_ENTRY_MATCH_THRESHOLD):
+            inferred_shop  = r.supplier.shop_name or ""
+            inferred_stall = r.supplier.stall     or ""
+            is_variant     = True   # product variant; location known, details TBD
 
         # A – photo placeholder (no text; image anchored below)
         ws.cell(row, 1).border = _BORDER
@@ -1956,11 +1912,11 @@ def update_catalog(path: Path, resolved: list[ResolvedItem]) -> int:
         # B – product title  (bold, amber background)
         _cat_cell(ws, row, 2, r.item.title,  _CAT_WARN_FILL, _CAT_BODY_BOLD, _CAT_WRAP)
 
-        # C – shop name  (always empty — user must fill in manually)
-        _cat_cell(ws, row, 3, None, _CAT_WARN_FILL, _CAT_BODY, _CAT_WRAP)
+        # C – shop name  (pre-filled if variant, otherwise empty)
+        _cat_cell(ws, row, 3, inferred_shop or None,  _CAT_WARN_FILL, _CAT_BODY, _CAT_WRAP)
 
-        # D – stall  (always empty — user must fill in manually)
-        _cat_cell(ws, row, 4, None, _CAT_WARN_FILL, _CAT_BODY, _CAT_CENTER)
+        # D – stall  (pre-filled if variant, otherwise empty)
+        _cat_cell(ws, row, 4, inferred_stall or None, _CAT_WARN_FILL, _CAT_BODY, _CAT_CENTER)
 
         # E – price  (always empty; distinct yellow fill = price TBD)
         _cat_cell(ws, row, 5, None,          _CAT_PRICE_FILL, _CAT_BODY,     _CAT_CENTER)
@@ -1984,19 +1940,22 @@ def update_catalog(path: Path, resolved: list[ResolvedItem]) -> int:
             _cat_cell(ws, row, 7, None,
                       _NA_FILL, _NA_FONT, _CAT_CENTER)
 
-        # H – actionable note (always instructs the user to fill in C, D, E)
-        # When a very-high-confidence hint exists, append it as context only.
-        note = (
-            "NEW \u2500 Fill in: Shop Name (C)  \u2502  Stall (D)  "
-            "\u2502  Price \u00a5 (E)"
-        )
-        if item_has_charm:
-            note += "  \u2502  Charm Shop (F)"
-        if has_hint:
-            note += (
-                f"  \u2502  Possible match: {hint_shop or '?'} / "
-                f"{hint_stall or '?'}  ({r.match_score:.0f}%) \u2014 verify before filling"
+        # H – actionable note
+        if is_variant:
+            note = (
+                f"NEW \u2500 Variant matched to {inferred_shop or '?'} / "
+                f"{inferred_stall or '?'} \u2502  Verify location, "
+                "fill Price \u00a5 (E)"
             )
+            if item_has_charm:
+                note += "  \u2502  Assign Charm Shop (F)"
+        else:
+            note = (
+                "NEW \u2500 Fill in: Shop Name (C)  \u2502  Stall (D)  "
+                "\u2502  Price \u00a5 (E)"
+            )
+            if item_has_charm:
+                note += "  \u2502  Charm Shop (F)"
         _cat_cell(ws, row, 8, note, _CAT_WARN_FILL, _CAT_WARN_FONT, _CAT_WRAP)
 
         ws.row_dimensions[row].height = ROW_HEIGHT   # 46 pt, always
@@ -2140,81 +2099,7 @@ def sync_suppliers_from_product_map(wb: openpyxl.Workbook) -> int:
             "Suppliers sheet: appended %d row(s) (unique shop+stall from Product Map)",
             added,
         )
-
-    # After adding new rows, re-sort the entire Suppliers sheet so entries
-    # remain in stall-ascending order regardless of insertion sequence.
-    sort_suppliers_sheet(wb)
-
     return added
-
-
-def sort_suppliers_sheet(wb: openpyxl.Workbook) -> bool:
-    """
-    Re-sort **all** data rows on the *Suppliers* sheet in-place, ordered by:
-
-        floor-ascending  →  stall code (case-insensitive)  →  shop name
-
-    This is the same key used throughout the shopping-route generator so the
-    Suppliers sheet always mirrors the physical walking order.
-
-    Returns ``True`` if the sheet was modified, ``False`` if it was already
-    sorted or contained zero / one data row.
-    """
-    if SUPPLIERS_SHEET not in wb.sheetnames:
-        return False
-    ws = wb[SUPPLIERS_SHEET]
-
-    # Detect column positions from the header row
-    ci_id = ci_shop = ci_stall = None
-    for ci in range(1, 15):
-        h = str(ws.cell(1, ci).value or "").strip().lower()
-        if h == "id":           ci_id   = ci
-        elif h == "shop name":  ci_shop  = ci
-        elif h == "stall":      ci_stall = ci
-    ci_id    = ci_id    or 1
-    ci_shop  = ci_shop  or 2
-    ci_stall = ci_stall or 5
-
-    max_col = ws.max_column or 8
-
-    # Read all non-empty data rows
-    rows: list[dict] = []
-    for r in range(2, ws.max_row + 1):
-        shop = str(ws.cell(r, ci_shop).value or "").strip()
-        if not shop:
-            continue
-        stall = str(ws.cell(r, ci_stall).value or "").strip()
-        cell_vals = {ci: ws.cell(r, ci).value for ci in range(1, max_col + 1)}
-        rows.append({"_vals": cell_vals, "_shop": shop, "_stall": stall})
-
-    if len(rows) <= 1:
-        return False
-
-    sorted_rows = sorted(
-        rows,
-        key=lambda row: (
-            _stall_floor(row["_stall"]),
-            row["_stall"].lower(),
-            row["_shop"].lower(),
-        ),
-    )
-
-    # Short-circuit if order is unchanged
-    if [r["_vals"] for r in rows] == [r["_vals"] for r in sorted_rows]:
-        return False
-
-    # Clear existing data rows then rewrite in sorted order
-    for r in range(ws.max_row, 1, -1):
-        ws.delete_rows(r, 1)
-
-    for seq, row in enumerate(sorted_rows, start=2):
-        for ci, val in row["_vals"].items():
-            ws.cell(seq, ci).value = val
-        # Reassign sequential ID
-        ws.cell(seq, ci_id).value = str(seq - 1)
-
-    log.info("Suppliers sheet: sorted %d row(s) by stall.", len(sorted_rows))
-    return True
 
 
 def clear_product_map_charm_codes(path: Path) -> int:
@@ -2600,130 +2485,6 @@ def list_product_map_rows_for_picker(path: Path) -> list[ProductMapPickerRow]:
     return out
 
 
-def get_catalog_photo_map(catalog_path: Path) -> dict[str, bytes]:
-    """Return a mapping of *normalized product title* → canonical JPEG photo bytes.
-
-    Reads embedded photos from column A of the Product Map sheet.  Used by the
-    Orders Dashboard so that every order for the same product always displays the
-    same photo regardless of which PDF it was extracted from.
-
-    The dict contains two entries per product:
-      • The full normalized title (exact match priority).
-      • The first 50 characters (backward-compat for older cached items whose
-        norm_title was stored with [:50] truncation).
-    """
-    if not catalog_path.exists():
-        return {}
-    try:
-        rows = list_product_map_rows_for_picker(catalog_path)
-        if not rows:
-            return {}
-        row_photos = extract_photos_from_xlsx(
-            catalog_path, sheet_name=CATALOG_SHEET, photo_col_idx=0
-        )
-        result: dict[str, bytes] = {}
-        for row in rows:
-            photo = row_photos.get(row.row_num)
-            if not photo:
-                continue
-            key = _normalize(row.title)
-            result[key] = photo
-            short = key[:50]
-            if short not in result:
-                result[short] = photo
-        log.info(
-            "Catalog photo map: %d product(s) have canonical photos", len(result)
-        )
-        return result
-    except Exception as exc:
-        log.warning("get_catalog_photo_map failed: %s", exc)
-        return {}
-
-
-def apply_canonical_charm_fields_to_resolved(
-    resolved: list[ResolvedItem],
-    catalog_path: Path,
-) -> int:
-    """Overwrite each item's ``r.supplier.charm_shop`` with the canonical shop
-    from the Charm Library (``default_charm_shop``) for that charm code.
-
-    After ``normalize_catalog_charm_shops`` runs, the Charm Library holds the
-    single ground-truth shop for every charm code.  Cached items loaded from
-    JSON may still carry the OLD per-order ``charm_shop`` value (from before
-    normalisation), which makes the shopping-route charm aggregation split the
-    same code into multiple rows — contradicting the dashboard.
-
-    This function propagates the library's canonical shop back into every
-    ``ResolvedItem`` so the Excel aggregation and the dashboard always agree.
-
-    Returns the number of items whose ``charm_shop`` was corrected.
-    """
-    charm_lib = load_charm_library(catalog_path)
-    if not charm_lib:
-        return 0
-    # Canonical shop per code (only codes that have one)
-    canonical: dict[str, str] = {
-        code: (entry.default_charm_shop or "").strip()
-        for code, entry in charm_lib.items()
-        if (entry.default_charm_shop or "").strip()
-    }
-    if not canonical:
-        return 0
-    corrected = 0
-    for r in resolved:
-        if not r.supplier:
-            continue
-        code = (r.supplier.charm_code or "").strip()
-        if not code:
-            continue
-        target_shop = canonical.get(code)
-        if target_shop and (r.supplier.charm_shop or "").strip() != target_shop:
-            r.supplier.charm_shop = target_shop
-            corrected += 1
-    if corrected:
-        log.info(
-            "apply_canonical_charm_fields: corrected charm_shop on %d item(s) "
-            "to match Charm Library canonical mapping",
-            corrected,
-        )
-    return corrected
-
-
-def apply_catalog_photos_to_resolved(
-    resolved: list[ResolvedItem],
-    catalog_path: Path,
-) -> int:
-    """Overwrite each item's ``photo_bytes`` with the canonical photo from the
-    Product Map when one is available.
-
-    This ensures the shopping route Excel (and the JSON cache) always show the
-    same photo for the same product regardless of which PDF batch it was
-    originally extracted from.  When a user uploads a replacement photo via the
-    Orders Dashboard the new image is committed to the Product Map; calling this
-    function before writing the cache and route files propagates that change
-    throughout the system automatically on the next regeneration.
-
-    Returns the number of items whose photo was updated.
-    """
-    catalog_photos = get_catalog_photo_map(catalog_path)
-    if not catalog_photos:
-        return 0
-    updated = 0
-    for r in resolved:
-        norm = _normalize(r.item.title)
-        canonical = catalog_photos.get(norm) or catalog_photos.get(norm[:50])
-        if canonical and canonical != r.item.photo_bytes:
-            r.item.photo_bytes = canonical
-            updated += 1
-    if updated:
-        log.info(
-            "apply_catalog_photos: replaced photos for %d of %d item(s) "
-            "with canonical Product Map images",
-            updated, len(resolved),
-        )
-    return updated
-
-
 def list_product_map_data_rows(path: Path) -> list[tuple[int, str, bool]]:
     """
     Return ``(excel_row, product_title, is_discontinued)`` for each Product Map
@@ -2764,25 +2525,6 @@ def update_product_map_cells(
         wb.close()
         raise ValueError(f"Row {row_num} is out of range (2 .. {ws.max_row}).")
 
-    # Guard: if the row is the TOTAL summary row (merged A:H, column-A value starts
-    # with "TOTAL:"), the caller's title_to_row mapping is stale.  Raise a clear,
-    # actionable error instead of the cryptic MergedCell read-only AttributeError.
-    _col_a_val = ws.cell(row_num, 1).value
-    if isinstance(_col_a_val, str) and _col_a_val.strip().startswith("TOTAL:"):
-        wb.close()
-        raise ValueError(
-            f"Row {row_num} is the catalog TOTAL row, not a product data row. "
-            "The row-number mapping is stale — close and reopen the Orders "
-            "Dashboard to refresh it, then try again."
-        )
-
-    # Unmerge any merged ranges overlapping this row BEFORE writing.
-    # openpyxl raises 'MergedCell attribute value is read-only' when you try to
-    # assign .value to a non-anchor cell in a merged range.  This arises whenever
-    # title_to_row points to a row that was later touched by a merge (e.g. after
-    # a catalog sort/rebuild moved the TOTAL row into the same position).
-    _unmerge_row_cells(ws, row_num)
-
     if shop_name is not None:
         ws.cell(row_num, 3).value = shop_name or None
     if stall is not None:
@@ -2796,113 +2538,6 @@ def update_product_map_cells(
     set_supplier_catalog_active_to_product_map(wb)
     wb.save(path)
     wb.close()
-
-
-def normalize_catalog_charm_shops(path: Path) -> int:
-    """Enforce a strict 1:1 ``charm_code → charm_shop`` constraint across the
-    entire Product Map.
-
-    Rule (first-established wins, Charm Library takes priority):
-    ─────────────────────────────────────────────────────────────
-    1. If the Charm Library has a ``default_charm_shop`` for a code, that shop
-       is **canonical** for every row in the Product Map that carries that code.
-    2. If the Charm Library has *no* ``default_charm_shop`` for a code but the
-       Product Map already has at least one row with a non-empty ``charm_shop``,
-       the first such shop found becomes canonical and is written back into the
-       Charm Library so future runs are consistent.
-    3. All Product Map rows whose ``charm_shop`` differs from the canonical shop
-       are corrected in-place.
-
-    Returns the number of Product Map rows that were corrected.
-    Skips the write pass entirely when everything is already consistent.
-    """
-    if not path.exists():
-        return 0
-
-    # ── Pass 1 (read-only): build canonical code → shop mapping ─────────
-    charm_lib = load_charm_library(path)
-    canonical: dict[str, str] = {
-        code: entry.default_charm_shop
-        for code, entry in charm_lib.items()
-        if entry.default_charm_shop
-    }
-
-    # Accumulate all (r_num, code, current_shop) tuples for catalog rows
-    pm_rows: list[tuple[int, str, str]] = []
-
-    wb_ro = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    if CATALOG_SHEET in wb_ro.sheetnames:
-        ws_ro = wb_ro[CATALOG_SHEET]
-        for r_num in range(2, ws_ro.max_row + 1):
-            b_val = ws_ro.cell(r_num, 2).value
-            if not b_val or not isinstance(b_val, str):
-                continue
-            code_str = str(ws_ro.cell(r_num, 7).value or "").strip()  # col G = Charm Code
-            shop_str = str(ws_ro.cell(r_num, 6).value or "").strip()  # col F = Charm Shop
-            if not code_str:
-                continue
-            pm_rows.append((r_num, code_str, shop_str))
-            # First non-empty shop in Product Map establishes canonical when
-            # the library hasn't declared one yet.
-            if code_str not in canonical and shop_str:
-                canonical[code_str] = shop_str
-    wb_ro.close()
-
-    if not canonical:
-        return 0
-
-    # Rows that need their charm_shop corrected
-    fix_rows: dict[int, str] = {
-        r_num: canonical[code_str]
-        for r_num, code_str, shop_str in pm_rows
-        if code_str in canonical and shop_str != canonical[code_str]
-    }
-
-    # Library rows that need default_charm_shop filled in
-    lib_fill: dict[str, str] = {
-        code: shop
-        for code, shop in canonical.items()
-        if charm_lib.get(code) and not charm_lib[code].default_charm_shop
-    }
-
-    if not fix_rows and not lib_fill:
-        log.debug(
-            "normalize_catalog_charm_shops: all %d charm-coded row(s) consistent",
-            len(pm_rows),
-        )
-        return 0
-
-    # ── Pass 2 (write): apply corrections ────────────────────────────────
-    backup_supplier_catalog_before_write(path, "normalize_charm_shops")
-    wb = openpyxl.load_workbook(path)
-    ensure_catalog_column_layout(wb)
-    ws = wb[CATALOG_SHEET]
-
-    fixed = 0
-    for r_num, target_shop in fix_rows.items():
-        _unmerge_row_cells(ws, r_num)
-        ws.cell(r_num, 6).value = target_shop or None
-        fixed += 1
-
-    # Fill missing default_charm_shop in Charm Library sheet
-    if lib_fill and CHARM_LIBRARY_SHEET in wb.sheetnames:
-        ws_lib = wb[CHARM_LIBRARY_SHEET]
-        for r_num in range(2, ws_lib.max_row + 1):
-            code_val = str(ws_lib.cell(r_num, 2).value or "").strip()  # col B = code
-            if code_val in lib_fill:
-                cur = str(ws_lib.cell(r_num, 4).value or "").strip()   # col D = default shop
-                if not cur:
-                    ws_lib.cell(r_num, 4).value = lib_fill[code_val]
-
-    _refresh_all_product_map_validations(wb, ws)
-    set_supplier_catalog_active_to_product_map(wb)
-    wb.save(path)
-    log.info(
-        "normalize_catalog_charm_shops: corrected %d Product Map row(s); "
-        "%d Charm Library default_charm_shop field(s) filled",
-        fixed, len(lib_fill),
-    )
-    return fixed
 
 
 def resolve_product_map_row_for_discontinue(path: Path, query: str) -> tuple[int, str]:
@@ -3262,16 +2897,6 @@ def update_product_map_photo(path: Path, row_num: int, photo_bytes: bytes) -> No
     if row_num < 2 or row_num > ws.max_row:
         wb.close()
         raise ValueError(f"Row {row_num} is not a valid data row (2 .. {ws.max_row}).")
-
-    # Same TOTAL-row guard as update_product_map_cells.
-    _col_a_photo = ws.cell(row_num, 1).value
-    if isinstance(_col_a_photo, str) and _col_a_photo.strip().startswith("TOTAL:"):
-        wb.close()
-        raise ValueError(
-            f"Row {row_num} is the catalog TOTAL row, not a product data row. "
-            "Close and reopen the Orders Dashboard to refresh the row mapping."
-        )
-
     b_val = ws.cell(row_num, 2).value
     if not b_val or not isinstance(b_val, str):
         wb.close()
@@ -3442,10 +3067,6 @@ def _resolved_to_dict(r: ResolvedItem) -> dict:
         "charm_shop":      r.supplier.charm_shop  if r.supplier else "",
         "charm_code":      r.supplier.charm_code  if r.supplier else "",
         "match_score":     r.match_score,
-        # Preserved so the dashboard can distinguish "in catalog but no supplier
-        # info yet" (needs_info) from "truly unmatched" even when all supplier
-        # fields are empty strings.
-        "in_catalog":      r.supplier is not None,
     }
 
 
@@ -3471,36 +3092,16 @@ def _dict_to_resolved(d: dict) -> ResolvedItem:
     )
     order.items = [item]
     supplier = None
-    # Rebuild CatalogEntry whenever ANY matching field is present.
-    # Previously this checked only shop_name, which silently discarded
-    # stall, charm_shop, and charm_code for products whose catalog row had
-    # a stall or charm assignment but an empty shop name — causing the
-    # dashboard to show "Unmatched" even though the entry existed.
-    if (
-        d.get("shop_name")
-        or d.get("stall")
-        or d.get("charm_shop")
-        or d.get("charm_code")
-    ):
+    if d.get("shop_name"):
         supplier = CatalogEntry(
             product_title = d["title"],
             category  = d.get("category", ""),
-            shop_name = d.get("shop_name", ""),
-            stall     = d.get("stall",     ""),
-            price     = d.get("price",     ""),
-            notes     = d.get("notes",     ""),
+            shop_name = d["shop_name"],
+            stall     = d.get("stall",    ""),
+            price     = d.get("price",    ""),
+            notes     = d.get("notes",    ""),
             charm_shop = d.get("charm_shop", ""),
             charm_code = d.get("charm_code", ""),
-        )
-    elif d.get("in_catalog"):
-        # Item matched a catalog entry but all supplier fields are empty
-        # (needs_info state). Create an empty CatalogEntry so the dashboard
-        # can distinguish this from a truly unmatched item (supplier=None).
-        supplier = CatalogEntry(
-            product_title = d["title"],
-            category  = d.get("category", ""),
-            price     = d.get("price",     ""),
-            notes     = d.get("notes",     ""),
         )
     return ResolvedItem(order=order, item=item, supplier=supplier,
                         match_score=d.get("match_score", 0.0))
@@ -3759,35 +3360,20 @@ def load_items_from_xlsx(xlsx_path: Path) -> list[ResolvedItem]:
 
         shop_name = str(row_vals[3]).strip() if row_vals[3] else ""
         stall     = str(row_vals[4]).strip() if row_vals[4] else ""
-        # "???" means truly unmatched (not in catalog) — clear to empty.
-        # "\u2014" (em-dash) is the sentinel written for needs_info rows
-        # (matched catalog entry with no supplier/stall filled yet) — also
-        # clear the value but remember the item IS in the catalog so the
-        # dashboard shows "Needs Info" instead of "Unmatched".
-        _in_catalog_no_loc = False
+        # Treat "--" as empty for supplier/stall
         if shop_name in ("--", "???"):
             shop_name = ""
-        elif shop_name == "\u2014":
-            shop_name = ""
-            _in_catalog_no_loc = True
         if stall in ("--", "???"):
             stall = ""
-        elif stall == "\u2014":
-            stall = ""
-            _in_catalog_no_loc = True
         supplier = None
         # Create a supplier entry whenever there is any location info, so
         # floor-based sorting still works even with incomplete catalog data.
-        # Also create an empty CatalogEntry for needs_info rows so the
-        # dashboard can show them as "Needs Info" rather than "Unmatched".
         if shop_name or stall:
             supplier = CatalogEntry(
                 product_title = item.title,
                 shop_name     = shop_name,
                 stall         = stall,
             )
-        elif _in_catalog_no_loc:
-            supplier = CatalogEntry(product_title=item.title)
 
         items.append(ResolvedItem(order=order, item=item, supplier=supplier,
                                   match_score=0.0))
@@ -3891,48 +3477,6 @@ def load_existing_statuses(xlsx_path: Path) -> dict[tuple[str, str], str]:
         log.info("Preserved %d non-default status value(s) from existing file",
                  len(statuses))
     return statuses
-
-
-def _load_ui_status_cache(
-    output_dir: Path,
-) -> dict[tuple[str, str, str], str]:
-    """Load purchase-status overrides written by the Orders Dashboard UI.
-
-    The UI saves statuses to ``<output_dir>/route_statuses_cache.json`` with
-    keys serialised as ``order_num\\x00norm_title\\x00comp``.  This function
-    reads that file and returns the same dict format as
-    ``load_existing_statuses`` so the two can be merged transparently.
-
-    Returns an empty dict silently if the file does not exist or cannot be
-    parsed — callers should treat it as a best-effort supplement.
-    """
-    cache_path = output_dir / "route_statuses_cache.json"
-    if not cache_path.exists():
-        return {}
-    try:
-        import json as _json
-        raw: dict = _json.loads(cache_path.read_text(encoding="utf-8"))
-        valid = {"Purchased", "Out of Stock", "Out of Production"}
-        result: dict[tuple[str, str, str], str] = {}
-        for k_str, val in raw.items():
-            if val not in valid:
-                continue
-            parts = k_str.split("\x00", 2)
-            if len(parts) != 3:
-                continue
-            order_num, norm_title, comp = parts
-            # Enforce the same [:50] truncation used throughout the sheet
-            # generation pipeline so keys align with the xlsx-based statuses.
-            result[(order_num, norm_title[:50], comp)] = val
-        if result:
-            log.info(
-                "UI status cache: loaded %d override(s) from %s",
-                len(result), cache_path.name,
-            )
-        return result
-    except Exception as e:
-        log.warning("Could not read UI status cache %s: %s", cache_path.name, e)
-        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -4544,19 +4088,20 @@ def _resolve_charm_photo_bytes(
     charm_library: dict[str, CharmLibraryEntry] | None,
     charm_images_dir: Path | None = None,
 ) -> bytes | None:
-    """Resolve charm photo: Charm Library embed FIRST (canonical source — the
-    same photo the user sees in the dashboard's charm gallery), with the
-    on-disk folder only as a fallback for codes not yet in the library."""
+    """Resolve charm photo: folder first, then Charm Library embed, else None."""
     if not r.supplier:
         return None
     code = (r.supplier.charm_code or "").strip()
     if not code:
         return None
+    from_disk = charm_photo_bytes_from_folder(code, charm_images_dir)
+    if from_disk:
+        return from_disk
     if charm_library:
         ent = charm_library.get(code)
         if ent and ent.photo_bytes:
             return ent.photo_bytes
-    return charm_photo_bytes_from_folder(code, charm_images_dir)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -4818,17 +4363,12 @@ def import_charm_screenshot_assets(
     openai_api_key: str | None = None,
     openai_model: str = "gpt-4o-mini",
     openai_base_url: str | None = None,
-    sku_overrides: dict | None = None,
 ) -> tuple[int, list[str]]:
     """
     Find files under *images_dir* matching any glob in *patterns*, assign sequential codes
     ``<prefix>`` + zero-padded digits (width from existing library/disk and
     ``CHARM_CODE_NUMERIC_MIN_WIDTH`` for new sequences), rename on disk, append
     **Charm Library** rows with embedded photos.
-
-    *sku_overrides* — optional ``{staged_file_stem: sku_text}`` mapping supplied by the
-    import dialog.  When present for a file, its value is used as the SKU (column C)
-    instead of the vision API.  Takes priority over *vision_sku*.
 
     With *vision_sku* and credentials (API key and/or local OpenAI-compatible base URL),
     **SKU** (C) is filled via Chat Completions vision (review results).  Dry-run never
@@ -4968,19 +4508,8 @@ def import_charm_screenshot_assets(
 
             data = dest.read_bytes()
             sku_text: str | None = None
-            sku_source: str = "none"
             mime = _charm_image_mime_type(ext)
-
-            # Priority 1: caller-supplied override from the import SKU dialog
-            if sku_overrides is not None:
-                _ov = (sku_overrides.get(src.stem) or "").strip()
-                if _ov:
-                    sku_text   = _ov
-                    sku_source = "dialog"
-                    lines.append(f"    sku: {sku_text}  [set during import]")
-
-            # Priority 2: vision API (only if no dialog override was given)
-            if not sku_text and vision_sku and vision_can_call and mime:
+            if vision_sku and vision_can_call and mime:
                 sku_text = openai_vision_charm_sku(
                     data,
                     mime,
@@ -4989,7 +4518,6 @@ def import_charm_screenshot_assets(
                     base_url=oa_base,
                 )
                 if sku_text:
-                    sku_source = "vision"
                     lines.append(f"    sku: {sku_text}")
                 else:
                     lines.append(f"    [warn] vision returned no SKU for {code}")
@@ -5001,18 +4529,19 @@ def import_charm_screenshot_assets(
             _cat_cell(ws_lib, row, 2, code, _CAT_WARN_FILL, _CAT_BODY_BOLD, _CAT_CENTER)
             _cat_cell(ws_lib, row, 3, sku_text, _CAT_WARN_FILL, _CAT_BODY, _CAT_CENTER)
             _cat_cell(ws_lib, row, 4, None, _CAT_CHARM_PENDING_FILL, _CAT_BODY, _CAT_CENTER)
-            if sku_source == "dialog":
-                note = (
-                    f"Imported {stamp}.\n\n"
-                    f"• SKU set during import — edit column C if needed.\n\n"
-                    f"• Optional: Default shop (D)."
-                )
-            elif sku_source == "vision":
-                note = (
-                    f"Imported {stamp}.\n\n"
-                    f"• SKU from AI ({openai_model}) — verify column C.\n\n"
-                    f"• Optional: Default shop (D)."
-                )
+            if vision_sku and vision_can_call:
+                if sku_text:
+                    note = (
+                        f"Imported {stamp}.\n\n"
+                        f"• SKU from AI ({openai_model}) — verify column C.\n\n"
+                        f"• Optional: Default shop (D)."
+                    )
+                else:
+                    note = (
+                        f"Imported {stamp}.\n\n"
+                        f"• Fill SKU (C).\n\n"
+                        f"• Optional: Default shop (D)."
+                    )
             else:
                 note = (
                     f"Imported {stamp}.\n\n"
@@ -5090,84 +4619,6 @@ def _apply_charm_rename_to_sheet(ws, rename_map: dict[str, str]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Charm Library -- write SKUs for existing rows
-# ---------------------------------------------------------------------------
-
-
-def write_charm_library_skus(
-    catalog_path: Path,
-    code_to_sku: dict[str, str],
-    *,
-    overwrite: bool = True,
-) -> tuple[int, list[str]]:
-    """
-    Write SKU values (column C) for existing **Charm Library** rows.
-
-    *code_to_sku* maps charm code → desired SKU text.  Empty-string values
-    are written as ``None`` (clears the cell).  Codes not in the sheet are
-    silently ignored.
-
-    When *overwrite* is False, only rows whose column C is currently blank
-    are updated — existing non-blank SKUs are left unchanged.
-
-    Returns ``(n_updated, log_lines)``.
-    """
-    lines: list[str] = []
-    if not catalog_path.exists():
-        lines.append(f"[error] Catalog not found: {catalog_path}")
-        return 0, lines
-    if not code_to_sku:
-        lines.append("[ok] No SKU updates requested.")
-        return 0, lines
-
-    wb = openpyxl.load_workbook(catalog_path)
-    updated = 0
-    try:
-        if CHARM_LIBRARY_SHEET not in wb.sheetnames:
-            lines.append(
-                f"[error] Sheet {CHARM_LIBRARY_SHEET!r} missing."
-            )
-            return 0, lines
-        ws = wb[CHARM_LIBRARY_SHEET]
-        lower_map = {k.strip().casefold(): (k, v) for k, v in code_to_sku.items()}
-
-        for r in range(2, ws.max_row + 1):
-            if _charm_library_instruction_row(ws, r):
-                continue
-            raw_code = str(ws.cell(r, 2).value or "").strip()
-            if not raw_code or raw_code.casefold() == "charm code":
-                continue
-            entry = lower_map.get(raw_code.casefold())
-            if entry is None:
-                continue
-            _, new_sku = entry
-            existing = str(ws.cell(r, 3).value or "").strip()
-            if existing and not overwrite:
-                continue
-            ws.cell(r, 3).value = new_sku if new_sku else None
-            _cat_cell(ws, r, 3, new_sku or None,
-                      _CAT_WARN_FILL, _CAT_BODY, _CAT_CENTER)
-            updated += 1
-            lines.append(
-                f"  {raw_code}: SKU = {new_sku!r}"
-                + ("  (overwrote existing)" if existing and overwrite else "")
-            )
-
-        if updated:
-            backup_supplier_catalog_before_write(catalog_path, "edit_charm_skus")
-            wb.save(catalog_path)
-            lines.append(
-                f"[ok] Updated {updated} SKU(s) in {catalog_path.name}."
-            )
-        else:
-            lines.append("[ok] No rows matched or all already had SKUs.")
-    finally:
-        wb.close()
-
-    return updated, lines
-
-
-# ---------------------------------------------------------------------------
 # Charm Library -- reorder rows then renumber (visual drag-drop result)
 # ---------------------------------------------------------------------------
 
@@ -5178,20 +4629,30 @@ def reorder_charm_library_rows(
     *,
     charm_images_dir: Path | None = None,
     dry_run: bool = False,
-    caller_entries: dict | None = None,
 ) -> tuple[int, list[str]]:
     """
     Rewrite Charm Library rows to match *new_code_order*, then renumber.
 
-    *new_code_order* is the definitive list of charm codes the caller wants
-    to keep, in their chosen visual order.  Codes present in the file but
-    absent from *new_code_order* are excluded (treated as deleted).
+    *new_code_order* is the desired sequence of **existing** charm codes as
+    arranged by the user in the reorder dialog.  Any codes present in the
+    library but absent from *new_code_order* are appended at the end in their
+    original relative order.  Unknown codes are silently ignored.
 
-    *caller_entries* — if provided, these entries (with correct photo bytes)
-    are used instead of loading from disk.  This prevents photo corruption
-    caused by openpyxl ``delete_rows`` misaligning image anchors.
+    Steps
+    -----
+    1. Load all charm data (code, SKU, shop, notes, photo bytes) via
+       ``load_charm_library``.
+    2. Open workbook, locate all current data rows, strip them (cell values +
+       embedded images) in one pass.
+    3. Re-write data rows in *new_code_order* starting at the original
+       ``first_data_row``, re-embedding photos.
+    4. Assign new sequential codes (CH-00001, CH-00002 …) matching position.
+    5. Update Product Map column G references for any codes that changed.
+    6. Rename on-disk charm images (two-pass, collision-safe).
+    7. Refresh named ranges, validations, save.
 
     Returns ``(n_reordered, log_lines)``.
+    With ``dry_run=True`` nothing is written — only the planned mapping is logged.
     """
     lines: list[str] = []
 
@@ -5200,25 +4661,17 @@ def reorder_charm_library_rows(
         return 0, lines
 
     # ---- 1. Load all charm data (including embedded photo bytes) ----
-    if caller_entries is not None:
-        entries: dict[str, CharmLibraryEntry] = dict(caller_entries)
-    else:
-        try:
-            entries = load_charm_library(catalog_path)
-        except Exception as exc:
-            lines.append(f"[error] Could not read Charm Library: {exc}")
-            return 0, lines
+    try:
+        entries: dict[str, CharmLibraryEntry] = load_charm_library(catalog_path)
+    except Exception as exc:
+        lines.append(f"[error] Could not read Charm Library: {exc}")
+        return 0, lines
 
     if not entries:
         lines.append("[ok] Charm Library is empty — nothing to reorder.")
         return 0, lines
 
-    # ---- 2. Build final order: ONLY codes the caller requested ----
-    #
-    # new_code_order is the definitive set of codes the user wants to keep
-    # (in their chosen order).  Any code present in the file but absent from
-    # new_code_order was deliberately deleted by the user and must NOT be
-    # written back — otherwise deleted charms resurrect on every apply.
+    # ---- 2. Build final order: honour new_code_order, append any remainder ----
     known      = set(entries.keys())
     seen: set[str] = set()
     final_order: list[str] = []
@@ -5226,12 +4679,10 @@ def reorder_charm_library_rows(
         if code in known and code not in seen:
             final_order.append(code)
             seen.add(code)
-    dropped = known - seen
-    if dropped:
-        lines.append(
-            f"[info] Excluding {len(dropped)} code(s) not in requested order: "
-            + ", ".join(sorted(dropped))
-        )
+    for code in entries:          # dict preserves insertion (original) order
+        if code not in seen:
+            final_order.append(code)
+            seen.add(code)
 
     n_total = len(final_order)
 
@@ -5301,15 +4752,13 @@ def reorder_charm_library_rows(
         first_data_row = current_rows[0][0]
         last_data_row  = current_rows[-1][0]
 
-        # Remove ALL images anchored to column A from row 2 onward.
-        # This catches orphaned images left by openpyxl delete_rows()
-        # (which doesn't reliably update image anchors) and any ghost
-        # images from previous broken operations.
+        # Remove all images anchored to column A in data rows
+        data_row_set = {r for r, _ in current_rows}
         ws_lib._images = [
             img for img in list(getattr(ws_lib, "_images", []) or [])
             if not (
                 _charm_library_image_anchor_col_a(img)
-                and (_anchor_row(img) or 0) >= first_data_row
+                and _anchor_row(img) in data_row_set
             )
         ]
 
@@ -5392,13 +4841,6 @@ def reorder_charm_library_rows(
 
     # ---- 9. Rename disk files (two-pass, collision-safe) ----
     if rename_map and charm_images_dir and charm_images_dir.is_dir():
-        # Clean up leftover temp files from any prior failed renames
-        for stale in charm_images_dir.glob("__reorder_tmp_*"):
-            try:
-                stale.unlink()
-            except OSError:
-                pass
-
         temp_to_final: dict[Path, Path] = {}
         for old_code, new_code in rename_map.items():
             for ext in _CHARM_IMAGE_EXTENSIONS:
@@ -5419,8 +4861,6 @@ def reorder_charm_library_rows(
                     )
         for tmp_path, final_path in temp_to_final.items():
             try:
-                if final_path.exists():
-                    final_path.unlink()
                 tmp_path.rename(final_path)
             except OSError as exc:
                 lines.append(
@@ -6129,57 +5569,36 @@ def _sheet_route(ws, items: list[ResolvedItem],
             else:
                 _awaiting_items.append(_ci)
 
-        # Aggregate coded items by charm_code only.  The 1:1 code→shop rule is
-        # enforced upstream (normalize_catalog_charm_shops + apply_canonical_
-        # charm_fields_to_resolved), so every item with the same code always
-        # has the same canonical shop — one row per unique charm code.
-        #
-        # Shop resolution priority:
-        #   1. CharmLibraryEntry.default_charm_shop (canonical ground-truth)
-        #   2. r.supplier.charm_shop (fallback for codes not yet in library)
-        #   3. "" (empty — row shows "--")
-        #
-        # Photo resolution priority (always prefer the Charm Library tab):
-        #   1. CharmLibraryEntry.photo_bytes (embedded in supplier_catalog.xlsx)
-        #   2. charm_photo_bytes_from_folder  (on-disk fallback)
-        #   3. None                            (no photo — cell left blank)
+        # Aggregate coded items by charm code
         _charm_agg: dict[str, dict] = {}
         for _ci in _coded_items:
-            _cc  = _ci.supplier.charm_code.strip()
-            _lib = (charm_library or {}).get(_cc)
-            # Library default takes precedence — after normalization this is
-            # the canonical value.  Fall back to the per-order value only for
-            # codes the library hasn't registered yet.
-            _cs  = ""
-            if _lib and _lib.default_charm_shop:
-                _cs = _lib.default_charm_shop.strip()
-            if not _cs:
-                _cs = (_ci.supplier.charm_shop if _ci.supplier else "").strip()
+            _cc = _ci.supplier.charm_code.strip()
             if _cc not in _charm_agg:
-                # Photo: Charm Library embed FIRST (matches the dashboard's
-                # gallery tiles), on-disk folder second.
-                _ph = _lib.photo_bytes if _lib and _lib.photo_bytes else None
-                if not _ph:
-                    _ph = charm_photo_bytes_from_folder(_cc, charm_images_dir)
+                _lib = (charm_library or {}).get(_cc)
                 _charm_agg[_cc] = {
                     "code": _cc,
                     "sku": _lib.sku if _lib else "",
                     "default_shop": _lib.default_charm_shop if _lib else "",
                     "notes": _lib.notes if _lib else "",
-                    "photo_bytes": _ph,
-                    "charm_shop": _cs,
-                    "charm_shop_obj": _cshops_lookup_tmp.get(_cs),
+                    "photo_bytes": None,
+                    "charm_shop": "",
+                    "charm_shop_obj": None,
                     "total_qty": 0,
                     "orders": [],
                     "items": [],
-                    "private_notes": [],  # per-order private notes (deduplicated)
                 }
+                _ph = charm_photo_bytes_from_folder(_cc, charm_images_dir)
+                if not _ph and _lib and _lib.photo_bytes:
+                    _ph = _lib.photo_bytes
+                _charm_agg[_cc]["photo_bytes"] = _ph
             _charm_agg[_cc]["total_qty"] += _ci.item.quantity
             _charm_agg[_cc]["orders"].append(_ci.order.order_number)
             _charm_agg[_cc]["items"].append(_ci)
-            _pn = (_ci.order.private_notes or "").strip()
-            if _pn and _pn not in _charm_agg[_cc]["private_notes"]:
-                _charm_agg[_cc]["private_notes"].append(_pn)
+            if not _charm_agg[_cc]["charm_shop"]:
+                _as = (_ci.supplier.charm_shop if _ci.supplier else "").strip()
+                if _as:
+                    _charm_agg[_cc]["charm_shop"] = _as
+                    _charm_agg[_cc]["charm_shop_obj"] = _cshops_lookup_tmp.get(_as)
 
         n_unique_charms  = len(_charm_agg)
         n_missing_code   = len(_awaiting_items)
@@ -6323,14 +5742,7 @@ def _sheet_route(ws, items: list[ResolvedItem],
 
                 unique_orders  = sorted(set(agg["orders"]))
                 orders_display = ", ".join(f"#{o}" for o in unique_orders)
-                # Combine Charm Library notes (static annotation) with the
-                # deduplicated per-order private notes collected during aggregation.
-                _lib_note    = agg["notes"]
-                _order_notes = "; ".join(agg["private_notes"]) if agg["private_notes"] else ""
-                if _lib_note and _order_notes:
-                    notes_val = f"{_lib_note}\n{_order_notes}"
-                else:
-                    notes_val = _lib_note or _order_notes
+                notes_val      = agg["notes"]
 
                 ws.cell(row, 1, cidx + 1)
                 if _zh_route_compact:
@@ -6822,596 +6234,6 @@ def generate_xlsx(items: list[ResolvedItem], output: Path,
 
     wb.save(output)
     log.info("Saved -> %s", output.resolve())
-
-
-# ---------------------------------------------------------------------------
-# Simplified Shopping Route — single-sheet, minimal columns
-# ---------------------------------------------------------------------------
-#
-# Section 1 — Cases / Grips (10 columns):
-#   # | Photo | Supplier | Stall | Items to Purchase | Case | Grip |
-#   Phone Model | Qty | Private Notes
-#
-# Section 2 — Charms aggregated by code (same 10-column grid):
-#   # | Photo | Charm Code | Charm Shop | Stall | Charm | — | — | Qty |
-#   Private Notes
-# ---------------------------------------------------------------------------
-
-def _sheet_route_simple(
-    ws,
-    items: list[ResolvedItem],
-    statuses: dict[tuple[str, str], str] | None = None,
-    charm_shops: list[CharmShop] | None = None,
-    charm_library: dict[str, CharmLibraryEntry] | None = None,
-    charm_images_dir: Path | None = None,
-) -> None:
-    ws.title = "Shopping Route"
-    ws.sheet_properties.tabColor = "1F4E79"
-
-    COLS    = 10
-    col_end = get_column_letter(COLS)
-    HDR_ROW = 4
-
-    # ── Section 1 column positions ───────────────────────────────────────
-    S1_PHOTO    = 2
-    S1_SUPPLIER = 3
-    S1_STALL    = 4
-    S1_ITP      = 5   # Items to Purchase
-    S1_CASE     = 6
-    S1_GRIP     = 7
-    S1_PHONE    = 8
-    S1_QTY      = 9
-    S1_NOTES    = 10
-
-    # ── Section 2 column positions (same grid, different semantics) ───────
-    S2_PHOTO       = 2
-    S2_CHARM_CODE  = 3
-    S2_CHARM_SHOP  = 4
-    S2_STALL       = 5
-    S2_CHARM       = 6
-    # cols 7-8 intentionally blank / N/A
-    S2_QTY         = 9
-    S2_NOTES       = 10
-
-    _statuses  = statuses or {}
-    _row_h     = ROW_HEIGHT
-    _photo_px  = PHOTO_PX
-    _photo_col_w = PHOTO_COL_W
-
-    # ── Classify items ────────────────────────────────────────────────────
-    def _has_loc(r: ResolvedItem) -> bool:
-        return bool(r.supplier and (r.supplier.shop_name or r.supplier.stall))
-
-    routable   = [r for r in items if _has_loc(r)]
-    needs_info = [r for r in items if r.supplier and not _has_loc(r) and not _needs_catalog_entry(r)]
-    unmatched  = [r for r in items if not r.supplier or _needs_catalog_entry(r)]
-    charm_items = [r for r in items if _style_has(r.item.style)[2]]
-
-    total_charm_qty = sum(r.item.quantity for r in charm_items)
-    supplier_stops  = len({(r.supplier.shop_name, r.supplier.stall) for r in routable})
-    order_count     = len({r.order.order_number for r in items})
-
-    # ── Title ─────────────────────────────────────────────────────────────
-    ws.merge_cells(f"A1:{col_end}1")
-    ws.cell(1, 1, f"Shopping Route  --  {date.today().strftime('%B %d, %Y')}").font = _TITLE_FONT
-    ws.row_dimensions[1].height = 36
-
-    # ── Subtitle ──────────────────────────────────────────────────────────
-    ws.merge_cells(f"A2:{col_end}2")
-    sub_parts = [
-        f"{len(items)} items",
-        f"{order_count} orders",
-        f"{supplier_stops} supplier stops",
-        "sorted lowest to highest floor",
-    ]
-    if charm_items:
-        sub_parts.append(f"{total_charm_qty} charm(s) needed \u2014 separate building")
-    if needs_info:
-        sub_parts.append(f"{len(needs_info)} awaiting supplier info")
-    if unmatched:
-        sub_parts.append(f"{len(unmatched)} unmatched")
-    ws.cell(2, 1, "  |  ".join(sub_parts)).font = _SUB_FONT
-    ws.row_dimensions[2].height = 24
-
-    # ── Legend ────────────────────────────────────────────────────────────
-    ws.merge_cells(f"A3:{col_end}3")
-    ws.cell(3, 1,
-        "Status:  Pending (white)   |   Purchased (green)"
-        "   |   Out of Stock (amber)   |   Out of Production (red)"
-        "   |   N/A (gray)"
-    ).font = Font("Calibri", size=9, italic=True, color="555555")
-    ws.row_dimensions[3].height = 14
-
-    # ── Section 1 header row ──────────────────────────────────────────────
-    S1_HDRS = [
-        "#", "Photo", "Supplier", "Stall",
-        "Items to Purchase", "Case", "Grip",
-        "Phone Model", "Qty", "Private Notes",
-    ]
-    for ci, h in enumerate(S1_HDRS, 1):
-        ws.cell(HDR_ROW, ci, h)
-    _style_header(ws, HDR_ROW, COLS)
-    ws.cell(HDR_ROW, S1_ITP ).fill = PatternFill("solid", fgColor="2E7D32")
-    ws.cell(HDR_ROW, S1_CASE).fill = PatternFill("solid", fgColor="1A6B3C")
-    ws.cell(HDR_ROW, S1_GRIP).fill = PatternFill("solid", fgColor="1A3D6B")
-    ws.row_dimensions[HDR_ROW].height = 18
-
-    # ── Group routable items by supplier ──────────────────────────────────
-    groups: dict[tuple[str, str], list[ResolvedItem]] = defaultdict(list)
-    for r in routable:
-        groups[(r.supplier.shop_name, r.supplier.stall)].append(r)
-    for gk in groups:
-        groups[gk].sort(key=_route_item_sort_key)
-    sorted_keys = sorted(
-        groups,
-        key=lambda k: (_stall_floor(k[1]), k[1] or "\uffff", k[0]),
-    )
-
-    active_case_cells: list[str] = []
-    active_grip_cells: list[str] = []
-    row = HDR_ROW + 1
-    first_data_row = row
-    seq = 1
-
-    _status_opts = STATUS_OPTIONS
-    dv_formula   = f'"{",".join(_status_opts)}"'
-    dv_kwargs    = dict(
-        type="list", formula1=dv_formula, allow_blank=False, showDropDown=False,
-        showErrorMessage=True,
-        error="Pick a value from the dropdown.", errorTitle="Invalid status",
-    )
-
-    def _write_comp(ws, row, col, has_component, active_cells, order_num="", comp="", item_title=""):
-        cell = ws.cell(row, col)
-        if has_component:
-            nt  = _normalize(item_title)[:50]
-            prv = _statuses.get((order_num, nt, comp))
-            cell.value     = _t(prv, "en") if prv else "Pending"
-            cell.alignment = _CENTER
-            active_cells.append(cell.coordinate)
-        else:
-            cell.value     = "N/A"
-            cell.fill      = _NA_FILL
-            cell.font      = _NA_FONT
-            cell.alignment = _CENTER
-
-    def _write_s1_row(ws, row, r: ResolvedItem, fill, supplier_display, stall_display):
-        nonlocal seq
-        has_case, has_grip, _ = _style_has(r.item.style)
-        onum = r.order.order_number
-        nt   = _normalize(r.item.title)[:50]
-        case_st = _statuses.get((onum, nt, "case"))
-        grip_st = _statuses.get((onum, nt, "grip"))
-        items_label = _items_to_purchase(has_case, has_grip, case_st, grip_st, "en")
-
-        ws.cell(row, 1, seq)
-        ws.cell(row, S1_SUPPLIER, supplier_display)
-        ws.cell(row, S1_STALL, stall_display)
-        itp = ws.cell(row, S1_ITP, items_label)
-        itp.alignment = _CENTER
-        itp.font      = _ITEMS_TO_PURCHASE_FONT
-        _write_comp(ws, row, S1_CASE, has_case, active_case_cells, onum, "case", r.item.title)
-        _write_comp(ws, row, S1_GRIP, has_grip, active_grip_cells, onum, "grip", r.item.title)
-        ws.cell(row, S1_PHONE, r.item.phone_model)
-        ws.cell(row, S1_QTY,   r.item.quantity)
-        if r.order.private_notes:
-            ws.cell(row, S1_NOTES, r.order.private_notes).alignment = _WRAP
-
-        _style_row(ws, row, COLS, fill=fill)
-        for ci, has in ((S1_CASE, has_case), (S1_GRIP, has_grip)):
-            c = ws.cell(row, ci)
-            if not has:
-                c.fill = _NA_FILL
-                c.font = _NA_FONT
-            else:
-                c.alignment = _CENTER
-        if r.order.private_notes:
-            ws.cell(row, S1_NOTES).alignment = _WRAP
-        ws.cell(row, 1).alignment      = _CENTER
-        ws.cell(row, S1_QTY).alignment = _CENTER
-        ws.row_dimensions[row].height  = _row_h
-        _embed_photo(ws, r.item.photo_bytes, row, S1_PHOTO, _photo_px)
-        seq += 1
-
-    # ── Routable rows ─────────────────────────────────────────────────────
-    for gidx, key in enumerate(sorted_keys):
-        fill = _GROUP_FILLS[gidx % 2]
-        for r in groups[key]:
-            _write_s1_row(ws, row, r, fill,
-                          r.supplier.shop_name or "--",
-                          r.supplier.stall     or "--")
-            row += 1
-
-    # ── Needs Supplier Info ───────────────────────────────────────────────
-    if needs_info:
-        row += 1
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
-        ni = ws.cell(row, 1,
-            "(~)  In Catalog \u2013 Awaiting Supplier Info  "
-            "\u2192  open supplier_catalog.xlsx and fill in Shop Name + Stall"
-        )
-        ni.font   = Font("Calibri", bold=True, size=11, color="1F4E79")
-        ni.fill   = PatternFill("solid", fgColor="BDD7EE")
-        ni.border = _BORDER
-        row += 1
-        for r in sorted(needs_info, key=_route_item_sort_key):
-            _write_s1_row(ws, row, r, _NEEDSINFO_FILL,
-                          r.supplier.shop_name or "\u2014",
-                          r.supplier.stall     or "\u2014")
-            # Re-apply needs-info font to non-N/A cells after _write_s1_row
-            for ci in range(1, COLS + 1):
-                c = ws.cell(row, ci)
-                if c.fill.fgColor.value != "EFEFEF":   # skip N/A cells
-                    c.font = _NEEDSINFO_FONT
-            row += 1
-
-    # ── Unmatched ─────────────────────────────────────────────────────────
-    if unmatched:
-        row += 1
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
-        warn = ws.cell(row, 1, "(!!)  Unmatched Items \u2014 supplier not found in catalog")
-        warn.font   = Font("Calibri", bold=True, size=11, color="856404")
-        warn.fill   = _WARN_FILL
-        warn.border = _BORDER
-        row += 1
-        for r in sorted(unmatched, key=_route_item_sort_key):
-            _write_s1_row(ws, row, r, _WARN_FILL, "???", "???")
-            for ci in range(1, COLS + 1):
-                ws.cell(row, ci).font = _WARN_FONT
-            row += 1
-
-    last_data_row = row - 1
-
-    # ── Status dropdowns for Case / Grip ──────────────────────────────────
-    for cell_list in (active_case_cells, active_grip_cells):
-        if cell_list:
-            dv = DataValidation(**dv_kwargs)
-            ws.add_data_validation(dv)
-            for coord in cell_list:
-                dv.add(coord)
-
-    # ── Conditional formatting for Section 1 ──────────────────────────────
-    if last_data_row >= first_data_row:
-        s1_range = f"A{first_data_row}:{col_end}{last_data_row}"
-        r0 = first_data_row
-        gc = f"${get_column_letter(S1_CASE)}"
-        hc = f"${get_column_letter(S1_GRIP)}"
-        ws.conditional_formatting.add(s1_range, FormulaRule(
-            formula=[f'OR({gc}{r0}="Out of Production",{hc}{r0}="Out of Production")'],
-            fill=_STATUS_FILLS["Out of Production"], font=_STATUS_FONTS["Out of Production"], stopIfTrue=True,
-        ))
-        ws.conditional_formatting.add(s1_range, FormulaRule(
-            formula=[f'AND(OR({gc}{r0}="Out of Stock",{hc}{r0}="Out of Stock"),'
-                     f'NOT(OR({gc}{r0}="Out of Production",{hc}{r0}="Out of Production")))'],
-            fill=_STATUS_FILLS["Out of Stock"], font=_STATUS_FONTS["Out of Stock"], stopIfTrue=True,
-        ))
-        ws.conditional_formatting.add(s1_range, FormulaRule(
-            formula=[f'AND(OR({gc}{r0}="N/A",{gc}{r0}="Purchased"),'
-                     f'OR({hc}{r0}="N/A",{hc}{r0}="Purchased"))'],
-            fill=_STATUS_FILLS["Purchased"], font=_STATUS_FONTS["Purchased"], stopIfTrue=True,
-        ))
-
-    # =========================================================================
-    # SECTION 2 — CHARMS (aggregated by charm code)
-    # =========================================================================
-    if charm_items:
-        row += 1
-
-        _cshops        = charm_shops or []
-        _cshops_lookup = {cs.shop_name: cs for cs in _cshops}
-        total_charm_qty_c = sum(r.item.quantity for r in charm_items)
-
-        # Partition coded vs awaiting
-        _coded_items:    list[ResolvedItem] = []
-        _awaiting_items: list[ResolvedItem] = []
-        for _ci in charm_items:
-            _cc = (_ci.supplier.charm_code if _ci.supplier else "").strip()
-            (_coded_items if _cc else _awaiting_items).append(_ci)
-
-        # Aggregate by charm_code — one row per unique charm.  The 1:1 rule is
-        # enforced upstream so every item with the same code already has the
-        # same canonical shop.  Photo and shop resolution match _sheet_route
-        # exactly: Charm Library first, folder/per-order fallback.
-        _charm_agg: dict[str, dict] = {}
-        for _ci in _coded_items:
-            _cc  = _ci.supplier.charm_code.strip()
-            _lib = (charm_library or {}).get(_cc)
-            _cs  = ""
-            if _lib and _lib.default_charm_shop:
-                _cs = _lib.default_charm_shop.strip()
-            if not _cs:
-                _cs = (_ci.supplier.charm_shop if _ci.supplier else "").strip()
-            if _cc not in _charm_agg:
-                _ph = _lib.photo_bytes if _lib and _lib.photo_bytes else None
-                if not _ph:
-                    _ph = charm_photo_bytes_from_folder(_cc, charm_images_dir)
-                _charm_agg[_cc] = {
-                    "code": _cc,
-                    "default_shop": _lib.default_charm_shop if _lib else "",
-                    "photo_bytes": _ph,
-                    "charm_shop": _cs,
-                    "total_qty": 0,
-                    "orders": [],
-                    "items": [],
-                }
-            _charm_agg[_cc]["total_qty"] += _ci.item.quantity
-            _charm_agg[_cc]["orders"].append(_ci.order.order_number)
-            _charm_agg[_cc]["items"].append(_ci)
-
-        n_missing_code   = len(_awaiting_items)
-        unassigned_count = sum(
-            1 for r in charm_items
-            if not (r.supplier and r.supplier.charm_shop and r.supplier.charm_shop in _cshops_lookup)
-        )
-
-        # ── Charm banner ──────────────────────────────────────────────────
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
-        cb_text = (
-            f"\u2728  CHARMS TO PURCHASE  \u2014  SEPARATE BUILDING"
-            f"  \u2014  {total_charm_qty_c} charm(s) needed across {len(charm_items)} order(s)"
-        )
-        if n_missing_code:
-            cb_text += f"  \u25b6  {n_missing_code} order(s) missing charm-code assignment"
-        if unassigned_count:
-            cb_text += f"  \u25b6  {unassigned_count} order(s) missing charm-shop assignment"
-        cb = ws.cell(row, 1, cb_text)
-        cb.font      = Font("Calibri", bold=True, size=13, color="FFFFFF")
-        cb.fill      = _CHARM_BANNER_FILL
-        cb.border    = _BORDER
-        cb.alignment = _CENTER
-        ws.row_dimensions[row].height = 26
-        row += 1
-
-        # ── Charm shops reference ─────────────────────────────────────────
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
-        if _cshops:
-            shops_text = "Charm shops:   " + "   |   ".join(
-                f"{s.shop_name}  ({s.stall})" for s in _cshops
-            )
-        else:
-            shops_text = "No charm shops configured \u2014 add them in the 'Charm Shops' tab"
-        sr = ws.cell(row, 1, shops_text)
-        sr.font      = Font("Calibri", bold=True, size=10, color="3D1359")
-        sr.fill      = _CHARM_SHOPS_FILL
-        sr.border    = _BORDER
-        sr.alignment = _CENTER
-        ws.row_dimensions[row].height = 20
-        row += 1
-
-        # ── Section 2 sub-header ─────────────────────────────────────────
-        S2_HDRS = [
-            "#", "Photo", "Charm Code", "Charm Shop", "Stall",
-            "Charm", "", "", "Qty", "Private Notes",
-        ]
-        for ci, h in enumerate(S2_HDRS, 1):
-            ws.cell(row, ci, h)
-        _style_header(ws, row, COLS)
-        ws.cell(row, S2_CHARM).fill = _CHARM_HDR_FILL
-        for _mc in (7, 8):
-            ws.cell(row, _mc).fill = _NA_FILL
-            ws.cell(row, _mc).font = _CHARM_NA_HDR_FONT
-        ws.row_dimensions[row].height = 18
-        row += 1
-
-        charm_first_row     = row
-        charm_section_cells: list[str] = []
-
-        # ── Aggregated charm rows ─────────────────────────────────────────
-        sorted_codes = sorted(
-            _charm_agg,
-            key=lambda c: (_charm_agg[c]["charm_shop"] or "\uffff", c),
-        )
-        for cidx, code in enumerate(sorted_codes):
-            agg  = _charm_agg[code]
-            fill = _CHARM_GROUP_FILLS[cidx % 2]
-
-            _cs_name = agg["charm_shop"] or agg["default_shop"]
-            _cs_obj  = _cshops_lookup.get(_cs_name)
-            if _cs_obj:
-                shop_disp  = _cs_obj.shop_name
-                stall_disp = _cs_obj.stall
-            elif _cs_name:
-                shop_disp  = f"? {_cs_name}"
-                stall_disp = "?"
-            else:
-                shop_disp  = "--"
-                stall_disp = "--"
-
-            preserved = _statuses.get((code, "", "charm_agg"))
-            if not preserved:
-                _per_order = []
-                for _ri in agg["items"]:
-                    _ps = _statuses.get((_ri.order.order_number, _normalize(_ri.item.title)[:50], "charm"))
-                    if _ps:
-                        _per_order.append(_ps)
-                if _per_order:
-                    if any(s == "Out of Production" for s in _per_order):
-                        preserved = "Out of Production"
-                    elif any(s == "Out of Stock" for s in _per_order):
-                        preserved = "Out of Stock"
-                    elif all(s == "Purchased" for s in _per_order):
-                        preserved = "Purchased"
-
-            # Collect private notes from all orders (deduplicated)
-            _all_notes: list[str] = []
-            _seen_notes: set[str] = set()
-            for _ri in agg["items"]:
-                _pn = (_ri.order.private_notes or "").strip()
-                if _pn and _pn not in _seen_notes:
-                    _all_notes.append(_pn)
-                    _seen_notes.add(_pn)
-
-            ws.cell(row, 1, cidx + 1)
-            ws.cell(row, S2_CHARM_CODE, code)
-            ws.cell(row, S2_CHARM_SHOP, shop_disp)
-            ws.cell(row, S2_STALL,      stall_disp)
-            charm_cell = ws.cell(row, S2_CHARM)
-            charm_cell.value     = _t(preserved, "en") if preserved else "Pending"
-            charm_cell.alignment = _CENTER
-            charm_section_cells.append(charm_cell.coordinate)
-            ws.cell(row, S2_QTY, agg["total_qty"])
-            if _all_notes:
-                ws.cell(row, S2_NOTES, "; ".join(_all_notes)).alignment = _WRAP
-
-            _style_row(ws, row, COLS, fill=fill)
-            for _mc in (7, 8):
-                ws.cell(row, _mc).fill = _NA_FILL
-                ws.cell(row, _mc).font = _NA_FONT
-            ws.cell(row, S2_CHARM).alignment      = _CENTER
-            ws.cell(row, 1).alignment             = _CENTER
-            ws.cell(row, S2_CHARM_CODE).alignment = _CENTER
-            ws.cell(row, S2_QTY).alignment        = _CENTER
-            if _all_notes:
-                ws.cell(row, S2_NOTES).alignment = _WRAP
-            ws.row_dimensions[row].height = _row_h
-            _embed_photo(ws, agg["photo_bytes"], row, S2_PHOTO, _photo_px)
-            row += 1
-
-        charm_last_row = row - 1
-
-        # ── Charm status dropdowns ────────────────────────────────────────
-        if charm_section_cells:
-            dv_charm = DataValidation(**dv_kwargs)
-            ws.add_data_validation(dv_charm)
-            for coord in charm_section_cells:
-                dv_charm.add(coord)
-
-        # ── Conditional formatting for Section 2 ──────────────────────────
-        if charm_last_row >= charm_first_row:
-            c2_range = f"A{charm_first_row}:{col_end}{charm_last_row}"
-            ic       = f"${get_column_letter(S2_CHARM)}"
-            cr0      = charm_first_row
-            ws.conditional_formatting.add(c2_range, FormulaRule(
-                formula=[f'{ic}{cr0}="Out of Production"'],
-                fill=_STATUS_FILLS["Out of Production"], font=_STATUS_FONTS["Out of Production"], stopIfTrue=True,
-            ))
-            ws.conditional_formatting.add(c2_range, FormulaRule(
-                formula=[f'{ic}{cr0}="Out of Stock"'],
-                fill=_STATUS_FILLS["Out of Stock"], font=_STATUS_FONTS["Out of Stock"], stopIfTrue=True,
-            ))
-            ws.conditional_formatting.add(c2_range, FormulaRule(
-                formula=[f'{ic}{cr0}="Purchased"'],
-                fill=_STATUS_FILLS["Purchased"], font=_STATUS_FONTS["Purchased"], stopIfTrue=True,
-            ))
-
-        # ── Awaiting charm code sub-section ──────────────────────────────
-        if _awaiting_items:
-            row += 1
-            _total_await_qty = sum(r.item.quantity for r in _awaiting_items)
-            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
-            aw = ws.cell(row, 1,
-                f"\u23f3  AWAITING CHARM CODE ASSIGNMENT  \u2014  "
-                f"{len(_awaiting_items)} order(s) ({_total_await_qty} unit(s))"
-                f"  \u2192  open supplier_catalog.xlsx \u2192 Product Map col H (Charm Code)"
-            )
-            aw.font      = Font("Calibri", bold=True, size=11, color="7D4E00")
-            aw.fill      = PatternFill("solid", fgColor="FFF3CD")
-            aw.border    = _BORDER
-            aw.alignment = _CENTER
-            ws.row_dimensions[row].height = 22
-            row += 1
-
-            for ci, h in enumerate(S2_HDRS, 1):
-                ws.cell(row, ci, h)
-            _style_header(ws, row, COLS)
-            ws.cell(row, S2_CHARM).fill = PatternFill("solid", fgColor="FFF3CD")
-            ws.cell(row, S2_CHARM).font = Font("Calibri", bold=True, size=11, color="7D4E00")
-            for _mc in (7, 8):
-                ws.cell(row, _mc).fill = _NA_FILL
-                ws.cell(row, _mc).font = _CHARM_NA_HDR_FONT
-            ws.row_dimensions[row].height = 18
-            row += 1
-
-            _AWAIT_FILL      = PatternFill("solid", fgColor="FFFBF0")
-            _AWAIT_CODE_FONT = Font("Calibri", size=9, color="7D4E00", italic=True)
-            _AWAIT_CODE_FILL = PatternFill("solid", fgColor="FFF3CD")
-
-            for aidx, r in enumerate(sorted(
-                _awaiting_items,
-                key=lambda ri: (_normalize(ri.item.title), ri.order.order_number),
-            )):
-                assigned_name = (r.supplier.charm_shop if r.supplier else "") or ""
-                assigned_cs   = _cshops_lookup.get(assigned_name)
-                if assigned_cs:
-                    shop_disp  = assigned_cs.shop_name
-                    stall_disp = assigned_cs.stall
-                elif assigned_name:
-                    shop_disp  = f"? {assigned_name}"
-                    stall_disp = "?"
-                else:
-                    shop_disp  = "--"
-                    stall_disp = "--"
-
-                ws.cell(row, 1, aidx + 1)
-                ws.cell(row, S2_CHARM_CODE, "\u2014")
-                ws.cell(row, S2_CHARM_SHOP, shop_disp)
-                ws.cell(row, S2_STALL,      stall_disp)
-                _ac = ws.cell(row, S2_CHARM, "\u23f3 Awaiting Code")
-                _ac.alignment = _CENTER
-                _ac.font      = _AWAIT_CODE_FONT
-                _ac.fill      = _AWAIT_CODE_FILL
-                ws.cell(row, S2_QTY, r.item.quantity)
-                if r.order.private_notes:
-                    ws.cell(row, S2_NOTES, r.order.private_notes).alignment = _WRAP
-
-                _style_row(ws, row, COLS, fill=_AWAIT_FILL)
-                _ac = ws.cell(row, S2_CHARM)
-                _ac.font = _AWAIT_CODE_FONT
-                _ac.fill = _AWAIT_CODE_FILL
-                _ac.alignment = _CENTER
-                for _mc in (7, 8):
-                    ws.cell(row, _mc).fill = _NA_FILL
-                    ws.cell(row, _mc).font = _NA_FONT
-                if r.order.private_notes:
-                    ws.cell(row, S2_NOTES).alignment = _WRAP
-                ws.cell(row, 1).alignment      = _CENTER
-                ws.cell(row, S2_QTY).alignment = _CENTER
-                ws.row_dimensions[row].height  = _row_h
-                _embed_photo(ws, r.item.photo_bytes, row, S2_PHOTO, _photo_px)
-                row += 1
-
-    # ── Column widths ─────────────────────────────────────────────────────
-    # #  | Photo       | Supplier/Code | Shop/Supplier | Stall/Stall |
-    # ITP/Charm | Case/— | Grip/— | Phone/Qty | Qty/Notes
-    col_widths = [4, _photo_col_w, 14, 14, 9, 10, 8, 8, 18, 32]
-    for ci, w in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(ci)].width = w
-
-    ws.freeze_panes = "A5"
-    if last_data_row >= first_data_row:
-        ws.auto_filter.ref = f"A{HDR_ROW}:{col_end}{last_data_row}"
-
-
-def generate_xlsx_simple(
-    items: list[ResolvedItem],
-    output: Path,
-    statuses: dict[tuple[str, str], str] | None = None,
-    charm_shops: list[CharmShop] | None = None,
-    charm_library: dict[str, CharmLibraryEntry] | None = None,
-    charm_images_dir: Path | None = None,
-) -> None:
-    """Generate the simplified single-sheet shopping route workbook."""
-    wb = openpyxl.Workbook()
-    _sheet_route_simple(
-        wb.active, items,
-        statuses=statuses,
-        charm_shops=charm_shops,
-        charm_library=charm_library,
-        charm_images_dir=charm_images_dir,
-    )
-    from openpyxl.worksheet.page import PageMargins
-    ws = wb.active
-    ws.page_setup.orientation = "landscape"
-    ws.page_setup.paperSize   = ws.PAPERSIZE_A4
-    ws.page_setup.fitToPage   = True
-    ws.page_setup.fitToWidth  = 1
-    ws.page_setup.fitToHeight = 0
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
-    ws.page_margins = PageMargins(
-        left=0.4, right=0.4, top=0.6, bottom=0.6, header=0.3, footer=0.3,
-    )
-    wb.save(output)
-    log.info("Simple route saved -> %s", output.resolve())
 
 
 # ---------------------------------------------------------------------------
@@ -8051,11 +6873,9 @@ def generate_html(items: list[ResolvedItem], output: Path,
                     "orders": [],
                     "items": [],
                 }
-                # Charm Library embed first, on-disk folder fallback — the
-                # Charm Library tab is the canonical photo source.
-                _hph = _hlib.photo_bytes if _hlib and _hlib.photo_bytes else None
-                if not _hph:
-                    _hph = charm_photo_bytes_from_folder(_hcc, charm_images_dir)
+                _hph = charm_photo_bytes_from_folder(_hcc, charm_images_dir)
+                if not _hph and _hlib and _hlib.photo_bytes:
+                    _hph = _hlib.photo_bytes
                 _h_agg[_hcc]["photo_bytes"] = _hph
             _h_agg[_hcc]["total_qty"] += _hci.item.quantity
             _h_agg[_hcc]["orders"].append(_hci.order.order_number)
@@ -9623,19 +8443,8 @@ def main() -> None:
 
     # ------------------------------------------------------------------ #
     # Step 1 -- Preserve any statuses the user already updated in Excel   #
-    #           AND merge in any overrides from the Orders Dashboard UI.  #
-    #           UI overrides take priority: they represent the most recent #
-    #           user input and are stored in route_statuses_cache.json.   #
     # ------------------------------------------------------------------ #
     existing_statuses = load_existing_statuses(output_path)
-    _ui_overrides = _load_ui_status_cache(output_path.parent)
-    if _ui_overrides:
-        # UI cache takes priority over the stale xlsx values.
-        existing_statuses.update(_ui_overrides)
-        log.info(
-            "Merged %d UI status override(s) into existing statuses",
-            len(_ui_overrides),
-        )
 
     # ------------------------------------------------------------------ #
     # Step 2 -- Load previously cached orders (from earlier runs)         #
@@ -9846,22 +8655,6 @@ def main() -> None:
         sys.exit(1)
 
     # ------------------------------------------------------------------ #
-    # Step 5c -- Apply canonical Product Map photos                       #
-    #                                                                      #
-    # Replace each item's photo_bytes with the authoritative photo stored  #
-    # in the Product Map (supplier_catalog.xlsx, col A).  This guarantees  #
-    # that:                                                                 #
-    #   • Every order for the same product shows the same photo in the     #
-    #     route Excel regardless of which PDF it came from.                #
-    #   • Photos uploaded via the Orders Dashboard panel (which are saved   #
-    #     to the Product Map) appear in the route on the very next         #
-    #     regeneration without any manual steps.                           #
-    # The updated photo_bytes are also written into the cache (step 7) so  #
-    # subsequent regenerations are consistent.                             #
-    # ------------------------------------------------------------------ #
-    apply_catalog_photos_to_resolved(all_resolved, catalog_path)
-
-    # ------------------------------------------------------------------ #
     # Step 5b -- (optional) Purge purchased sections                      #
     #                                                                      #
     # Reads the statuses already entered in the current Excel file and    #
@@ -9986,21 +8779,6 @@ def main() -> None:
     new_added = 0
     if not args.no_catalog_update:
         new_added = update_catalog(catalog_path, all_resolved)
-        # Enforce 1:1 charm_code ↔ charm_shop consistency after every catalog
-        # write.  A single charm code must always map to the same shop so that
-        # the shopping route and orders dashboard never diverge.
-        normalize_catalog_charm_shops(catalog_path)
-
-    # ------------------------------------------------------------------ #
-    # Step 6b -- Sync canonical charm_shop into every ResolvedItem       #
-    #                                                                      #
-    # Cached items loaded from JSON may carry stale charm_shop values     #
-    # from before the 1:1 rule was applied.  This pass overwrites each    #
-    # item's charm_shop with the Charm Library's canonical shop for its  #
-    # code, guaranteeing the route Excel's charm aggregation matches the  #
-    # dashboard exactly.  Always runs, even without --refresh-catalog.    #
-    # ------------------------------------------------------------------ #
-    apply_canonical_charm_fields_to_resolved(all_resolved, catalog_path)
 
     # ------------------------------------------------------------------ #
     # Step 7 -- Save updated cache (all orders, inc. newly added)         #
@@ -10013,12 +8791,6 @@ def main() -> None:
     generate_xlsx(all_resolved, output_path, statuses=existing_statuses,
                   charm_shops=charm_shops, charm_library=charm_library,
                   charm_images_dir=charm_images_dir)
-
-    # Step 8b-simple -- Always generate simplified shopping route (minimal columns)
-    simple_output_path = output_path.with_stem(output_path.stem + "_simple")
-    generate_xlsx_simple(all_resolved, simple_output_path, statuses=existing_statuses,
-                         charm_shops=charm_shops, charm_library=charm_library,
-                         charm_images_dir=charm_images_dir)
 
     # Step 8b -- Optionally generate a Simplified Chinese version
     zh_item_count   = 0   # used later in the summary print
@@ -10145,7 +8917,6 @@ def main() -> None:
     if purged_count or partial_purge_count:
         print(f"  [>>]  {remaining_ct} item(s) still need attention")
     print(f"  --->  {output_path.resolve()}  ({len(all_resolved)} items)")
-    print(f"  [SIMPLE]  {simple_output_path.resolve()}  (simplified — no floor/product/order cols)")
     if manifest_written_path is not None:
         print(
             f"  [JSON] {manifest_written_path.resolve()}  "
