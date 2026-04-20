@@ -406,6 +406,36 @@ _ZH: dict[str, str] = {
     "Charm shops":           "挂件店铺",
     "No charm shops configured": "未配置挂件店铺",
     "Private Notes":         "私信备注",
+    # Simple-route column headers (not already covered above)
+    "Charm Code":            "挂件编码",
+    "Charm Shop":            "挂件店铺",
+    # Simple-route subtitle fragments
+    "sorted lowest to highest floor": "按楼层从低到高排序",
+    "awaiting supplier info":         "待填供应商信息",
+    "unmatched":                      "未匹配",
+    "separate building":              "独立楼栋",
+    # Status legend row
+    "Status legend: Pending (white) | Purchased (green) | Out of Stock (amber) | Out of Production (red) | N/A (gray)":
+        "状态说明：  待处理（白）|  已购买（绿）|  缺货（黄）|  停产（红）|  不适用（灰）",
+    # Awaiting / needs-info banner phrases
+    "In Catalog \u2013 Awaiting Supplier Info":
+        "目录中 \u2013 待填供应商信息",
+    "open supplier_catalog.xlsx and fill in Shop Name + Stall":
+        "\u8bf7\u5728 supplier_catalog.xlsx \u4e2d\u586b\u5199\u300c\u5e97\u94fa\u540d\u300d\u548c\u300c\u644a\u4f4d\u300d\u5217",
+    "Unmatched Items \u2014 supplier not found in catalog":
+        "未匹配商品 \u2014 目录中未找到供应商",
+    # Charm banner
+    "CHARMS TO PURCHASE \u2014 SEPARATE BUILDING": "待购挂件 \u2014 独立楼栋",
+    "charm(s) needed across %d order(s)": "个挂件，涉及 %d 个订单",
+    "order(s) missing charm-code assignment": "个订单缺挂件编码",
+    "order(s) missing charm-shop assignment": "个订单缺挂件店铺",
+    "No charm shops configured \u2014 add them in the \u2018Charm Shops\u2019 tab":
+        "\u672a\u914d\u7f6e\u6302\u4ef6\u5e97\u94fa \u2014 \u8bf7\u5728\u300c\u6302\u4ef6\u5e97\u94fa\u300d\u5de5\u4f5c\u8868\u4e2d\u6dfb\u52a0",
+    # Awaiting charm code sub-section banner
+    "AWAITING CHARM CODE ASSIGNMENT": "待分配挂件编码",
+    "open supplier_catalog.xlsx \u2192 Product Map col H (Charm Code)":
+        "请在 supplier_catalog.xlsx \u2192 产品映射 H 列（挂件编码）中填写",
+    "\u23f3 Awaiting Code": "\u23f3 待分配编码",
 }
 
 
@@ -3734,7 +3764,14 @@ def load_items_from_xlsx(xlsx_path: Path) -> list[ResolvedItem]:
         style_parts = []
         if case_val != "N/A": style_parts.append("Case")
         if grip_val != "N/A": style_parts.append("Grip")
-        style = "+".join(style_parts) if style_parts else "Case"
+        # Rows where BOTH case and grip are N/A belong to charm-only items that
+        # were (incorrectly) written to the case/grip section with no useful
+        # component data.  Skip them — their information lives in the cache
+        # (loaded separately) and they should never be "recovered" from the
+        # case/grip Excel section.
+        if not style_parts:
+            continue
+        style = "+".join(style_parts)
 
         # Private Notes: col 15 (index 14) in new EN 15-col format
         _pn_idx = 14
@@ -5691,12 +5728,22 @@ def _sheet_route(ws, items: list[ResolvedItem],
     def _supplier_has_location(r: ResolvedItem) -> bool:
         return bool(r.supplier and (r.supplier.shop_name or r.supplier.stall))
 
-    routable   = [r for r in items if _supplier_has_location(r)]
+    # Case/grip section lists must exclude items whose style has NO case and NO
+    # grip components (i.e. "Charm Only" items).  Those items belong solely in
+    # the dedicated Charm section below; including them here would create
+    # spurious N/A-only rows that confuse load_items_from_xlsx when recovering
+    # orders from an existing Excel file.
+    def _needs_casegrip(r: ResolvedItem) -> bool:
+        hc, hg, _ = _style_has(r.item.style)
+        return hc or hg
+
+    routable   = [r for r in items if _supplier_has_location(r) and _needs_casegrip(r)]
     needs_info = [r for r in items
                   if r.supplier
                   and not _supplier_has_location(r)
-                  and not _needs_catalog_entry(r)]
-    unmatched  = [r for r in items if not r.supplier or _needs_catalog_entry(r)]
+                  and not _needs_catalog_entry(r)
+                  and _needs_casegrip(r)]
+    unmatched  = [r for r in items if (not r.supplier or _needs_catalog_entry(r)) and _needs_casegrip(r)]
 
     # Charm items: any order whose style includes a charm component.
     # These receive a dedicated CHARMS section at the bottom of the sheet,
@@ -6844,11 +6891,15 @@ def _sheet_route_simple(
     charm_shops: list[CharmShop] | None = None,
     charm_library: dict[str, CharmLibraryEntry] | None = None,
     charm_images_dir: Path | None = None,
+    lang: str = "en",
 ) -> None:
-    ws.title = "Shopping Route"
+    ws.title = _t("Shopping Route", lang)
     ws.sheet_properties.tabColor = "1F4E79"
 
-    COLS    = 10
+    # Chinese version omits the Private Notes column (col 10) to keep the
+    # sheet compact — private notes are English-only buyer messages.
+    _has_notes_col = lang != "zh"
+    COLS    = 10 if _has_notes_col else 9
     col_end = get_column_letter(COLS)
     HDR_ROW = 4
 
@@ -6861,7 +6912,7 @@ def _sheet_route_simple(
     S1_GRIP     = 7
     S1_PHONE    = 8
     S1_QTY      = 9
-    S1_NOTES    = 10
+    S1_NOTES    = 10 if _has_notes_col else None   # None → column omitted
 
     # ── Section 2 column positions (same grid, different semantics) ───────
     S2_PHOTO       = 2
@@ -6871,7 +6922,7 @@ def _sheet_route_simple(
     S2_CHARM       = 6
     # cols 7-8 intentionally blank / N/A
     S2_QTY         = 9
-    S2_NOTES       = 10
+    S2_NOTES       = 10 if _has_notes_col else None   # None → column omitted
 
     _statuses  = statuses or {}
     _row_h     = ROW_HEIGHT
@@ -6893,40 +6944,67 @@ def _sheet_route_simple(
 
     # ── Title ─────────────────────────────────────────────────────────────
     ws.merge_cells(f"A1:{col_end}1")
-    ws.cell(1, 1, f"Shopping Route  --  {date.today().strftime('%B %d, %Y')}").font = _TITLE_FONT
+    _title_date = (
+        date.today().strftime("%Y\u5e74%m\u6708%d\u65e5")
+        if lang == "zh" else
+        date.today().strftime("%B %d, %Y")
+    )
+    ws.cell(1, 1, f"{_t('Shopping Route', lang)}  --  {_title_date}").font = _TITLE_FONT
     ws.row_dimensions[1].height = 36
 
     # ── Subtitle ──────────────────────────────────────────────────────────
     ws.merge_cells(f"A2:{col_end}2")
-    sub_parts = [
-        f"{len(items)} items",
-        f"{order_count} orders",
-        f"{supplier_stops} supplier stops",
-        "sorted lowest to highest floor",
-    ]
-    if charm_items:
-        sub_parts.append(f"{total_charm_qty} charm(s) needed \u2014 separate building")
-    if needs_info:
-        sub_parts.append(f"{len(needs_info)} awaiting supplier info")
-    if unmatched:
-        sub_parts.append(f"{len(unmatched)} unmatched")
+    if lang == "zh":
+        sub_parts = [
+            f"{len(items)} \u4ef6\u5546\u54c1",
+            f"{order_count} \u4e2a\u8ba2\u5355",
+            f"{supplier_stops} \u4e2a\u4f9b\u5e94\u5546",
+            _t("sorted lowest to highest floor", lang),
+        ]
+        if charm_items:
+            sub_parts.append(f"{total_charm_qty} \u4e2a\u6302\u4ef6\u9700\u91c7\u8d2d \u2014 \u72ec\u7acb\u697c\u68cb")
+        if needs_info:
+            sub_parts.append(f"{len(needs_info)} \u4e2a{_t('awaiting supplier info', lang)}")
+        if unmatched:
+            sub_parts.append(f"{len(unmatched)} \u4e2a{_t('unmatched', lang)}")
+    else:
+        sub_parts = [
+            f"{len(items)} items",
+            f"{order_count} orders",
+            f"{supplier_stops} supplier stops",
+            _t("sorted lowest to highest floor", lang),
+        ]
+        if charm_items:
+            sub_parts.append(f"{total_charm_qty} charm(s) needed \u2014 separate building")
+        if needs_info:
+            sub_parts.append(f"{len(needs_info)} awaiting supplier info")
+        if unmatched:
+            sub_parts.append(f"{len(unmatched)} unmatched")
     ws.cell(2, 1, "  |  ".join(sub_parts)).font = _SUB_FONT
     ws.row_dimensions[2].height = 24
 
     # ── Legend ────────────────────────────────────────────────────────────
     ws.merge_cells(f"A3:{col_end}3")
-    ws.cell(3, 1,
+    _legend_key = "Status legend: Pending (white) | Purchased (green) | Out of Stock (amber) | Out of Production (red) | N/A (gray)"
+    ws.cell(3, 1, _t(_legend_key, lang) if lang == "zh" else (
         "Status:  Pending (white)   |   Purchased (green)"
         "   |   Out of Stock (amber)   |   Out of Production (red)"
         "   |   N/A (gray)"
-    ).font = Font("Calibri", size=9, italic=True, color="555555")
+    )).font = Font("Calibri", size=9, italic=True, color="555555")
     ws.row_dimensions[3].height = 14
 
     # ── Section 1 header row ──────────────────────────────────────────────
     S1_HDRS = [
-        "#", "Photo", "Supplier", "Stall",
-        "Items to Purchase", "Case", "Grip",
-        "Phone Model", "Qty", "Private Notes",
+        "#",
+        _t("Photo", lang),
+        _t("Supplier", lang),
+        _t("Stall", lang),
+        _t("Items to Purchase", lang),
+        _t("Case", lang),
+        _t("Grip", lang),
+        _t("Phone Model", lang),
+        _t("Qty", lang),
+        *([_t("Private Notes", lang)] if _has_notes_col else []),
     ]
     for ci, h in enumerate(S1_HDRS, 1):
         ws.cell(HDR_ROW, ci, h)
@@ -6953,12 +7031,14 @@ def _sheet_route_simple(
     first_data_row = row
     seq = 1
 
-    _status_opts = STATUS_OPTIONS
+    _status_opts = ZH_STATUS_OPTIONS if lang == "zh" else STATUS_OPTIONS
     dv_formula   = f'"{",".join(_status_opts)}"'
     dv_kwargs    = dict(
         type="list", formula1=dv_formula, allow_blank=False, showDropDown=False,
         showErrorMessage=True,
-        error="Pick a value from the dropdown.", errorTitle="Invalid status",
+        error=("请从下拉列表中选择一个值。" if lang == "zh"
+               else "Pick a value from the dropdown."),
+        errorTitle=("状态无效" if lang == "zh" else "Invalid status"),
     )
 
     def _write_comp(ws, row, col, has_component, active_cells, order_num="", comp="", item_title=""):
@@ -6966,11 +7046,11 @@ def _sheet_route_simple(
         if has_component:
             nt  = _normalize(item_title)[:50]
             prv = _statuses.get((order_num, nt, comp))
-            cell.value     = _t(prv, "en") if prv else "Pending"
+            cell.value     = _t(prv, lang) if prv else _t("Pending", lang)
             cell.alignment = _CENTER
             active_cells.append(cell.coordinate)
         else:
-            cell.value     = "N/A"
+            cell.value     = _t("N/A", lang)
             cell.fill      = _NA_FILL
             cell.font      = _NA_FONT
             cell.alignment = _CENTER
@@ -6982,7 +7062,7 @@ def _sheet_route_simple(
         nt   = _normalize(r.item.title)[:50]
         case_st = _statuses.get((onum, nt, "case"))
         grip_st = _statuses.get((onum, nt, "grip"))
-        items_label = _items_to_purchase(has_case, has_grip, case_st, grip_st, "en")
+        items_label = _items_to_purchase(has_case, has_grip, case_st, grip_st, lang)
 
         ws.cell(row, 1, seq)
         ws.cell(row, S1_SUPPLIER, supplier_display)
@@ -6994,7 +7074,7 @@ def _sheet_route_simple(
         _write_comp(ws, row, S1_GRIP, has_grip, active_grip_cells, onum, "grip", r.item.title)
         ws.cell(row, S1_PHONE, r.item.phone_model)
         ws.cell(row, S1_QTY,   r.item.quantity)
-        if r.order.private_notes:
+        if S1_NOTES and r.order.private_notes:
             ws.cell(row, S1_NOTES, r.order.private_notes).alignment = _WRAP
 
         _style_row(ws, row, COLS, fill=fill)
@@ -7005,7 +7085,7 @@ def _sheet_route_simple(
                 c.font = _NA_FONT
             else:
                 c.alignment = _CENTER
-        if r.order.private_notes:
+        if S1_NOTES and r.order.private_notes:
             ws.cell(row, S1_NOTES).alignment = _WRAP
         ws.cell(row, 1).alignment      = _CENTER
         ws.cell(row, S1_QTY).alignment = _CENTER
@@ -7026,10 +7106,9 @@ def _sheet_route_simple(
     if needs_info:
         row += 1
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
-        ni = ws.cell(row, 1,
-            "(~)  In Catalog \u2013 Awaiting Supplier Info  "
-            "\u2192  open supplier_catalog.xlsx and fill in Shop Name + Stall"
-        )
+        _ni_label = _t("In Catalog \u2013 Awaiting Supplier Info", lang)
+        _ni_action = _t("open supplier_catalog.xlsx and fill in Shop Name + Stall", lang)
+        ni = ws.cell(row, 1, f"(~)  {_ni_label}  \u2192  {_ni_action}")
         ni.font   = Font("Calibri", bold=True, size=11, color="1F4E79")
         ni.fill   = PatternFill("solid", fgColor="BDD7EE")
         ni.border = _BORDER
@@ -7049,7 +7128,8 @@ def _sheet_route_simple(
     if unmatched:
         row += 1
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
-        warn = ws.cell(row, 1, "(!!)  Unmatched Items \u2014 supplier not found in catalog")
+        _um_label = _t("Unmatched Items \u2014 supplier not found in catalog", lang)
+        warn = ws.cell(row, 1, f"(!!)  {_um_label}")
         warn.font   = Font("Calibri", bold=True, size=11, color="856404")
         warn.fill   = _WARN_FILL
         warn.border = _BORDER
@@ -7071,23 +7151,28 @@ def _sheet_route_simple(
                 dv.add(coord)
 
     # ── Conditional formatting for Section 1 ──────────────────────────────
+    # Use the localised status strings that were written into cells above.
+    _sv_oop  = _t("Out of Production", lang)
+    _sv_oos  = _t("Out of Stock", lang)
+    _sv_done = _t("Purchased", lang)
+    _sv_na   = _t("N/A", lang)
     if last_data_row >= first_data_row:
         s1_range = f"A{first_data_row}:{col_end}{last_data_row}"
         r0 = first_data_row
         gc = f"${get_column_letter(S1_CASE)}"
         hc = f"${get_column_letter(S1_GRIP)}"
         ws.conditional_formatting.add(s1_range, FormulaRule(
-            formula=[f'OR({gc}{r0}="Out of Production",{hc}{r0}="Out of Production")'],
+            formula=[f'OR({gc}{r0}="{_sv_oop}",{hc}{r0}="{_sv_oop}")'],
             fill=_STATUS_FILLS["Out of Production"], font=_STATUS_FONTS["Out of Production"], stopIfTrue=True,
         ))
         ws.conditional_formatting.add(s1_range, FormulaRule(
-            formula=[f'AND(OR({gc}{r0}="Out of Stock",{hc}{r0}="Out of Stock"),'
-                     f'NOT(OR({gc}{r0}="Out of Production",{hc}{r0}="Out of Production")))'],
+            formula=[f'AND(OR({gc}{r0}="{_sv_oos}",{hc}{r0}="{_sv_oos}"),'
+                     f'NOT(OR({gc}{r0}="{_sv_oop}",{hc}{r0}="{_sv_oop}")))'],
             fill=_STATUS_FILLS["Out of Stock"], font=_STATUS_FONTS["Out of Stock"], stopIfTrue=True,
         ))
         ws.conditional_formatting.add(s1_range, FormulaRule(
-            formula=[f'AND(OR({gc}{r0}="N/A",{gc}{r0}="Purchased"),'
-                     f'OR({hc}{r0}="N/A",{hc}{r0}="Purchased"))'],
+            formula=[f'AND(OR({gc}{r0}="{_sv_na}",{gc}{r0}="{_sv_done}"),'
+                     f'OR({hc}{r0}="{_sv_na}",{hc}{r0}="{_sv_done}"))'],
             fill=_STATUS_FILLS["Purchased"], font=_STATUS_FONTS["Purchased"], stopIfTrue=True,
         ))
 
@@ -7146,14 +7231,24 @@ def _sheet_route_simple(
 
         # ── Charm banner ──────────────────────────────────────────────────
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
-        cb_text = (
-            f"\u2728  CHARMS TO PURCHASE  \u2014  SEPARATE BUILDING"
-            f"  \u2014  {total_charm_qty_c} charm(s) needed across {len(charm_items)} order(s)"
-        )
-        if n_missing_code:
-            cb_text += f"  \u25b6  {n_missing_code} order(s) missing charm-code assignment"
-        if unassigned_count:
-            cb_text += f"  \u25b6  {unassigned_count} order(s) missing charm-shop assignment"
+        if lang == "zh":
+            cb_text = (
+                f"\u2728  \u5f85\u8d2d\u6302\u4ef6  \u2014  \u72ec\u7acb\u697c\u68cb"
+                f"  \u2014  {total_charm_qty_c} \u4e2a\u6302\u4ef6\uff0c\u6d89\u53ca {len(charm_items)} \u4e2a\u8ba2\u5355"
+            )
+            if n_missing_code:
+                cb_text += f"  \u25b6  {n_missing_code} \u4e2a\u8ba2\u5355\u7f3a\u6302\u4ef6\u7f16\u7801"
+            if unassigned_count:
+                cb_text += f"  \u25b6  {unassigned_count} \u4e2a\u8ba2\u5355\u7f3a\u6302\u4ef6\u5e97\u94fa"
+        else:
+            cb_text = (
+                f"\u2728  CHARMS TO PURCHASE  \u2014  SEPARATE BUILDING"
+                f"  \u2014  {total_charm_qty_c} charm(s) needed across {len(charm_items)} order(s)"
+            )
+            if n_missing_code:
+                cb_text += f"  \u25b6  {n_missing_code} order(s) missing charm-code assignment"
+            if unassigned_count:
+                cb_text += f"  \u25b6  {unassigned_count} order(s) missing charm-shop assignment"
         cb = ws.cell(row, 1, cb_text)
         cb.font      = Font("Calibri", bold=True, size=13, color="FFFFFF")
         cb.fill      = _CHARM_BANNER_FILL
@@ -7165,11 +7260,12 @@ def _sheet_route_simple(
         # ── Charm shops reference ─────────────────────────────────────────
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
         if _cshops:
-            shops_text = "Charm shops:   " + "   |   ".join(
+            _shops_label = "\u6302\u4ef6\u5e97\u94fa\uff1a   " if lang == "zh" else "Charm shops:   "
+            shops_text = _shops_label + "   |   ".join(
                 f"{s.shop_name}  ({s.stall})" for s in _cshops
             )
         else:
-            shops_text = "No charm shops configured \u2014 add them in the 'Charm Shops' tab"
+            shops_text = _t("No charm shops configured \u2014 add them in the \u2018Charm Shops\u2019 tab", lang)
         sr = ws.cell(row, 1, shops_text)
         sr.font      = Font("Calibri", bold=True, size=10, color="3D1359")
         sr.fill      = _CHARM_SHOPS_FILL
@@ -7180,8 +7276,15 @@ def _sheet_route_simple(
 
         # ── Section 2 sub-header ─────────────────────────────────────────
         S2_HDRS = [
-            "#", "Photo", "Charm Code", "Charm Shop", "Stall",
-            "Charm", "", "", "Qty", "Private Notes",
+            "#",
+            _t("Photo", lang),
+            _t("Charm Code", lang),
+            _t("Charm Shop", lang),
+            _t("Stall", lang),
+            _t("Charm", lang),
+            "", "",
+            _t("Qty", lang),
+            *([_t("Private Notes", lang)] if _has_notes_col else []),
         ]
         for ci, h in enumerate(S2_HDRS, 1):
             ws.cell(row, ci, h)
@@ -7246,11 +7349,11 @@ def _sheet_route_simple(
             ws.cell(row, S2_CHARM_SHOP, shop_disp)
             ws.cell(row, S2_STALL,      stall_disp)
             charm_cell = ws.cell(row, S2_CHARM)
-            charm_cell.value     = _t(preserved, "en") if preserved else "Pending"
+            charm_cell.value     = _t(preserved, lang) if preserved else _t("Pending", lang)
             charm_cell.alignment = _CENTER
             charm_section_cells.append(charm_cell.coordinate)
             ws.cell(row, S2_QTY, agg["total_qty"])
-            if _all_notes:
+            if S2_NOTES and _all_notes:
                 ws.cell(row, S2_NOTES, "; ".join(_all_notes)).alignment = _WRAP
 
             _style_row(ws, row, COLS, fill=fill)
@@ -7261,7 +7364,7 @@ def _sheet_route_simple(
             ws.cell(row, 1).alignment             = _CENTER
             ws.cell(row, S2_CHARM_CODE).alignment = _CENTER
             ws.cell(row, S2_QTY).alignment        = _CENTER
-            if _all_notes:
+            if S2_NOTES and _all_notes:
                 ws.cell(row, S2_NOTES).alignment = _WRAP
             ws.row_dimensions[row].height = _row_h
             _embed_photo(ws, agg["photo_bytes"], row, S2_PHOTO, _photo_px)
@@ -7277,20 +7380,21 @@ def _sheet_route_simple(
                 dv_charm.add(coord)
 
         # ── Conditional formatting for Section 2 ──────────────────────────
+        # Use the same localised status strings as were written into cells.
         if charm_last_row >= charm_first_row:
             c2_range = f"A{charm_first_row}:{col_end}{charm_last_row}"
             ic       = f"${get_column_letter(S2_CHARM)}"
             cr0      = charm_first_row
             ws.conditional_formatting.add(c2_range, FormulaRule(
-                formula=[f'{ic}{cr0}="Out of Production"'],
+                formula=[f'{ic}{cr0}="{_sv_oop}"'],
                 fill=_STATUS_FILLS["Out of Production"], font=_STATUS_FONTS["Out of Production"], stopIfTrue=True,
             ))
             ws.conditional_formatting.add(c2_range, FormulaRule(
-                formula=[f'{ic}{cr0}="Out of Stock"'],
+                formula=[f'{ic}{cr0}="{_sv_oos}"'],
                 fill=_STATUS_FILLS["Out of Stock"], font=_STATUS_FONTS["Out of Stock"], stopIfTrue=True,
             ))
             ws.conditional_formatting.add(c2_range, FormulaRule(
-                formula=[f'{ic}{cr0}="Purchased"'],
+                formula=[f'{ic}{cr0}="{_sv_done}"'],
                 fill=_STATUS_FILLS["Purchased"], font=_STATUS_FONTS["Purchased"], stopIfTrue=True,
             ))
 
@@ -7299,11 +7403,20 @@ def _sheet_route_simple(
             row += 1
             _total_await_qty = sum(r.item.quantity for r in _awaiting_items)
             ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=COLS)
-            aw = ws.cell(row, 1,
-                f"\u23f3  AWAITING CHARM CODE ASSIGNMENT  \u2014  "
-                f"{len(_awaiting_items)} order(s) ({_total_await_qty} unit(s))"
-                f"  \u2192  open supplier_catalog.xlsx \u2192 Product Map col H (Charm Code)"
-            )
+            if lang == "zh":
+                _aw_action = _t("open supplier_catalog.xlsx \u2192 Product Map col H (Charm Code)", lang)
+                _aw_text = (
+                    f"\u23f3  \u5f85\u5206\u914d\u6302\u4ef6\u7f16\u7801  \u2014  "
+                    f"{len(_awaiting_items)} \u4e2a\u8ba2\u5355\uff08{_total_await_qty} \u4ef6\uff09"
+                    f"  \u2192  {_aw_action}"
+                )
+            else:
+                _aw_text = (
+                    f"\u23f3  AWAITING CHARM CODE ASSIGNMENT  \u2014  "
+                    f"{len(_awaiting_items)} order(s) ({_total_await_qty} unit(s))"
+                    f"  \u2192  open supplier_catalog.xlsx \u2192 Product Map col H (Charm Code)"
+                )
+            aw = ws.cell(row, 1, _aw_text)
             aw.font      = Font("Calibri", bold=True, size=11, color="7D4E00")
             aw.fill      = PatternFill("solid", fgColor="FFF3CD")
             aw.border    = _BORDER
@@ -7346,12 +7459,12 @@ def _sheet_route_simple(
                 ws.cell(row, S2_CHARM_CODE, "\u2014")
                 ws.cell(row, S2_CHARM_SHOP, shop_disp)
                 ws.cell(row, S2_STALL,      stall_disp)
-                _ac = ws.cell(row, S2_CHARM, "\u23f3 Awaiting Code")
+                _ac = ws.cell(row, S2_CHARM, _t("\u23f3 Awaiting Code", lang))
                 _ac.alignment = _CENTER
                 _ac.font      = _AWAIT_CODE_FONT
                 _ac.fill      = _AWAIT_CODE_FILL
                 ws.cell(row, S2_QTY, r.item.quantity)
-                if r.order.private_notes:
+                if S2_NOTES and r.order.private_notes:
                     ws.cell(row, S2_NOTES, r.order.private_notes).alignment = _WRAP
 
                 _style_row(ws, row, COLS, fill=_AWAIT_FILL)
@@ -7362,7 +7475,7 @@ def _sheet_route_simple(
                 for _mc in (7, 8):
                     ws.cell(row, _mc).fill = _NA_FILL
                     ws.cell(row, _mc).font = _NA_FONT
-                if r.order.private_notes:
+                if S2_NOTES and r.order.private_notes:
                     ws.cell(row, S2_NOTES).alignment = _WRAP
                 ws.cell(row, 1).alignment      = _CENTER
                 ws.cell(row, S2_QTY).alignment = _CENTER
@@ -7372,8 +7485,13 @@ def _sheet_route_simple(
 
     # ── Column widths ─────────────────────────────────────────────────────
     # #  | Photo       | Supplier/Code | Shop/Supplier | Stall/Stall |
-    # ITP/Charm | Case/— | Grip/— | Phone/Qty | Qty/Notes
-    col_widths = [4, _photo_col_w, 14, 14, 9, 10, 8, 8, 18, 32]
+    # ITP/Charm | Case/— | Grip/— | Phone/Qty | [Qty/]Notes
+    # Chinese version has 9 columns (no Private Notes); give col 9 (Qty)
+    # a wider width so the grid stays balanced.
+    if _has_notes_col:
+        col_widths = [4, _photo_col_w, 14, 14, 9, 10, 8, 8, 18, 32]
+    else:
+        col_widths = [4, _photo_col_w, 14, 14, 9, 10, 8, 8, 12]
     for ci, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(ci)].width = w
 
@@ -7389,8 +7507,14 @@ def generate_xlsx_simple(
     charm_shops: list[CharmShop] | None = None,
     charm_library: dict[str, CharmLibraryEntry] | None = None,
     charm_images_dir: Path | None = None,
+    lang: str = "en",
 ) -> None:
-    """Generate the simplified single-sheet shopping route workbook."""
+    """Generate the simplified single-sheet shopping route workbook.
+
+    Pass ``lang='zh'`` to produce the Chinese-translated variant, which uses
+    the same compact layout as the English simple version but with Simplified
+    Chinese column headers, section banners, and status dropdown values.
+    """
     wb = openpyxl.Workbook()
     _sheet_route_simple(
         wb.active, items,
@@ -7398,6 +7522,7 @@ def generate_xlsx_simple(
         charm_shops=charm_shops,
         charm_library=charm_library,
         charm_images_dir=charm_images_dir,
+        lang=lang,
     )
     from openpyxl.worksheet.page import PageMargins
     ws = wb.active
@@ -9657,14 +9782,80 @@ def main() -> None:
         cached_items, processed_pdfs = load_cache(cache_path)
         excel_items                  = load_items_from_xlsx(output_path)
 
-    # Merge: cache (has photos) takes priority; Excel fills in anything missing
-    _seen_prior: set[tuple[str, str]] = set()
-    prior_items: list[ResolvedItem]   = []
-    for r in cached_items + excel_items:
-        key = (r.order.order_number, _normalize(r.item.title)[:50])
-        if key not in _seen_prior:
-            _seen_prior.add(key)
+    # Keep an unmodified reference to the items loaded directly from JSON
+    # before the _seen_prior merge below can collapse split-component entries
+    # (e.g. "Grip Only" + "Charm Only" sharing the same order+title key).
+    # Used later to build _cached_item_keys with the full per-component set.
+    _raw_cached_items: list[ResolvedItem] = list(cached_items)
+
+    # Helper: map a style string to a frozenset of component names.
+    # "Grip Only", "Grip", and "Stand" all map to frozenset({'grip'}).
+    # Defined here (before the merges below) because both _seen_prior and
+    # _cached_item_keys use it.
+    def _style_comps(s: str) -> frozenset:
+        hc, hg, hch = _style_has(s)
+        return frozenset(x for x, v in (("case", hc), ("grip", hg), ("charm", hch)) if v)
+
+    # Merge: cache (has photos) takes priority; Excel fills in anything missing.
+    #
+    # Phase 1 — add all cache entries, deduped by (order, title, components).
+    #   Using style-components (not raw style text) means "Grip Only" and
+    #   "Grip" hash identically, while "Grip Only" and "Charm Only" — which
+    #   are genuinely distinct items bought as separate line-items — keep their
+    #   own slots in prior_items.
+    #
+    # Phase 2 — add Excel items that are NOT already covered by the union of
+    #   cached components for that (order, title) pair.  The union-subset test
+    #   handles two edge cases:
+    #     a) Excel stores "Case" for a "Case+Charm" order (charm stripped) —
+    #        frozenset({'case'}) ⊆ {'case','charm'} → skip (already in cache).
+    #     b) Excel stores "Grip+Charm" for a split-component order that has
+    #        separate "Grip Only" + "Charm Only" cache entries — the union
+    #        {'grip'}∪{'charm'}={'grip','charm'} covers the Excel item → skip.
+    #   Only truly missing items (absent order+title or missing components)
+    #   are recovered from the Excel.
+    _prior_key_set: set[tuple[str, str, frozenset]] = set()
+    prior_items: list[ResolvedItem] = []
+
+    # Phase 1: all cached items
+    for r in cached_items:
+        key = (r.order.order_number, _normalize(r.item.title)[:50], _style_comps(r.item.style))
+        if key not in _prior_key_set:
+            _prior_key_set.add(key)
             prior_items.append(r)
+
+    # Build a set of (order, title) pairs already known to the cache so the
+    # Excel safety-net below never overrides/augments orders the cache already
+    # tracks.  If the cache knows about an order+title (even partially), we
+    # trust the cache; the PDF re-processing (truly_new) will add any genuinely
+    # missing component items.
+    _cached_known_ot: set[tuple[str, str]] = {
+        (r.order.order_number, _normalize(r.item.title)[:50])
+        for r in prior_items
+    }
+
+    # Build union-of-components per (order, title) from the phase-1 result
+    _cached_union: dict[tuple[str, str], frozenset] = {}
+    for r in prior_items:
+        ot = (r.order.order_number, _normalize(r.item.title)[:50])
+        _cached_union[ot] = _cached_union.get(ot, frozenset()) | _style_comps(r.item.style)
+
+    # Phase 2: Excel items not covered by the cache.
+    # Skip any order+title already present in the cache (trust cache > Excel).
+    # Only add Excel items for order+title combinations the cache has never seen
+    # (genuine safety-net: cache was deleted but Excel survived).
+    for r in excel_items:
+        comps = _style_comps(r.item.style)
+        key   = (r.order.order_number, _normalize(r.item.title)[:50], comps)
+        ot    = (r.order.order_number, _normalize(r.item.title)[:50])
+        if key in _prior_key_set:
+            continue  # exact duplicate
+        if ot in _cached_known_ot:
+            continue  # order+title already in cache — trust cache, skip Excel entry
+        if comps.issubset(_cached_union.get(ot, frozenset())):
+            continue  # components fully covered by cache
+        _prior_key_set.add(key)
+        prior_items.append(r)
 
     if len(prior_items) > len(cached_items):
         log.info(
@@ -9672,8 +9863,20 @@ def main() -> None:
             len(prior_items) - len(cached_items),
         )
 
-    cached_items      = prior_items
-    cached_order_nums = {r.order.order_number for r in cached_items}
+    cached_items = prior_items
+
+    # Key: (order_number, normalised_title[:50], style_components).
+    # Built from the full pre-merge cache (not just prior_items) so that
+    # a split-component order's "Charm Only" entry (which _seen_prior drops
+    # because "Grip Only" occupies the same order+title bucket) is still
+    # represented here and prevents the PDF from re-adding it needlessly.
+    # On runs where the cache does NOT yet contain "Charm Only", it is
+    # absent from this set, _style_comps correctly distinguishes it from the
+    # "Grip Only" entry, and it is picked up as truly new.
+    _cached_item_keys: set[tuple[str, str, frozenset]] = {
+        (r.order.order_number, _normalize(r.item.title)[:50], _style_comps(r.item.style))
+        for r in _raw_cached_items  # full pre-merge cache with all split-component entries
+    }
 
     # ------------------------------------------------------------------ #
     # Step 3 -- Discover and parse NEW PDFs                               #
@@ -9827,8 +10030,18 @@ def main() -> None:
     if all_new_orders:
         new_resolved = match_items(all_new_orders, catalog, args.threshold)
 
-    truly_new = [r for r in new_resolved
-                 if r.order.order_number not in cached_order_nums]
+    # Deduplicate new items against the cache using the same normalised
+    # (order_number, norm_title[:50], style_components) key.  This lets
+    # "Grip Only" and "Charm Only" items for the same product/order pass
+    # through independently while still preventing exact duplicates that
+    # appear in more than one input PDF from being double-added on the same run.
+    _seen_new: set[tuple[str, str, frozenset]] = set()
+    truly_new: list[ResolvedItem] = []
+    for _r in new_resolved:
+        _k = (_r.order.order_number, _normalize(_r.item.title)[:50], _style_comps(_r.item.style))
+        if _k not in _cached_item_keys and _k not in _seen_new:
+            _seen_new.add(_k)
+            truly_new.append(_r)
     duplicates = len(new_resolved) - len(truly_new)
     if duplicates:
         log.info("Skipped %d item(s) already in cache (duplicate PDF re-scan)", duplicates)
@@ -10060,10 +10273,13 @@ def main() -> None:
 
         title_fn = _make_title_fn(trans_cache, trans_cache_path)
 
-        generate_xlsx(zh_items, zh_path, statuses=existing_statuses, lang="zh",
-                      title_fn=title_fn, charm_shops=charm_shops,
-                      charm_library=charm_library,
-                      charm_images_dir=charm_images_dir)
+        # Chinese Excel uses the same compact simple layout as the English
+        # simple version but with Simplified Chinese translations throughout.
+        generate_xlsx_simple(zh_items, zh_path, statuses=existing_statuses,
+                             charm_shops=charm_shops,
+                             charm_library=charm_library,
+                             charm_images_dir=charm_images_dir,
+                             lang="zh")
         log.info("Chinese version saved -> %s", zh_path.resolve())
 
     # ------------------------------------------------------------------ #

@@ -3210,6 +3210,9 @@ class _OrdersDashboardDialog:
         self._charm_lib_photo_ref: list[object] = []
         # Photo preview in the detail panel (kept to prevent GC of PhotoImage)
         self._detail_photo_ref: list[object] = []
+        # Charm purchase summary popup (kept to bring-to-front instead of re-creating)
+        self._summary_win: tk.Toplevel | None = None
+        self._summary_photo_refs: list[object] = []
         self._charm_tile_frames: dict[str, tk.Frame] = {}
         self._charm_tile_info: dict[str, dict] = {}
         self._selected_charm_code: str = ""
@@ -3230,6 +3233,10 @@ class _OrdersDashboardDialog:
         # component = "case" | "grip" | "charm"
         # Only non-Pending values are stored (Pending is the default/omitted key).
         self._pstatuses: dict[tuple[str, str, str], str] = {}
+        # Purchase-list button + its separator — both live inside _filter_frame
+        # and must be destroyed/recreated on every mode switch to avoid duplicates.
+        self._purchase_list_btn: tk.Button | None = None
+        self._purchase_list_sep: tk.Frame | None = None
 
         self._mode = "casegrip"
         self._active_filter = "all"
@@ -3650,6 +3657,16 @@ class _OrdersDashboardDialog:
             self._btn_mode_ch.config(bg="#5b21b6", fg="#ffffff")
             filters = self._CH_FILTERS
 
+        # Destroy the purchase-list button and its separator from any previous
+        # charms-mode visit before rebuilding the filter bar. Without this,
+        # every charms → casegrip → charms round-trip appends a second copy.
+        if self._purchase_list_sep is not None:
+            self._purchase_list_sep.destroy()
+            self._purchase_list_sep = None
+        if self._purchase_list_btn is not None:
+            self._purchase_list_btn.destroy()
+            self._purchase_list_btn = None
+
         for btn in self._filter_btns:
             btn.destroy()
         self._filter_btns.clear()
@@ -3665,6 +3682,30 @@ class _OrdersDashboardDialog:
             )
             btn.pack(side=tk.LEFT, padx=(0, 4))
             self._filter_btns.append(btn)
+
+        # Charms mode: show the 🛒 Purchase List button; close it on mode switch
+        if mode == "charms":
+            self._purchase_list_sep = tk.Frame(self._filter_frame, bg=COLORS["border"],
+                                               width=1, highlightthickness=0)
+            self._purchase_list_sep.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 8), pady=4)
+            _pl_text = (
+                "\U0001F6D2  Purchase List" if self._lang == "en"
+                else "\U0001F6D2  采购清单"
+            )
+            self._purchase_list_btn = tk.Button(
+                self._filter_frame, text=_pl_text,
+                font=("Segoe UI", 9, "bold"), relief=tk.FLAT, bd=0,
+                padx=10, pady=3, cursor="hand2",
+                bg="#1e1b4b", fg="#e0e7ff",
+                activebackground="#312e81", activeforeground="#ffffff",
+                command=self._show_charm_purchase_summary,
+            )
+            self._purchase_list_btn.pack(side=tk.LEFT)
+        else:
+            # Switching away from charms — close the summary popup if open
+            if self._summary_win and self._summary_win.winfo_exists():
+                self._summary_win.destroy()
+            self._summary_win = None
 
         self._configure_columns()
         self._build_mode_panel()   # builds the always-visible charm gallery or CG form
@@ -5064,9 +5105,19 @@ class _OrdersDashboardDialog:
                     text="No photo" if self._lang == "en" else "\u65e0\u56fe\u7247",
                     width=16, height=4,
                 )
-            self._detail_photo_frame.pack(
-                fill=tk.X, before=self._order_info_sep
-            )
+            # Photo preview + upload are only shown for Case/Grip.
+            # In Charms mode the product photo is irrelevant — the charm gallery
+            # on the right already shows the canonical charm images.
+            if self._mode == "casegrip":
+                self._detail_photo_frame.pack(
+                    fill=tk.X, before=self._order_info_sep
+                )
+                self._upload_photo_btn.pack(fill=tk.X, padx=10, pady=(0, 2))
+                self._upload_photo_status.pack(fill=tk.X, padx=10, pady=(0, 6))
+            else:
+                self._detail_photo_frame.pack_forget()
+                self._upload_photo_btn.pack_forget()
+                self._upload_photo_status.pack_forget()
 
         # ── Show save controls ─────────────────────────────────────────
         if self._mode == "casegrip":
@@ -5198,6 +5249,397 @@ class _OrdersDashboardDialog:
                 if shop:
                     return shop
         return ""
+
+    # ── Charm Purchase Summary ────────────────────────────────────────
+
+    def _build_charm_purchase_data(self) -> list[dict]:
+        """Aggregate ch_items by charm_code and return sorted purchase rows.
+
+        Each row dict:
+            code, sku, shop, stall, total_qty, photo_bytes, notes,
+            status_by_qty  — {status_string: cumulative_qty}  e.g.
+                             {"Purchased": 2, "Pending": 1}
+        Sorted (shop, code) — same order as the shopping-route Excel charm section.
+        """
+        agg: dict[str, dict] = {}
+        for d in self._ch_items:
+            code = (d.get("charm_code") or "").strip()
+            if not code:
+                continue
+            lib   = self._charm_library.get(code)
+            shop  = (d.get("charm_shop") or "").strip()
+            stall = (d.get("stall") or "").strip()
+            qty   = int(d.get("qty") or 1)
+
+            # Individual order buy status — keyed exactly like the xlsx round-trip
+            order  = d.get("order", "")
+            norm   = (d.get("norm_title") or "")[:50]
+            status = self._pstatuses.get((order, norm, "charm"), "Pending")
+
+            if code not in agg:
+                agg[code] = {
+                    "code":          code,
+                    "sku":           (lib.sku if lib and lib.sku else ""),
+                    "shop":          shop,
+                    "stall":         stall,
+                    "total_qty":     0,
+                    # Charm Library photo is the canonical image (same as gallery tiles)
+                    "photo_bytes":   (lib.photo_bytes if lib and lib.photo_bytes else None),
+                    "notes":         [],
+                    # {status_label: qty} — weighted by order quantity
+                    "status_by_qty": {},
+                }
+            agg[code]["total_qty"] += qty
+            sbq = agg[code]["status_by_qty"]
+            sbq[status] = sbq.get(status, 0) + qty
+            if not agg[code]["shop"] and shop:
+                agg[code]["shop"] = shop
+            if not agg[code]["stall"] and stall:
+                agg[code]["stall"] = stall
+            pn = (d.get("private_notes") or "").strip()
+            if pn and pn not in agg[code]["notes"]:
+                agg[code]["notes"].append(pn)
+
+        return sorted(
+            agg.values(),
+            key=lambda x: ((x["shop"] or "\uffff"), x["code"]),
+        )
+
+    def _show_charm_purchase_summary(self) -> None:
+        """Open (or bring-to-front) the Charm Purchase List popup.
+
+        Mirrors the shopping-route Excel's CHARMS TO PURCHASE section:
+          • One row per unique charm code — total qty across ALL orders
+          • Buy Status column: shows Purchased / Pending / Out of Stock etc.
+            When qty > 1, shows a "X / Y Purchased" breakdown so you always
+            know how many units are still outstanding.
+          • Charm Library photo (the canonical image, not the product photo)
+          • Shop + Stall + deduplicated private notes
+          • Rows colour-coded by shop group; status badge overrides for done rows
+          • Non-blocking: stays open while the user assigns charms in the dashboard
+          • Refresh button re-aggregates from the current dashboard data
+        """
+        # Bring to front if already open
+        if self._summary_win and self._summary_win.winfo_exists():
+            self._summary_win.lift()
+            self._summary_win.focus_force()
+            return
+
+        rows = self._build_charm_purchase_data()
+
+        # ── Pre-compute header statistics ─────────────────────────────
+        total_qty     = sum(r["total_qty"] for r in rows)
+        n_codes       = len(rows)
+        n_orders      = len({
+            d.get("order", "") for d in self._ch_items if d.get("charm_code")
+        })
+        purchased_qty = sum(
+            r["status_by_qty"].get("Purchased", 0) for r in rows
+        )
+        purchased_codes = sum(
+            1 for r in rows
+            if r["status_by_qty"].get("Purchased", 0) == r["total_qty"]
+        )
+
+        # ── Window setup ──────────────────────────────────────────────
+        win = tk.Toplevel(self._d)
+        self._summary_win = win
+        win.title(
+            "Charm Purchase List" if self._lang == "en"
+            else "\u6302\u4ef6\u91c7\u8d2d\u6e05\u5355"
+        )
+        win.transient(self._d)
+        win.configure(bg=COLORS["app"])
+        win.geometry("950x540")
+        win.minsize(680, 360)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        # ── Hero header ───────────────────────────────────────────────
+        hdr = tk.Frame(win, bg=COLORS["hero"], highlightthickness=0)
+        hdr.grid(row=0, column=0, sticky="ew")
+
+        _en = self._lang == "en"
+        if _en:
+            title_txt = "\U0001F6D2  Charm Purchase List"
+            sub_txt   = (
+                f"{n_codes} charm type{'s' if n_codes != 1 else ''}  \u2014  "
+                f"{total_qty} unit{'s' if total_qty != 1 else ''} total  \u2014  "
+                f"{n_orders} order{'s' if n_orders != 1 else ''}  \u2014  "
+                f"{purchased_qty} / {total_qty} purchased  \u2014  "
+                "sorted by shop"
+            )
+        else:
+            title_txt = "\U0001F6D2  \u6302\u4ef6\u91c7\u8d2d\u6e05\u5355"
+            sub_txt   = (
+                f"{n_codes} \u79cd\u6302\u4ef6  \u2014  "
+                f"\u5171 {total_qty} \u4e2a  \u2014  "
+                f"{n_orders} \u4e2a\u8ba2\u5355  \u2014  "
+                f"\u5df2\u8d2d {purchased_qty} / {total_qty} \u4e2a  \u2014  "
+                "\u6309\u5e97\u94fa\u6392\u5e8f"
+            )
+        tk.Label(hdr, text=title_txt,
+                 font=("Segoe UI", 14, "bold"), fg="#ffffff",
+                 bg=COLORS["hero"]).pack(anchor=tk.W, padx=16, pady=(10, 2))
+        tk.Label(hdr, text=sub_txt,
+                 font=("Segoe UI", 9), fg="#dbeafe",
+                 bg=COLORS["hero"]).pack(anchor=tk.W, padx=16, pady=(0, 10))
+
+        # ── Treeview body ─────────────────────────────────────────────
+        body = tk.Frame(win, bg=COLORS["app"])
+        body.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
+        body.grid_rowconfigure(0, weight=1)
+        body.grid_columnconfigure(0, weight=1)
+
+        _ROW_H = 52 if self._pil_ok else 26
+        try:
+            sty = ttk.Style()
+            sty.configure("Sum.Treeview", rowheight=_ROW_H,
+                          font=("Segoe UI", 10),
+                          background="#ffffff", fieldbackground="#ffffff")
+            sty.configure("Sum.Treeview.Heading",
+                          font=("Segoe UI", 10, "bold"),
+                          background="#1e1b4b", foreground="#ffffff",
+                          relief="flat", padding=(6, 5))
+            sty.map("Sum.Treeview.Heading",
+                    background=[("active", "#312e81")])
+            sty.map("Sum.Treeview",
+                    background=[("selected", "#6d28d9")],
+                    foreground=[("selected", "#ffffff")])
+        except tk.TclError:
+            pass
+
+        tree = ttk.Treeview(
+            body, show="tree headings", selectmode="browse",
+            style="Sum.Treeview",
+            columns=("code", "sku", "shop", "stall", "qty", "status", "notes"),
+        )
+        vsb = ttk.Scrollbar(body, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        tree.heading("#0",      text="Photo",                                          anchor=tk.CENTER)
+        tree.heading("code",    text="Charm Code"    if _en else "\u6302\u4ef6\u7f16\u7801", anchor=tk.CENTER)
+        tree.heading("sku",     text="SKU",                                            anchor=tk.CENTER)
+        tree.heading("shop",    text="Shop"          if _en else "\u6302\u4ef6\u5e97\u94fa")
+        tree.heading("stall",   text="Stall"         if _en else "\u6446\u4f4d",       anchor=tk.CENTER)
+        tree.heading("qty",     text="Qty"           if _en else "\u6570\u91cf",       anchor=tk.CENTER)
+        tree.heading("status",  text="Buy Status"    if _en else "\u91c7\u8d2d\u72b6\u6001", anchor=tk.CENTER)
+        tree.heading("notes",   text="Private Notes" if _en else "\u5907\u6ce8")
+
+        _PH_W = 56 if self._pil_ok else 12
+        tree.column("#0",     width=_PH_W, minwidth=_PH_W, stretch=False, anchor=tk.CENTER)
+        tree.column("code",   width=92,    minwidth=70,     stretch=False, anchor=tk.CENTER)
+        tree.column("sku",    width=70,    minwidth=50,     stretch=False, anchor=tk.CENTER)
+        tree.column("shop",   width=130,   minwidth=90,     stretch=False)
+        tree.column("stall",  width=60,    minwidth=48,     stretch=False, anchor=tk.CENTER)
+        tree.column("qty",    width=46,    minwidth=36,     stretch=False, anchor=tk.CENTER)
+        tree.column("status", width=148,   minwidth=100,    stretch=False, anchor=tk.CENTER)
+        tree.column("notes",  width=200,   minwidth=100,    stretch=True)
+
+        # ── Row tags ──────────────────────────────────────────────────
+        # Shop-group palette (background tints + matching text)
+        _PALETTE = [
+            ("#f3e8ff", "#5b21b6"),  # violet
+            ("#ede9fe", "#4c1d95"),  # deep violet
+            ("#e0e7ff", "#3730a3"),  # indigo
+            ("#dbeafe", "#1e3a8a"),  # blue
+            ("#d1fae5", "#065f46"),  # green
+            ("#fef3c7", "#78350f"),  # amber
+            ("#ffe4e6", "#9f1239"),  # rose
+            ("#f0fdf4", "#14532d"),  # emerald
+        ]
+        shops_in_order: list[str] = []
+        for r in rows:
+            if r["shop"] not in shops_in_order:
+                shops_in_order.append(r["shop"])
+        shop_tag: dict[str, str] = {}
+        for i, s in enumerate(shops_in_order):
+            tag_name = f"_sp{i}"
+            bg, fg   = _PALETTE[i % len(_PALETTE)]
+            tree.tag_configure(tag_name, background=bg, foreground=fg)
+            shop_tag[s] = tag_name
+
+        # Status-override tags — fully purchased rows get a distinct green finish
+        # so they stand out regardless of shop group colour.
+        tree.tag_configure("_ps_done",  background="#dcfce7", foreground="#14532d")
+        tree.tag_configure("_ps_oos",   background="#fee2e2", foreground="#991b1b")
+        tree.tag_configure("_ps_oop",   background="#f3f4f6", foreground="#374151")
+        tree.tag_configure("_ps_part",  background="#fef9c3", foreground="#92400e")
+
+        # ── Status formatting helper ──────────────────────────────────
+        def _fmt_status(sbq: dict, total: int) -> str:
+            """Format status_by_qty into a compact, human-readable badge.
+
+            Single unit  →  plain status text with a leading symbol.
+            Multiple     →  "X / Y Purchased" plus a secondary breakdown when
+                            units are spread across more than one status bucket.
+            """
+            if not sbq:
+                return "\u23f3 Pending" if _en else "\u23f3 \u5f85\u8d2d"
+
+            purchased = sbq.get("Purchased", 0)
+            oos       = sbq.get("Out of Stock", 0)
+            oop       = sbq.get("Out of Production", 0)
+            pending   = sbq.get("Pending", 0)
+
+            if total == 1:
+                # Simple single-unit display
+                if purchased:
+                    return "\u2713 Purchased"   if _en else "\u2713 \u5df2\u8d2d"
+                if oos:
+                    return "\u26a0 Out of Stock" if _en else "\u26a0 \u7f3a\u8d27"
+                if oop:
+                    return "\u2717 Out of Prod." if _en else "\u2717 \u505c\u4ea7"
+                return "\u23f3 Pending"          if _en else "\u23f3 \u5f85\u8d2d"
+
+            # Multi-unit: always show X / Y Purchased
+            if purchased == total:
+                return (f"\u2713 All {total} Purchased"
+                        if _en else f"\u2713 \u5168\u90e8 {total} \u4e2a\u5df2\u8d2d")
+            if purchased == 0:
+                # None purchased — show the dominant non-purchased state
+                if oos == total:
+                    return (f"\u26a0 All {total} Out of Stock"
+                            if _en else f"\u26a0 {total} \u4e2a\u7f3a\u8d27")
+                if oop == total:
+                    return (f"\u2717 All {total} Out of Prod."
+                            if _en else f"\u2717 {total} \u4e2a\u505c\u4ea7")
+                # Mixed non-purchased — list each bucket
+                parts = []
+                if oop:
+                    parts.append(f"{oop}\u00d7\u2717" if not _en
+                                 else f"{oop}\u00d7Out-of-Prod")
+                if oos:
+                    parts.append(f"{oos}\u00d7\u26a0" if not _en
+                                 else f"{oos}\u00d7OOS")
+                if pending:
+                    parts.append(f"{pending}\u00d7\u23f3" if not _en
+                                 else f"{pending}\u00d7Pending")
+                return "  ".join(parts) if parts else f"\u23f3 {total} Pending"
+
+            # Partial purchase — "X / Y Purchased (+details)"
+            remaining = total - purchased
+            base = (f"{purchased} / {total} Purchased"
+                    if _en else f"{purchased} / {total} \u4e2a\u5df2\u8d2d")
+            extras = []
+            if oos:
+                extras.append(f"{oos} OOS" if _en else f"{oos} \u7f3a\u8d27")
+            if oop:
+                extras.append(f"{oop} OOP" if _en else f"{oop} \u505c\u4ea7")
+            if extras:
+                return f"{base}  ({', '.join(extras)})"
+            return base
+
+        def _status_tag(sbq: dict, total: int) -> str:
+            """Return the status-override tag name for a row, or '' for shop colour."""
+            purchased = sbq.get("Purchased", 0)
+            if purchased == total and total > 0:
+                return "_ps_done"
+            oos = sbq.get("Out of Stock", 0)
+            oop = sbq.get("Out of Production", 0)
+            if oop > 0 and oos == 0 and sbq.get("Purchased", 0) == 0 and sbq.get("Pending", 0) == 0:
+                return "_ps_oop"
+            if oos > 0 and oop == 0 and sbq.get("Purchased", 0) == 0 and sbq.get("Pending", 0) == 0:
+                return "_ps_oos"
+            purchased = sbq.get("Purchased", 0)
+            if purchased > 0 and purchased < total:
+                return "_ps_part"
+            return ""
+
+        # Keep photo ImageTk refs alive for the window's lifetime
+        self._summary_photo_refs.clear()
+
+        for r in rows:
+            sbq   = r.get("status_by_qty", {})
+            total = r["total_qty"]
+
+            s_tag  = _status_tag(sbq, total)
+            sh_tag = shop_tag.get(r["shop"], "")
+            # Status tag takes visual priority over shop-group tint
+            row_tag = s_tag if s_tag else sh_tag
+
+            ph  = None
+            raw = r.get("photo_bytes")
+            if raw and self._pil_ok and Image is not None and ImageTk is not None:
+                try:
+                    im = Image.open(BytesIO(raw))
+                    if im.mode == "RGBA":
+                        bg_im = Image.new("RGB", im.size, (255, 255, 255))
+                        bg_im.paste(im, mask=im.split()[3])
+                        im = bg_im
+                    elif im.mode != "RGB":
+                        im = im.convert("RGB")
+                    im.thumbnail((48, 48), Image.Resampling.LANCZOS)
+                    ph = ImageTk.PhotoImage(im)
+                    self._summary_photo_refs.append(ph)
+                except Exception:
+                    ph = None
+
+            kw: dict = {}
+            if ph:
+                kw["image"] = ph
+                kw["text"]  = ""
+            else:
+                kw["text"] = "\U0001F48E"   # gem emoji fallback
+
+            notes_txt = ";  ".join(r["notes"])
+            if len(notes_txt) > 80:
+                notes_txt = notes_txt[:78] + "\u2026"
+
+            status_txt = _fmt_status(sbq, total)
+
+            tree.insert(
+                "", tk.END,
+                values=(
+                    r["code"],
+                    r["sku"] or "",
+                    r["shop"] or "\u2014",
+                    r["stall"] or "\u2014",
+                    total,
+                    status_txt,
+                    notes_txt,
+                ),
+                tags=(row_tag,),
+                **kw,
+            )
+
+        # ── Footer bar ────────────────────────────────────────────────
+        foot = tk.Frame(win, bg=COLORS["app"])
+        foot.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+
+        ttk.Button(
+            foot,
+            text="Close" if self._lang == "en" else "\u5173\u95ed",
+            command=win.destroy,
+            style="Tool.TButton",
+        ).pack(side=tk.RIGHT)
+
+        def _refresh() -> None:
+            win.destroy()
+            self._summary_win = None
+            self._show_charm_purchase_summary()
+
+        ttk.Button(
+            foot,
+            text="\u27f3  Refresh" if self._lang == "en" else "\u27f3  \u5237\u65b0",
+            command=_refresh,
+            style="Tool.TButton",
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+        hint_txt = (
+            "Refresh after updating buy statuses or regenerating the route."
+            if self._lang == "en" else
+            "\u66f4\u65b0\u91c7\u8d2d\u72b6\u6001\u6216\u91cd\u65b0\u751f\u6210\u540e\uff0c\u70b9\u51fb\u5237\u65b0\u3002"
+        )
+        tk.Label(
+            foot, text=hint_txt,
+            font=("Segoe UI", 8), fg=COLORS["muted"], bg=COLORS["app"],
+        ).pack(side=tk.LEFT)
+
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.focus_set()
 
     # ── Row-mapping refresh ───────────────────────────────────────────
 
@@ -5347,6 +5789,15 @@ class _OrdersDashboardDialog:
                     normalize_catalog_charm_shops(FILE_SUPPLIER_CATALOG)
                 except Exception:
                     pass   # normalisation is best-effort; never block the UI
+
+            # Auto-refresh the Purchase List popup so the updated quantities
+            # are visible immediately, without the user clicking Refresh.
+            if (self._mode == "charms"
+                    and self._summary_win
+                    and self._summary_win.winfo_exists()):
+                self._summary_win.destroy()
+                self._summary_win = None
+                self._show_charm_purchase_summary()
 
             self._populate_tree()
 
@@ -5707,7 +6158,15 @@ class _OrdersDashboardDialog:
         self._parent._run_busy = True
         self._parent._set_chrome_busy(True)
         self._parent._append_log("Regenerating shopping route...\n")
-        cmd = [sys.executable, str(GENERATOR), "--project-dir", str(PROJECT_ROOT), "--refresh-catalog"]
+        # Use _collect_generator_args so every user-configured flag (--chinese,
+        # --html, --threshold, etc.) is forwarded.  Previously this built the
+        # command manually with only --refresh-catalog, which silently skipped
+        # the Chinese file and left shopping_route_zh.xlsx with stale photos
+        # even after the user uploaded replacements in the dashboard.
+        gen_args = self._parent._collect_generator_args(
+            "refresh_catalog", include_charm_steps=False
+        )
+        cmd = [sys.executable, str(GENERATOR), *gen_args]
 
         def _work():
             try:
