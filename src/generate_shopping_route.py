@@ -3449,6 +3449,20 @@ def update_product_map_photo(path: Path, row_num: int, photo_bytes: bytes) -> No
 
 def _resolved_to_dict(r: ResolvedItem) -> dict:
     """Serialise a ResolvedItem to a JSON-compatible dict (photos as base64)."""
+    # Apply the same threshold filtering used by the shopping route generator
+    # (_needs_catalog_entry) so the cache reflects what the Excel file actually
+    # shows.  Without this, false-positive matches (score below threshold) would
+    # carry incorrect supplier/stall data into the dashboard, making those items
+    # appear as "ready" (green) instead of "unmatched" (blank fields to fill in).
+    if _needs_catalog_entry(r):
+        # Discard any wrongly-inherited supplier location — treat as unmatched.
+        _shop_name  = ""
+        _stall      = ""
+        _in_catalog = False
+    else:
+        _shop_name  = r.supplier.shop_name if r.supplier else ""
+        _stall      = r.supplier.stall     if r.supplier else ""
+        _in_catalog = r.supplier is not None
     return {
         "order_number":    r.order.order_number,
         "etsy_shop":       r.order.etsy_shop,
@@ -3464,8 +3478,8 @@ def _resolved_to_dict(r: ResolvedItem) -> dict:
         "style":           r.item.style,
         "photo_b64":       base64.b64encode(r.item.photo_bytes).decode()
                            if r.item.photo_bytes else None,
-        "shop_name":       r.supplier.shop_name  if r.supplier else "",
-        "stall":           r.supplier.stall       if r.supplier else "",
+        "shop_name":       _shop_name,
+        "stall":           _stall,
         "category":        r.supplier.category    if r.supplier else "",
         "price":           r.supplier.price       if r.supplier else "",
         "notes":           r.supplier.notes       if r.supplier else "",
@@ -3475,7 +3489,7 @@ def _resolved_to_dict(r: ResolvedItem) -> dict:
         # Preserved so the dashboard can distinguish "in catalog but no supplier
         # info yet" (needs_info) from "truly unmatched" even when all supplier
         # fields are empty strings.
-        "in_catalog":      r.supplier is not None,
+        "in_catalog":      _in_catalog,
     }
 
 
@@ -3501,28 +3515,50 @@ def _dict_to_resolved(d: dict) -> ResolvedItem:
     )
     order.items = [item]
     supplier = None
+    # Retroactively apply the same threshold filtering used by
+    # _resolved_to_dict / _needs_catalog_entry so that old cache files
+    # written before this fix also produce the correct dashboard status.
+    # Without this, false-positive matches (score below threshold) stored in
+    # an older cache would still show incorrect supplier/stall data in the
+    # order dashboard (appearing as green "ready" instead of "unmatched").
+    _match_score = d.get("match_score", 0.0)
+    _shop_name   = d.get("shop_name", "")
+    _stall       = d.get("stall",     "")
+    _in_catalog  = d.get("in_catalog", False)
+    # False positive against a filled catalog entry → discard wrong location.
+    if (_shop_name or _stall) and _match_score < FILLED_ENTRY_MATCH_THRESHOLD:
+        _shop_name  = ""
+        _stall      = ""
+        _in_catalog = False
+    # False positive against an empty catalog entry → not truly in-catalog.
+    elif (
+        not _shop_name and not _stall and _in_catalog
+        and not d.get("charm_shop") and not d.get("charm_code")
+        and _match_score < EMPTY_ENTRY_MATCH_THRESHOLD
+    ):
+        _in_catalog = False
     # Rebuild CatalogEntry whenever ANY matching field is present.
     # Previously this checked only shop_name, which silently discarded
     # stall, charm_shop, and charm_code for products whose catalog row had
     # a stall or charm assignment but an empty shop name — causing the
     # dashboard to show "Unmatched" even though the entry existed.
     if (
-        d.get("shop_name")
-        or d.get("stall")
+        _shop_name
+        or _stall
         or d.get("charm_shop")
         or d.get("charm_code")
     ):
         supplier = CatalogEntry(
             product_title = d["title"],
             category  = d.get("category", ""),
-            shop_name = d.get("shop_name", ""),
-            stall     = d.get("stall",     ""),
+            shop_name = _shop_name,
+            stall     = _stall,
             price     = d.get("price",     ""),
             notes     = d.get("notes",     ""),
             charm_shop = d.get("charm_shop", ""),
             charm_code = d.get("charm_code", ""),
         )
-    elif d.get("in_catalog"):
+    elif _in_catalog:
         # Item matched a catalog entry but all supplier fields are empty
         # (needs_info state). Create an empty CatalogEntry so the dashboard
         # can distinguish this from a truly unmatched item (supplier=None).
@@ -6413,7 +6449,10 @@ def _sheet_route(ws, items: list[ResolvedItem],
                                 preserved = "Out of Production"
                             elif any(s == "Out of Stock" for s in _per_order):
                                 preserved = "Out of Stock"
-                            elif all(s == "Purchased" for s in _per_order):
+                            # Only mark the aggregate as Purchased when every single
+                            # item has been explicitly marked Purchased.
+                            elif (len(_per_order) == len(agg["items"])
+                                  and all(s == "Purchased" for s in _per_order)):
                                 preserved = "Purchased"
 
                     charm_cell = ws.cell(row, COL_CHARM)
@@ -6898,8 +6937,16 @@ def _sheet_route_simple(
 
     # Chinese version omits the Private Notes column (col 10) to keep the
     # sheet compact — private notes are English-only buyer messages.
-    _has_notes_col = lang != "zh"
-    COLS    = 10 if _has_notes_col else 9
+    # Chinese version also omits the individual Case / Grip status columns
+    # (cols 6-7) — 待购项 is sufficient for employees.
+    _has_notes_col  = lang != "zh"
+    _has_comp_cols  = lang != "zh"   # Case + Grip columns present only in EN
+    if _has_notes_col:
+        COLS = 10
+    elif _has_comp_cols:
+        COLS = 9
+    else:
+        COLS = 7
     col_end = get_column_letter(COLS)
     HDR_ROW = 4
 
@@ -6908,10 +6955,10 @@ def _sheet_route_simple(
     S1_SUPPLIER = 3
     S1_STALL    = 4
     S1_ITP      = 5   # Items to Purchase
-    S1_CASE     = 6
-    S1_GRIP     = 7
-    S1_PHONE    = 8
-    S1_QTY      = 9
+    S1_CASE     = 6               if _has_comp_cols else None
+    S1_GRIP     = 7               if _has_comp_cols else None
+    S1_PHONE    = 8               if _has_comp_cols else 6
+    S1_QTY      = 9               if _has_comp_cols else 7
     S1_NOTES    = 10 if _has_notes_col else None   # None → column omitted
 
     # ── Section 2 column positions (same grid, different semantics) ───────
@@ -6920,8 +6967,8 @@ def _sheet_route_simple(
     S2_CHARM_SHOP  = 4
     S2_STALL       = 5
     S2_CHARM       = 6
-    # cols 7-8 intentionally blank / N/A
-    S2_QTY         = 9
+    # cols 7-8 intentionally blank / N/A (only when comp cols present)
+    S2_QTY         = 9 if _has_comp_cols else 7
     S2_NOTES       = 10 if _has_notes_col else None   # None → column omitted
 
     _statuses  = statuses or {}
@@ -7000,8 +7047,7 @@ def _sheet_route_simple(
         _t("Supplier", lang),
         _t("Stall", lang),
         _t("Items to Purchase", lang),
-        _t("Case", lang),
-        _t("Grip", lang),
+        *([_t("Case", lang), _t("Grip", lang)] if _has_comp_cols else []),
         _t("Phone Model", lang),
         _t("Qty", lang),
         *([_t("Private Notes", lang)] if _has_notes_col else []),
@@ -7009,9 +7055,10 @@ def _sheet_route_simple(
     for ci, h in enumerate(S1_HDRS, 1):
         ws.cell(HDR_ROW, ci, h)
     _style_header(ws, HDR_ROW, COLS)
-    ws.cell(HDR_ROW, S1_ITP ).fill = PatternFill("solid", fgColor="2E7D32")
-    ws.cell(HDR_ROW, S1_CASE).fill = PatternFill("solid", fgColor="1A6B3C")
-    ws.cell(HDR_ROW, S1_GRIP).fill = PatternFill("solid", fgColor="1A3D6B")
+    ws.cell(HDR_ROW, S1_ITP).fill = PatternFill("solid", fgColor="2E7D32")
+    if _has_comp_cols:
+        ws.cell(HDR_ROW, S1_CASE).fill = PatternFill("solid", fgColor="1A6B3C")
+        ws.cell(HDR_ROW, S1_GRIP).fill = PatternFill("solid", fgColor="1A3D6B")
     ws.row_dimensions[HDR_ROW].height = 18
 
     # ── Group routable items by supplier ──────────────────────────────────
@@ -7070,21 +7117,24 @@ def _sheet_route_simple(
         itp = ws.cell(row, S1_ITP, items_label)
         itp.alignment = _CENTER
         itp.font      = _ITEMS_TO_PURCHASE_FONT
-        _write_comp(ws, row, S1_CASE, has_case, active_case_cells, onum, "case", r.item.title)
-        _write_comp(ws, row, S1_GRIP, has_grip, active_grip_cells, onum, "grip", r.item.title)
+        if S1_CASE is not None:
+            _write_comp(ws, row, S1_CASE, has_case, active_case_cells, onum, "case", r.item.title)
+        if S1_GRIP is not None:
+            _write_comp(ws, row, S1_GRIP, has_grip, active_grip_cells, onum, "grip", r.item.title)
         ws.cell(row, S1_PHONE, r.item.phone_model)
         ws.cell(row, S1_QTY,   r.item.quantity)
         if S1_NOTES and r.order.private_notes:
             ws.cell(row, S1_NOTES, r.order.private_notes).alignment = _WRAP
 
         _style_row(ws, row, COLS, fill=fill)
-        for ci, has in ((S1_CASE, has_case), (S1_GRIP, has_grip)):
-            c = ws.cell(row, ci)
-            if not has:
-                c.fill = _NA_FILL
-                c.font = _NA_FONT
-            else:
-                c.alignment = _CENTER
+        if S1_CASE is not None:
+            for ci, has in ((S1_CASE, has_case), (S1_GRIP, has_grip)):
+                c = ws.cell(row, ci)
+                if not has:
+                    c.fill = _NA_FILL
+                    c.font = _NA_FONT
+                else:
+                    c.alignment = _CENTER
         if S1_NOTES and r.order.private_notes:
             ws.cell(row, S1_NOTES).alignment = _WRAP
         ws.cell(row, 1).alignment      = _CENTER
@@ -7092,6 +7142,35 @@ def _sheet_route_simple(
         ws.row_dimensions[row].height  = _row_h
         _embed_photo(ws, r.item.photo_bytes, row, S1_PHOTO, _photo_px)
         seq += 1
+
+    # ── Chinese simple: pre-filter completed / charm-only rows out of every ──
+    # section list BEFORE any writing starts.  This is done once at the data  ─
+    # level so all three loops below need no extra guards.                     ─
+    #                                                                          ─
+    # Excluded when lang == "zh":                                              ─
+    #   • Charm-only items (no case, no grip) — they live in Section 2.       ─
+    #   • Items whose 待购项 would be "—": all case/grip components are        ─
+    #     already Purchased (Out-of-Stock / Out-of-Production items remain     ─
+    #     visible because employees still need to act on those).               ─
+    if lang == "zh":
+        def _s1_needed(r: ResolvedItem) -> bool:
+            hc, hg, _ = _style_has(r.item.style)
+            if not hc and not hg:
+                return False        # charm-only → belongs in Section 2 only
+            _onum = r.order.order_number
+            _nt   = _normalize(r.item.title)[:50]
+            return _items_to_purchase(
+                hc, hg,
+                _statuses.get((_onum, _nt, "case")),
+                _statuses.get((_onum, _nt, "grip")),
+                "en",               # compare against the fixed "—" em-dash
+            ) != "\u2014"
+
+        for _k in list(sorted_keys):
+            groups[_k] = [r for r in groups[_k] if _s1_needed(r)]
+        sorted_keys = [k for k in sorted_keys if groups[k]]
+        needs_info  = [r for r in needs_info  if _s1_needed(r)]
+        unmatched   = [r for r in unmatched   if _s1_needed(r)]
 
     # ── Routable rows ─────────────────────────────────────────────────────
     for gidx, key in enumerate(sorted_keys):
@@ -7152,11 +7231,12 @@ def _sheet_route_simple(
 
     # ── Conditional formatting for Section 1 ──────────────────────────────
     # Use the localised status strings that were written into cells above.
+    # Skipped for Chinese (no Case/Grip columns to drive row colouring).
     _sv_oop  = _t("Out of Production", lang)
     _sv_oos  = _t("Out of Stock", lang)
     _sv_done = _t("Purchased", lang)
     _sv_na   = _t("N/A", lang)
-    if last_data_row >= first_data_row:
+    if _has_comp_cols and last_data_row >= first_data_row:
         s1_range = f"A{first_data_row}:{col_end}{last_data_row}"
         r0 = first_data_row
         gc = f"${get_column_letter(S1_CASE)}"
@@ -7282,7 +7362,7 @@ def _sheet_route_simple(
             _t("Charm Shop", lang),
             _t("Stall", lang),
             _t("Charm", lang),
-            "", "",
+            *(["", ""] if _has_comp_cols else []),
             _t("Qty", lang),
             *([_t("Private Notes", lang)] if _has_notes_col else []),
         ]
@@ -7290,9 +7370,10 @@ def _sheet_route_simple(
             ws.cell(row, ci, h)
         _style_header(ws, row, COLS)
         ws.cell(row, S2_CHARM).fill = _CHARM_HDR_FILL
-        for _mc in (7, 8):
-            ws.cell(row, _mc).fill = _NA_FILL
-            ws.cell(row, _mc).font = _CHARM_NA_HDR_FONT
+        if _has_comp_cols:
+            for _mc in (7, 8):
+                ws.cell(row, _mc).fill = _NA_FILL
+                ws.cell(row, _mc).font = _CHARM_NA_HDR_FONT
         ws.row_dimensions[row].height = 18
         row += 1
 
@@ -7332,8 +7413,17 @@ def _sheet_route_simple(
                         preserved = "Out of Production"
                     elif any(s == "Out of Stock" for s in _per_order):
                         preserved = "Out of Stock"
-                    elif all(s == "Purchased" for s in _per_order):
+                    # Only mark the aggregate as Purchased when every single item
+                    # in the group has been explicitly marked Purchased.  A partial
+                    # subset of "Purchased" statuses must not hide a charm that still
+                    # has outstanding (implicitly-Pending) orders.
+                    elif (len(_per_order) == len(agg["items"])
+                          and all(s == "Purchased" for s in _per_order)):
                         preserved = "Purchased"
+
+            # Chinese simple: hide charms that are already Purchased.
+            if lang == "zh" and preserved == "Purchased":
+                continue
 
             # Collect private notes from all orders (deduplicated)
             _all_notes: list[str] = []
@@ -7357,9 +7447,10 @@ def _sheet_route_simple(
                 ws.cell(row, S2_NOTES, "; ".join(_all_notes)).alignment = _WRAP
 
             _style_row(ws, row, COLS, fill=fill)
-            for _mc in (7, 8):
-                ws.cell(row, _mc).fill = _NA_FILL
-                ws.cell(row, _mc).font = _NA_FONT
+            if _has_comp_cols:
+                for _mc in (7, 8):
+                    ws.cell(row, _mc).fill = _NA_FILL
+                    ws.cell(row, _mc).font = _NA_FONT
             ws.cell(row, S2_CHARM).alignment      = _CENTER
             ws.cell(row, 1).alignment             = _CENTER
             ws.cell(row, S2_CHARM_CODE).alignment = _CENTER
@@ -7429,9 +7520,10 @@ def _sheet_route_simple(
             _style_header(ws, row, COLS)
             ws.cell(row, S2_CHARM).fill = PatternFill("solid", fgColor="FFF3CD")
             ws.cell(row, S2_CHARM).font = Font("Calibri", bold=True, size=11, color="7D4E00")
-            for _mc in (7, 8):
-                ws.cell(row, _mc).fill = _NA_FILL
-                ws.cell(row, _mc).font = _CHARM_NA_HDR_FONT
+            if _has_comp_cols:
+                for _mc in (7, 8):
+                    ws.cell(row, _mc).fill = _NA_FILL
+                    ws.cell(row, _mc).font = _CHARM_NA_HDR_FONT
             ws.row_dimensions[row].height = 18
             row += 1
 
@@ -7472,9 +7564,10 @@ def _sheet_route_simple(
                 _ac.font = _AWAIT_CODE_FONT
                 _ac.fill = _AWAIT_CODE_FILL
                 _ac.alignment = _CENTER
-                for _mc in (7, 8):
-                    ws.cell(row, _mc).fill = _NA_FILL
-                    ws.cell(row, _mc).font = _NA_FONT
+                if _has_comp_cols:
+                    for _mc in (7, 8):
+                        ws.cell(row, _mc).fill = _NA_FILL
+                        ws.cell(row, _mc).font = _NA_FONT
                 if S2_NOTES and r.order.private_notes:
                     ws.cell(row, S2_NOTES).alignment = _WRAP
                 ws.cell(row, 1).alignment      = _CENTER
@@ -7484,14 +7577,15 @@ def _sheet_route_simple(
                 row += 1
 
     # ── Column widths ─────────────────────────────────────────────────────
-    # #  | Photo       | Supplier/Code | Shop/Supplier | Stall/Stall |
-    # ITP/Charm | Case/— | Grip/— | Phone/Qty | [Qty/]Notes
-    # Chinese version has 9 columns (no Private Notes); give col 9 (Qty)
-    # a wider width so the grid stays balanced.
+    # EN (10 cols): # | Photo | Supplier | Stall | ITP | Case | Grip | Phone | Qty | Notes
+    # EN-no-notes (9 cols): same minus Notes
+    # ZH (7 cols):  # | Photo | Supplier | Stall | ITP | Phone | Qty
     if _has_notes_col:
         col_widths = [4, _photo_col_w, 14, 14, 9, 10, 8, 8, 18, 32]
-    else:
+    elif _has_comp_cols:
         col_widths = [4, _photo_col_w, 14, 14, 9, 10, 8, 8, 12]
+    else:
+        col_widths = [4, _photo_col_w, 14, 9, 12, 18, 8]
     for ci, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(ci)].width = w
 
@@ -7803,7 +7897,10 @@ def _html_charm_agg_card(
                 preserved = "Out of Production"
             elif any(s == "Out of Stock" for s in _per_order):
                 preserved = "Out of Stock"
-            elif all(s == "Purchased" for s in _per_order):
+            # Only mark the aggregate as Purchased when every single item
+            # has been explicitly marked Purchased.
+            elif (len(_per_order) == len(agg["items"])
+                  and all(s == "Purchased" for s in _per_order)):
                 preserved = "Purchased"
     charm_val = _t(preserved, lang) if preserved else _t("Pending", lang)
     na_val    = _t("N/A", lang)
@@ -8247,7 +8344,10 @@ def generate_html(items: list[ResolvedItem], output: Path,
                         preserved = "Out of Production"
                     elif any(s == "Out of Stock" for s in _hpo):
                         preserved = "Out of Stock"
-                    elif all(s == "Purchased" for s in _hpo):
+                    # Only mark the aggregate as Purchased when every single item
+                    # has been explicitly marked Purchased.
+                    elif (len(_hpo) == len(agg["items"])
+                          and all(s == "Purchased" for s in _hpo)):
                         preserved = "Purchased"
             chv = _t(preserved, lang) if preserved else _t("Pending", lang)
             na  = _t("N/A", lang)
@@ -9398,10 +9498,11 @@ def main() -> None:
         proj = Path(args.project_dir).resolve()
         catalog_path = proj / "data" / "supplier_catalog.xlsx"
         output_path  = proj / "output" / "shopping_route.xlsx"
-        cache_path   = proj / "cache" / "orders_cache.json"
-        input_dir    = proj / "input"
-        oop_log_path = proj / "cache" / "out_of_production_log.csv"
-        trans_cache_path = proj / "cache" / "translations_zh_cache.json"
+        cache_path        = proj / "cache" / "orders_cache.json"
+        deleted_path      = proj / "cache" / "deleted_orders.json"
+        input_dir         = proj / "input"
+        oop_log_path      = proj / "cache" / "out_of_production_log.csv"
+        trans_cache_path  = proj / "cache" / "translations_zh_cache.json"
         charm_images_dir = (
             Path(args.charm_images_dir).resolve()
             if args.charm_images_dir.strip()
@@ -9411,6 +9512,7 @@ def main() -> None:
         catalog_path = Path(args.catalog)
         output_path  = Path(args.output)
         cache_path   = Path(args.cache)
+        deleted_path = cache_path.parent / "deleted_orders.json"
         input_dir    = Path(".")
         oop_log_path = Path(OOP_LOG_FILE)
         trans_cache_path = Path(ZH_TRANS_CACHE)
@@ -9763,7 +9865,28 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------ #
-    # Step 2 -- Load previously cached orders (from earlier runs)         #
+    # Step 2 -- Load deletion tombstone (set of (order, norm_title) keys #
+    #           the user has explicitly deleted from the Orders Dashboard)#
+    #           These are permanently excluded from both the Excel        #
+    #           safety-net restore and any future PDF re-processing.      #
+    # ------------------------------------------------------------------ #
+    _deleted_ot_keys: set[tuple[str, str]] = set()
+    if not args.reset and deleted_path.exists():
+        try:
+            _tomb_data = json.loads(deleted_path.read_text(encoding="utf-8"))
+            for _e in _tomb_data.get("deleted", []):
+                _nt50 = str(_e.get("norm_title", ""))[:50]
+                _deleted_ot_keys.add((str(_e.get("order", "")), _nt50))
+            if _deleted_ot_keys:
+                log.info(
+                    "Deletion tombstone: %d order(s) permanently excluded",
+                    len(_deleted_ot_keys),
+                )
+        except Exception as _te:
+            log.warning("Could not read deletion tombstone (%s) -- ignoring", _te)
+
+    # ------------------------------------------------------------------ #
+    # Step 2b -- Load previously cached orders (from earlier runs)        #
     #           ALWAYS also read the current Excel as a safety net so    #
     #           that no data in the file can ever be silently deleted.    #
     # ------------------------------------------------------------------ #
@@ -9850,6 +9973,8 @@ def main() -> None:
         ot    = (r.order.order_number, _normalize(r.item.title)[:50])
         if key in _prior_key_set:
             continue  # exact duplicate
+        if ot in _deleted_ot_keys:
+            continue  # user explicitly deleted this order — never restore from Excel
         if ot in _cached_known_ot:
             continue  # order+title already in cache — trust cache, skip Excel entry
         if comps.issubset(_cached_union.get(ot, frozenset())):
@@ -10038,10 +10163,14 @@ def main() -> None:
     _seen_new: set[tuple[str, str, frozenset]] = set()
     truly_new: list[ResolvedItem] = []
     for _r in new_resolved:
-        _k = (_r.order.order_number, _normalize(_r.item.title)[:50], _style_comps(_r.item.style))
-        if _k not in _cached_item_keys and _k not in _seen_new:
-            _seen_new.add(_k)
-            truly_new.append(_r)
+        _k  = (_r.order.order_number, _normalize(_r.item.title)[:50], _style_comps(_r.item.style))
+        _ot = (_r.order.order_number, _normalize(_r.item.title)[:50])
+        if _k in _cached_item_keys or _k in _seen_new:
+            continue  # already in cache or already seen this run
+        if _ot in _deleted_ot_keys:
+            continue  # user explicitly deleted — do not re-add from PDF
+        _seen_new.add(_k)
+        truly_new.append(_r)
     duplicates = len(new_resolved) - len(truly_new)
     if duplicates:
         log.info("Skipped %d item(s) already in cache (duplicate PDF re-scan)", duplicates)
@@ -10214,6 +10343,48 @@ def main() -> None:
     # dashboard exactly.  Always runs, even without --refresh-catalog.    #
     # ------------------------------------------------------------------ #
     apply_canonical_charm_fields_to_resolved(all_resolved, catalog_path)
+
+    # ------------------------------------------------------------------ #
+    # Step 6c -- Reconcile stale charm_agg=Purchased statuses             #
+    #                                                                      #
+    # When an old shopping_route.xlsx has a charm row marked "Purchased"  #
+    # in the charm-status cell, load_existing_statuses reads it back as   #
+    # charm_agg="Purchased" and every subsequent regeneration inherits    #
+    # that value, hiding the charm from the Chinese route even when the   #
+    # underlying orders are still outstanding.                             #
+    #                                                                      #
+    # Rule: a charm_agg="Purchased" entry is only valid when EVERY order  #
+    # that needs that charm has an explicit per-order charm="Purchased"   #
+    # status in existing_statuses.  Any charm_agg that cannot be          #
+    # confirmed this way is deleted so the charm re-appears as Pending.   #
+    # ------------------------------------------------------------------ #
+    _stale_agg: list[tuple] = []
+    for _sk, _sv in existing_statuses.items():
+        if not (len(_sk) == 3 and _sk[2] == "charm_agg" and _sv == "Purchased"):
+            continue
+        _agg_code = _sk[0]
+        _agg_orders = [
+            r for r in all_resolved
+            if _style_has(r.item.style)[2]
+            and (r.supplier.charm_code if r.supplier else "").strip() == _agg_code
+        ]
+        if not _agg_orders:
+            continue
+        _confirmed = all(
+            existing_statuses.get(
+                (r.order.order_number, _normalize(r.item.title)[:50], "charm")
+            ) == "Purchased"
+            for r in _agg_orders
+        )
+        if not _confirmed:
+            _stale_agg.append(_sk)
+    for _sk in _stale_agg:
+        del existing_statuses[_sk]
+        log.info(
+            "Cleared stale charm_agg=Purchased for %s — not all constituent "
+            "orders confirmed purchased; charm will show as Pending",
+            _sk[0],
+        )
 
     # ------------------------------------------------------------------ #
     # Step 7 -- Save updated cache (all orders, inc. newly added)         #

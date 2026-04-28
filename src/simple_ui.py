@@ -155,6 +155,7 @@ DROP_ZONE_H = 92
 
 FILE_SUPPLIER_CATALOG = DATA_DIR / "supplier_catalog.xlsx"
 FILE_ORDERS_CACHE = PROJECT_ROOT / "cache" / "orders_cache.json"
+FILE_DELETED_ORDERS = PROJECT_ROOT / "cache" / "deleted_orders.json"
 FILE_SHOPPING_ROUTE = OUTPUT_DIR / "shopping_route.xlsx"
 FILE_SHOPPING_ROUTE_ZH = OUTPUT_DIR / "shopping_route_zh.xlsx"
 FILE_SHOPPING_ROUTE_SIMPLE = OUTPUT_DIR / "shopping_route_simple.xlsx"
@@ -398,11 +399,13 @@ CHROME: dict[Lang, dict[str, str]] = {
         "footer_run_hint": "Read the messages in the output box when it finishes.",
         "quick_hint": (
             "Quick open — opens in Excel or your browser when the file exists; run the tool first if not. "
-            "Top group: supplier catalog file and the data folder it lives in. "
-            "Bottom group: shopping list outputs (use Chinese / HTML checkboxes before Run when needed)."
+            "Top group: supplier catalog and data folder. "
+            "Bottom group: shopping list outputs separated by format (Excel / Web)."
         ),
         "quick_group_supplier": "Supplier — product data (catalog lives here)",
         "quick_group_route": "Shopping list — generated outputs",
+        "quick_group_excel": "\U0001F4CA  Excel",
+        "quick_group_web":   "\U0001F310  Web",
         "quick_catalog": "Open supplier workbook",
         "btn_catalog_backups": "Catalog backups…",
         "cat_backup_title": "Supplier catalog backups",
@@ -515,11 +518,19 @@ CHROME: dict[Lang, dict[str, str]] = {
         ),
         "discontinue_no_selection": "Select a product row in the table first.",
         "quick_data_folder": "Open data folder",
-        "quick_route": "Excel (default)",
-        "quick_route_zh": "Excel — Chinese",
-        "quick_route_simple": "Simple list (Excel)",
+        "quick_route": "English — detailed",
+        "quick_route_simple": "English — simple",
+        "quick_route_zh": "Chinese — simple",
         "quick_html": "Web page",
         "quick_html_zh": "Web — Chinese",
+        "open_route_btn": "\U0001F4C2  Open Route \u25be",
+        "open_route_menu_title": "Open Shopping Route",
+        "open_route_en_detail": "\U0001F4CA  English — Detailed  (shopping_route.xlsx)",
+        "open_route_en_simple": "\U0001F4CB  English — Simple  (shopping_route_simple.xlsx)",
+        "open_route_zh": "\U0001F1E8\U0001F1F3  Chinese — Simple  (shopping_route_zh.xlsx)",
+        "open_route_html_en": "\U0001F310  Web Page — English  (shopping_route.html)",
+        "open_route_html_zh": "\U0001F310  Web Page — Chinese  (shopping_route_zh.html)",
+        "open_route_missing": "not generated yet",
         "file_missing_title": "File not found",
         "file_missing_body": "This file is not there yet:\n{path}\nRun the tool above first, or ask a supervisor. For Chinese or web files, tick those options before running.",
         "file_open_fail_title": "Could not open",
@@ -669,10 +680,12 @@ CHROME: dict[Lang, dict[str, str]] = {
         "footer_run_hint": "完成后请看下方输出框里的提示信息。",
         "quick_hint": (
             "快速打开 — 文件已存在时用 Excel 或浏览器打开；没有时请先在下方「运行」生成。"
-            "上面一组是供应商商品表及其所在文件夹（含挂饰图等）；下面一组是采购清单生成结果（要中文版或网页请先勾选再运行）。"
+            "上面一组是供应商商品表及其所在文件夹；下面一组是采购清单生成结果（按格式分为 Excel 与网页两组）。"
         ),
         "quick_group_supplier": "供应商 — 商品数据（商品表在此文件夹中）",
         "quick_group_route": "采购清单 — 生成结果",
+        "quick_group_excel": "\U0001F4CA  Excel",
+        "quick_group_web":   "\U0001F310  网页版",
         "quick_catalog": "打开商品表（Excel）",
         "btn_catalog_backups": "商品表备份…",
         "cat_backup_title": "供应商商品表备份",
@@ -783,11 +796,19 @@ CHROME: dict[Lang, dict[str, str]] = {
         ),
         "discontinue_no_selection": "请先在表格中选择一行商品。",
         "quick_data_folder": "打开商品数据文件夹",
-        "quick_route": "Excel（默认）",
-        "quick_route_zh": "Excel — 中文版",
-        "quick_route_simple": "简版清单（Excel）",
+        "quick_route": "英文 — 详细版",
+        "quick_route_simple": "英文 — 简版",
+        "quick_route_zh": "中文 — 简版",
         "quick_html": "网页版",
         "quick_html_zh": "网页 — 中文版",
+        "open_route_btn": "\U0001F4C2  打开路线表 \u25be",
+        "open_route_menu_title": "打开采购路线文件",
+        "open_route_en_detail": "\U0001F4CA  英文 — 详细版  (shopping_route.xlsx)",
+        "open_route_en_simple": "\U0001F4CB  英文 — 简版  (shopping_route_simple.xlsx)",
+        "open_route_zh": "\U0001F1E8\U0001F1F3  中文 — 简版  (shopping_route_zh.xlsx)",
+        "open_route_html_en": "\U0001F310  网页版 — 英文  (shopping_route.html)",
+        "open_route_html_zh": "\U0001F310  网页版 — 中文  (shopping_route_zh.html)",
+        "open_route_missing": "尚未生成",
         "file_missing_title": "还没有这个文件",
         "file_missing_body": "目前找不到：\n{path}\n请先在上方运行一次，或询问主管。若要中文版或网页，运行前请勾选对应选项。",
         "file_open_fail_title": "无法打开",
@@ -1058,6 +1079,8 @@ class App(tk.Tk):
         self._w_quick_hint: ttk.Label | None = None
         self._w_quick_grp_sup: ttk.Label | None = None
         self._w_quick_grp_route: ttk.Label | None = None
+        self._w_quick_grp_excel: ttk.Label | None = None
+        self._w_quick_grp_web:   ttk.Label | None = None
         self._quick_file_btns: list[tuple[ttk.Button, str]] = []
         self._btn_edit_products: ttk.Button | None = None
         self._btn_catalog_backups: ttk.Button | None = None
@@ -1244,6 +1267,10 @@ class App(tk.Tk):
             self._w_quick_grp_sup.config(text=CHROME[self._lang]["quick_group_supplier"])
         if self._w_quick_grp_route:
             self._w_quick_grp_route.config(text=CHROME[self._lang]["quick_group_route"])
+        if self._w_quick_grp_excel:
+            self._w_quick_grp_excel.config(text=CHROME[self._lang]["quick_group_excel"])
+        if self._w_quick_grp_web:
+            self._w_quick_grp_web.config(text=CHROME[self._lang]["quick_group_web"])
         for btn, key in self._quick_file_btns:
             btn.config(text=CHROME[self._lang][key])
         if self._btn_edit_products:
@@ -1511,14 +1538,30 @@ class App(tk.Tk):
         grp_route = ttk.Frame(quick_rows, style="App.TFrame")
         grp_route.pack(anchor=tk.W, fill=tk.X, pady=(0, 0))
         self._w_quick_grp_route = ttk.Label(grp_route, text="", style="Sub.TLabel", wraplength=1060)
-        self._w_quick_grp_route.pack(anchor=tk.W, pady=(0, 4))
-        row_route = ttk.Frame(grp_route, style="App.TFrame")
-        row_route.pack(anchor=tk.W, fill=tk.X)
-        _mk_open_btn(row_route, FILE_SHOPPING_ROUTE, "quick_route")
-        _mk_open_btn(row_route, FILE_SHOPPING_ROUTE_ZH, "quick_route_zh")
-        _mk_open_btn(row_route, FILE_SHOPPING_ROUTE_SIMPLE, "quick_route_simple")
-        _mk_open_btn(row_route, FILE_SHOPPING_HTML, "quick_html")
-        _mk_open_btn(row_route, FILE_SHOPPING_HTML_ZH, "quick_html_zh")
+        self._w_quick_grp_route.pack(anchor=tk.W, pady=(0, 6))
+
+        # ── Excel sub-row ─────────────────────────────────────────────────────
+        row_excel = ttk.Frame(grp_route, style="App.TFrame")
+        row_excel.pack(anchor=tk.W, fill=tk.X, pady=(0, 2))
+        self._w_quick_grp_excel = ttk.Label(
+            row_excel, text="", style="Muted.TLabel",
+            font=("Segoe UI", 8, "bold"), foreground="#6b7280", width=8,
+        )
+        self._w_quick_grp_excel.pack(side=tk.LEFT, padx=(0, 4), pady=(0, 0))
+        _mk_open_btn(row_excel, FILE_SHOPPING_ROUTE, "quick_route")
+        _mk_open_btn(row_excel, FILE_SHOPPING_ROUTE_SIMPLE, "quick_route_simple")
+        _mk_open_btn(row_excel, FILE_SHOPPING_ROUTE_ZH, "quick_route_zh")
+
+        # ── Web sub-row (no horizontal rule — spacing + labels keep it clean) ─
+        row_web = ttk.Frame(grp_route, style="App.TFrame")
+        row_web.pack(anchor=tk.W, fill=tk.X, pady=(2, 0))
+        self._w_quick_grp_web = ttk.Label(
+            row_web, text="", style="Muted.TLabel",
+            font=("Segoe UI", 8, "bold"), foreground="#6b7280", width=8,
+        )
+        self._w_quick_grp_web.pack(side=tk.LEFT, padx=(0, 4), pady=(0, 0))
+        _mk_open_btn(row_web, FILE_SHOPPING_HTML, "quick_html")
+        _mk_open_btn(row_web, FILE_SHOPPING_HTML_ZH, "quick_html_zh")
 
         strip = tk.Frame(top_block, bg=COLORS["strip"], highlightthickness=0)
         strip.pack(fill=tk.X, pady=(8, 0))
@@ -3220,8 +3263,8 @@ class _OrdersDashboardDialog:
         self._gallery_hint: tk.Label | None = None
         self._recently_used_frame: tk.Frame | None = None
         self._ru_photo_refs: list[object] = []
-        # Column sort state
-        self._sort_col: str = ""      # active sort column key, "" = no sort
+        # Column sort state (default Stall asc — applied again in _configure_columns)
+        self._sort_col: str = "stall"
         self._sort_dir: str = "asc"   # "asc" | "desc"
         # Base heading labels (without sort indicators) — populated in _configure_columns
         self._col_base_labels: dict[str, str] = {}
@@ -3497,6 +3540,28 @@ class _OrdersDashboardDialog:
             foot, text="Regenerate Shopping Route" if self._lang == "en" else "\u91cd\u65b0\u751f\u6210\u91c7\u8d2d\u6e05\u5355",
             command=self._regen, style="Tool.TButton")
         self._regen_btn.pack(side=tk.LEFT)
+        # Open Route dropdown — lists all generated file variants
+        self._btn_open_route = tk.Button(
+            foot,
+            text=self._parent._t("open_route_btn"),
+            font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT, bd=0, padx=14, pady=5, cursor="hand2",
+            bg=COLORS["accent"], fg="#ffffff",
+            activebackground=COLORS["hero"], activeforeground="#ffffff",
+            command=self._open_route,
+        )
+        self._btn_open_route.pack(side=tk.LEFT, padx=(10, 0))
+        # Delete selected orders button — styled red as a destructive action
+        self._btn_delete = tk.Button(
+            foot,
+            text="\U0001F5D1  Delete Selected" if self._lang == "en" else "\U0001F5D1  删除所选",
+            font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT, bd=0, padx=14, pady=5, cursor="hand2",
+            bg="#dc2626", fg="#ffffff",
+            activebackground="#b91c1c", activeforeground="#ffffff",
+            command=self._delete_selected_orders,
+        )
+        self._btn_delete.pack(side=tk.LEFT, padx=(10, 0))
         self._save_status = tk.Label(foot, text="", font=("Segoe UI", 10, "bold"),
                                      fg="#047857", bg=COLORS["app"])
         self._save_status.pack(side=tk.LEFT, padx=(16, 0))
@@ -3739,14 +3804,16 @@ class _OrdersDashboardDialog:
     # Keys starting with "_ps_" are sentinel values handled specially in the
     # sort engine (they rank by _PSTATUS_SORT_ORDER, not alphabetically).
     _CG_SORT_MAP: dict[str, str] = {
-        "order": "order", "product": "title", "supplier": "supplier",
+        "order": "order", "product": "title", "etsy_shop": "etsy_shop",
+        "supplier": "supplier",
         "stall": "stall",  "phone": "phone",   "status": "status",
         "notes": "private_notes",
         "case":  "_ps_case",   # purchase-status sort
         "grip":  "_ps_grip",   # purchase-status sort
     }
     _CH_SORT_MAP: dict[str, str] = {
-        "order": "order", "product": "title", "charm_code": "charm_code",
+        "order": "order", "product": "title", "etsy_shop": "etsy_shop",
+        "charm_code": "charm_code",
         "charm_shop": "charm_shop", "stall": "stall", "status": "status",
         "notes": "private_notes",
         "buy_status": "_ps_charm",  # purchase-status sort
@@ -3781,7 +3848,6 @@ class _OrdersDashboardDialog:
 
     def _configure_columns(self) -> None:
         tree = self._tree
-        self._sort_col = ""   # reset sort when switching mode
         self._col_base_labels.clear()
 
         if tree["columns"]:
@@ -3797,48 +3863,52 @@ class _OrdersDashboardDialog:
                 tree.heading(col, text=label, anchor=anchor)
 
         if self._mode == "casegrip":
-            tree["columns"] = ("seq", "order", "product", "supplier", "stall",
+            tree["columns"] = ("seq", "order", "product", "etsy_shop", "supplier", "stall",
                                "case", "grip", "phone", "qty", "status", "notes")
-            _hdr("seq",      "#",            anchor=tk.CENTER, sortable=False)
-            _hdr("order",    "Order #",      anchor=tk.CENTER, sortable=True)
-            _hdr("product",  "Product",      sortable=True)
-            _hdr("supplier", "Supplier",     sortable=True)
-            _hdr("stall",    "Stall",        anchor=tk.CENTER, sortable=True)
+            _hdr("seq",       "#",             anchor=tk.CENTER, sortable=False)
+            _hdr("order",     "Order #",       anchor=tk.CENTER, sortable=True)
+            _hdr("product",   "Product",       sortable=True)
+            _hdr("etsy_shop", "Etsy Shop",     sortable=True)
+            _hdr("supplier",  "Supplier",      sortable=True)
+            _hdr("stall",     "Stall",         anchor=tk.CENTER, sortable=True)
             # Case / Grip columns now show the per-component purchase status
-            _hdr("case",     "Case",         anchor=tk.CENTER, sortable=True)
-            _hdr("grip",     "Grip",         anchor=tk.CENTER, sortable=True)
-            _hdr("phone",    "Phone Model",  sortable=True)
-            _hdr("qty",      "Qty",          anchor=tk.CENTER, sortable=False)
-            _hdr("status",   "Match",        anchor=tk.CENTER, sortable=True)
-            _hdr("notes",    "Private Notes",sortable=True)
-            tree.column("seq",      width=32,  minwidth=26,  anchor=tk.CENTER, stretch=False)
-            tree.column("order",    width=95,  minwidth=80,  anchor=tk.CENTER, stretch=False)
-            tree.column("product",  width=200, minwidth=120, stretch=True)
-            tree.column("supplier", width=90,  minwidth=60,  stretch=False)
-            tree.column("stall",    width=58,  minwidth=44,  anchor=tk.CENTER, stretch=False)
-            tree.column("case",     width=108, minwidth=72,  anchor=tk.CENTER, stretch=False)
-            tree.column("grip",     width=108, minwidth=72,  anchor=tk.CENTER, stretch=False)
-            tree.column("phone",    width=118, minwidth=80,  stretch=False)
-            tree.column("qty",      width=32,  minwidth=26,  anchor=tk.CENTER, stretch=False)
-            tree.column("status",   width=72,  minwidth=50,  anchor=tk.CENTER, stretch=False)
-            tree.column("notes",    width=160, minwidth=80,  stretch=False)
+            _hdr("case",      "Case",          anchor=tk.CENTER, sortable=True)
+            _hdr("grip",      "Grip",          anchor=tk.CENTER, sortable=True)
+            _hdr("phone",     "Phone Model",   sortable=True)
+            _hdr("qty",       "Qty",           anchor=tk.CENTER, sortable=False)
+            _hdr("status",    "Match",         anchor=tk.CENTER, sortable=True)
+            _hdr("notes",     "Private Notes", sortable=True)
+            tree.column("seq",       width=32,  minwidth=26,  anchor=tk.CENTER, stretch=False)
+            tree.column("order",     width=95,  minwidth=80,  anchor=tk.CENTER, stretch=False)
+            tree.column("product",   width=200, minwidth=120, stretch=True)
+            tree.column("etsy_shop", width=110, minwidth=70,  stretch=False)
+            tree.column("supplier",  width=90,  minwidth=60,  stretch=False)
+            tree.column("stall",     width=58,  minwidth=44,  anchor=tk.CENTER, stretch=False)
+            tree.column("case",      width=108, minwidth=72,  anchor=tk.CENTER, stretch=False)
+            tree.column("grip",      width=108, minwidth=72,  anchor=tk.CENTER, stretch=False)
+            tree.column("phone",     width=118, minwidth=80,  stretch=False)
+            tree.column("qty",       width=32,  minwidth=26,  anchor=tk.CENTER, stretch=False)
+            tree.column("status",    width=72,  minwidth=50,  anchor=tk.CENTER, stretch=False)
+            tree.column("notes",     width=160, minwidth=80,  stretch=False)
         else:
-            tree["columns"] = ("seq", "order", "product", "charm_code", "charm_shop",
+            tree["columns"] = ("seq", "order", "product", "etsy_shop", "charm_code", "charm_shop",
                                "stall", "qty", "status", "buy_status", "notes")
-            _hdr("seq",        "#",            anchor=tk.CENTER, sortable=False)
-            _hdr("order",      "Order #",      anchor=tk.CENTER, sortable=True)
-            _hdr("product",    "Product",      sortable=True)
-            _hdr("charm_code", "Charm Code",   anchor=tk.CENTER, sortable=True)
-            _hdr("charm_shop", "Charm Shop",   sortable=True)
-            _hdr("stall",      "Stall",        anchor=tk.CENTER, sortable=True)
-            _hdr("qty",        "Qty",          anchor=tk.CENTER, sortable=False)
-            _hdr("status",     "Match",        anchor=tk.CENTER, sortable=True)
+            _hdr("seq",        "#",             anchor=tk.CENTER, sortable=False)
+            _hdr("order",      "Order #",       anchor=tk.CENTER, sortable=True)
+            _hdr("product",    "Product",       sortable=True)
+            _hdr("etsy_shop",  "Etsy Shop",     sortable=True)
+            _hdr("charm_code", "Charm Code",    anchor=tk.CENTER, sortable=True)
+            _hdr("charm_shop", "Charm Shop",    sortable=True)
+            _hdr("stall",      "Stall",         anchor=tk.CENTER, sortable=True)
+            _hdr("qty",        "Qty",           anchor=tk.CENTER, sortable=False)
+            _hdr("status",     "Match",         anchor=tk.CENTER, sortable=True)
             # Charm purchase status column
-            _hdr("buy_status", "Buy Status",   anchor=tk.CENTER, sortable=True)
-            _hdr("notes",      "Private Notes",sortable=True)
+            _hdr("buy_status", "Buy Status",    anchor=tk.CENTER, sortable=True)
+            _hdr("notes",      "Private Notes", sortable=True)
             tree.column("seq",        width=32,  minwidth=26,  anchor=tk.CENTER, stretch=False)
             tree.column("order",      width=95,  minwidth=80,  anchor=tk.CENTER, stretch=False)
             tree.column("product",    width=200, minwidth=120, stretch=True)
+            tree.column("etsy_shop",  width=110, minwidth=70,  stretch=False)
             tree.column("charm_code", width=90,  minwidth=60,  anchor=tk.CENTER, stretch=False)
             tree.column("charm_shop", width=120, minwidth=70,  stretch=False)
             tree.column("stall",      width=58,  minwidth=44,  anchor=tk.CENTER, stretch=False)
@@ -3846,6 +3916,10 @@ class _OrdersDashboardDialog:
             tree.column("status",     width=90,  minwidth=55,  anchor=tk.CENTER, stretch=False)
             tree.column("buy_status", width=108, minwidth=72,  anchor=tk.CENTER, stretch=False)
             tree.column("notes",      width=160, minwidth=80,  stretch=False)
+
+        # Always open / return to a mode with Stall ascending (matches shopping-route order).
+        self._sort_col = "stall"
+        self._sort_dir = "asc"
 
     # ── Sort engine ───────────────────────────────────────────────────
 
@@ -4999,6 +5073,7 @@ class _OrdersDashboardDialog:
                 else:
                     grip_cell = "\u2014"
                 vals = (seq, f"#{d['order']}", title_short,
+                        d.get("etsy_shop") or "\u2014",
                         d["supplier"] or "\u2014", d["stall"] or "\u2014",
                         case_cell, grip_cell, d["phone"],
                         d["qty"], st_text, notes_short)
@@ -5006,6 +5081,7 @@ class _OrdersDashboardDialog:
                 _chps = self._pstatuses.get((_order, _norm, "charm"), "Pending")
                 charm_buy_cell = _pd.get(_chps, _chps)
                 vals = (seq, f"#{d['order']}", title_short,
+                        d.get("etsy_shop") or "\u2014",
                         d.get("charm_code") or "\u2014",
                         d.get("charm_shop") or "\u2014",
                         d.get("stall") or "\u2014",
@@ -5801,6 +5877,76 @@ class _OrdersDashboardDialog:
 
             self._populate_tree()
 
+    def _save_phone(self) -> None:
+        """Save the phone model edit to the in-memory items and the order cache."""
+        if not self._selected_indices:
+            return
+        new_phone = self._edit_widgets.get("phone_var", tk.StringVar()).get().strip()
+        if not new_phone:
+            from tkinter import messagebox
+            messagebox.showwarning(
+                "No phone model" if self._lang == "en" else "\u672a\u8f93\u5165\u624b\u673a\u578b\u53f7",
+                "Enter or select a phone model first." if self._lang == "en"
+                else "\u8bf7\u5148\u8f93\u5165\u6216\u9009\u62e9\u624b\u673a\u578b\u53f7\u3002",
+            )
+            return
+
+        items = self._cg_items
+        updated = 0
+
+        for idx in self._selected_indices:
+            if idx < 0 or idx >= len(items):
+                continue
+            d = items[idx]
+            old_phone = d.get("phone", "")
+            if old_phone == new_phone:
+                updated += 1
+                continue
+
+            # Update the display dict
+            d["phone"] = new_phone
+
+            # Update the corresponding raw ResolvedItem so the cache stays accurate
+            order_num  = d.get("order", "")
+            norm_title = d.get("norm_title", "")
+            for r in self._items:
+                if (r.order.order_number == order_num
+                        and _normalize is not None
+                        and _normalize(r.item.title) == norm_title):
+                    r.item.phone_model = new_phone
+                    break
+
+            updated += 1
+
+        # Persist the updated phone models to the cache file
+        if updated and save_cache is not None:
+            try:
+                _existing_pdfs: set = set()
+                if load_cache is not None and FILE_ORDERS_CACHE.exists():
+                    try:
+                        _, _existing_pdfs = load_cache(FILE_ORDERS_CACHE)
+                    except Exception:
+                        pass
+                save_cache(FILE_ORDERS_CACHE, self._items, _existing_pdfs)
+            except Exception as e:
+                from tkinter import messagebox
+                messagebox.showerror(
+                    "Cache save failed" if self._lang == "en" else "\u7f13\u5b58\u4fdd\u5b58\u5931\u8d25",
+                    str(e),
+                )
+                return
+
+        if updated:
+            n = len(self._selected_indices)
+            if self._lang == "en":
+                msg = (f"\u2713 Phone model updated for {updated} order{'s' if updated > 1 else ''}"
+                       if updated == n else
+                       f"\u2713 Updated {updated} / {n}")
+            else:
+                msg = f"\u2713 \u5df2\u66f4\u65b0 {updated} \u4e2a\u8ba2\u5355\u624b\u673a\u578b\u53f7"
+            self._save_status_lbl.config(text=msg)
+            self._populate_tree()
+
     # ── Hover zoom ────────────────────────────────────────────────────
 
     # ── Inline cell status-picker ─────────────────────────────────────
@@ -5826,6 +5972,24 @@ class _OrdersDashboardDialog:
         if col_n < 0 or col_n >= len(columns):
             return
         col_name = columns[col_n]
+
+        # Inline phone-model picker (Case/Grip mode only)
+        if self._mode == "casegrip" and col_name == "phone":
+            items = self._cg_items
+            try:
+                item_idx = int(iid)
+            except ValueError:
+                return
+            if item_idx < 0 or item_idx >= len(items):
+                return
+            try:
+                bbox = self._tree.bbox(iid, col_name)
+            except Exception:
+                return
+            if not bbox:
+                return
+            self._show_phone_popup(bbox, item_idx, items[item_idx])
+            return
 
         # Only act on purchase-status columns
         if self._mode == "casegrip":
@@ -6051,6 +6215,229 @@ class _OrdersDashboardDialog:
                     pass
 
 
+    # ── Inline phone-model picker ─────────────────────────────────────
+
+    _PHONE_MODEL_LIST = [
+        "iPhone 17 Pro Max", "iPhone 17 Pro", "iPhone 17 Plus", "iPhone 17",
+        "iPhone 16 Pro Max", "iPhone 16 Pro", "iPhone 16 Plus", "iPhone 16",
+        "iPhone 15 Pro Max", "iPhone 15 Pro", "iPhone 15 Plus", "iPhone 15",
+        "iPhone 14 Pro Max", "iPhone 14 Pro", "iPhone 14 Plus", "iPhone 14",
+        "iPhone 13 Pro Max", "iPhone 13 Pro", "iPhone 13 Mini", "iPhone 13",
+        "iPhone 12 Pro Max", "iPhone 12 Pro", "iPhone 12 Mini", "iPhone 12",
+        "iPhone 11 Pro Max", "iPhone 11 Pro", "iPhone 11",
+    ]
+
+    def _show_phone_popup(self, bbox: tuple, item_idx: int, d: dict) -> None:
+        """Floating card for editing the phone model of a single row.
+
+        Design mirrors the status picker: shadow shell + 1 px border card.
+        Top section: editable combobox (type or pick).
+        Lower section: scrollable list of common models for quick selection.
+        """
+        bx, by, bw, bh = bbox
+        current = d.get("phone", "")
+
+        BG         = "#ffffff"
+        BORDER     = "#e2e8f0"
+        HOV_BG     = "#f1f5f9"
+        TEXT       = "#1e293b"
+        MUTED      = "#94a3b8"
+        ACCENT     = "#3b82f6"
+        PW         = max(bw, 230)
+        ROW_H      = 30
+        PAD_X      = 10
+        MAX_ROWS   = 8          # visible rows before the listbox scrolls
+
+        # ── Shadow + card shell (same as status picker) ───────────────
+        shadow = tk.Toplevel(self._d)
+        shadow.wm_overrideredirect(True)
+        shadow.attributes("-topmost", True)
+        shadow.configure(bg="#cbd5e1")
+
+        popup = tk.Frame(shadow, bg=BORDER)
+        popup.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        card = tk.Frame(popup, bg=BG)
+        card.pack(fill=tk.BOTH, expand=True)
+
+        def _confirm(value: str, sw_: tk.Toplevel = shadow) -> None:
+            v = value.strip()
+            sw_.destroy()
+            if v:
+                self._apply_phone_from_popup(item_idx, v)
+
+        # ── Header row ────────────────────────────────────────────────
+        hdr = tk.Frame(card, bg=BG)
+        hdr.pack(fill=tk.X, padx=PAD_X, pady=(8, 4))
+        tk.Label(
+            hdr,
+            text="PHONE MODEL" if self._lang == "en" else "\u624b\u673a\u578b\u53f7",
+            font=("Segoe UI", 7, "bold"), fg=MUTED, bg=BG,
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            hdr,
+            text="\u2328  type or click" if self._lang == "en"
+            else "\u2328  \u8f93\u5165\u6216\u70b9\u51fb",
+            font=("Segoe UI", 7), fg=MUTED, bg=BG,
+        ).pack(side=tk.RIGHT)
+
+        # ── Combobox entry ────────────────────────────────────────────
+        entry_frame = tk.Frame(card, bg=BG)
+        entry_frame.pack(fill=tk.X, padx=PAD_X, pady=(0, 6))
+
+        var = tk.StringVar(value=current)
+        cb = ttk.Combobox(
+            entry_frame, textvariable=var,
+            values=self._PHONE_MODEL_LIST,
+            font=("Segoe UI", 10), width=22,
+        )
+        cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        confirm_btn = tk.Label(
+            entry_frame,
+            text="\u2713",
+            font=("Segoe UI", 11, "bold"),
+            fg="#16a34a", bg=BG, cursor="hand2",
+            padx=8,
+        )
+        confirm_btn.pack(side=tk.LEFT)
+        confirm_btn.bind("<Button-1>", lambda _e: _confirm(var.get()))
+
+        cb.bind("<Return>",   lambda _e: _confirm(var.get()))
+        cb.bind("<<ComboboxSelected>>", lambda _e: _confirm(var.get()))
+
+        # ── Thin divider ─────────────────────────────────────────────
+        tk.Frame(card, bg=BORDER, height=1).pack(fill=tk.X)
+
+        # ── Scrollable model list ─────────────────────────────────────
+        list_frame = tk.Frame(card, bg=BG)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        lb = tk.Listbox(
+            list_frame,
+            font=("Segoe UI", 9),
+            fg=TEXT, bg=BG,
+            selectbackground=ACCENT,
+            selectforeground="#ffffff",
+            activestyle="none",
+            borderwidth=0, highlightthickness=0,
+            relief=tk.FLAT,
+            height=MAX_ROWS,
+            exportselection=False,
+            cursor="hand2",
+        )
+        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        for model in self._PHONE_MODEL_LIST:
+            lb.insert(tk.END, f"  {model}")
+
+        # Pre-select and scroll to the current model
+        for i, model in enumerate(self._PHONE_MODEL_LIST):
+            if model == current:
+                lb.selection_set(i)
+                lb.see(i)
+                break
+
+        def _on_lb_select(_e=None) -> None:
+            sel = lb.curselection()
+            if sel:
+                _confirm(self._PHONE_MODEL_LIST[sel[0]])
+
+        lb.bind("<ButtonRelease-1>", _on_lb_select)
+        lb.bind("<Return>",          _on_lb_select)
+
+        # Filter list as user types in the combobox
+        def _filter(*_) -> None:
+            q = var.get().strip().lower()
+            lb.delete(0, tk.END)
+            for model in self._PHONE_MODEL_LIST:
+                if q in model.lower():
+                    lb.insert(tk.END, f"  {model}")
+
+        var.trace_add("write", _filter)
+
+        # ── Position (same logic as status picker) ────────────────────
+        shadow.update_idletasks()
+        ph  = shadow.winfo_reqheight()
+        tx  = self._tree.winfo_rootx()
+        ty  = self._tree.winfo_rooty()
+        px  = tx + bx
+        py  = ty + by + bh + 4
+
+        sw_ = shadow.winfo_screenwidth()
+        sh_ = shadow.winfo_screenheight()
+        if px + PW > sw_:
+            px = sw_ - PW - 6
+        if py + ph > sh_:
+            py = ty + by - ph - 4
+
+        shadow.geometry(f"{PW + 2}x{ph + 2}+{px}+{py}")
+        popup.place(x=0, y=0, width=PW, height=ph)
+
+        # ── Focus + dismiss on outside click ─────────────────────────
+        shadow.grab_set()
+        cb.focus_set()
+        cb.icursor(tk.END)
+
+        def _dismiss_if_outside(event: tk.Event) -> None:
+            hit = shadow.winfo_containing(event.x_root, event.y_root)
+            if hit is None or not str(hit).startswith(str(shadow)):
+                shadow.destroy()
+
+        shadow.bind("<Button-1>", _dismiss_if_outside)
+        shadow.bind("<Escape>",   lambda _: shadow.destroy())
+
+    def _apply_phone_from_popup(self, item_idx: int, new_phone: str) -> None:
+        """Persist a phone model selected via the inline cell picker."""
+        items = self._cg_items
+        if item_idx < 0 or item_idx >= len(items):
+            return
+        d = items[item_idx]
+        if d.get("phone") == new_phone:
+            return
+
+        d["phone"] = new_phone
+
+        # Sync the raw ResolvedItem so the cache is accurate
+        order_num  = d.get("order", "")
+        norm_title = d.get("norm_title", "")
+        for r in self._items:
+            if (r.order.order_number == order_num
+                    and _normalize is not None
+                    and _normalize(r.item.title) == norm_title):
+                r.item.phone_model = new_phone
+                break
+
+        # Persist to cache
+        if save_cache is not None:
+            try:
+                _existing_pdfs: set = set()
+                if load_cache is not None and FILE_ORDERS_CACHE.exists():
+                    try:
+                        _, _existing_pdfs = load_cache(FILE_ORDERS_CACHE)
+                    except Exception:
+                        pass
+                save_cache(FILE_ORDERS_CACHE, self._items, _existing_pdfs)
+            except Exception:
+                pass
+
+        # Repopulate and restore selection + scroll
+        prev_sel = set(self._tree.selection())
+        self._populate_tree()
+        iid = str(item_idx)
+        try:
+            self._tree.selection_set(iid)
+            self._tree.see(iid)
+        except Exception:
+            for s in prev_sel:
+                try:
+                    self._tree.selection_set(s)
+                except Exception:
+                    pass
+
     # ── Hover zoom ────────────────────────────────────────────────────
 
     def _on_tree_motion(self, _e: tk.Event | None = None) -> None:
@@ -6195,6 +6582,189 @@ class _OrdersDashboardDialog:
                 self._parent.after(0, _done)
 
         threading.Thread(target=_work, daemon=True).start()
+
+    # ── Open Route file picker ────────────────────────────────────────
+
+    def _open_route(self, event=None) -> None:
+        """Show a dropdown menu beneath the button listing all route file variants.
+
+        Each entry shows the file label and a faint availability hint
+        ("not generated yet") when the file does not exist on disk.  Clicking
+        a present file opens it immediately; clicking a missing file shows the
+        standard "File not found" info dialog so the user knows what to do.
+        """
+        lang = self._lang
+        missing_hint = self._parent._t("open_route_missing")
+
+        _routes: list[tuple[str, Path]] = [
+            (self._parent._t("open_route_en_detail"),  FILE_SHOPPING_ROUTE),
+            (self._parent._t("open_route_en_simple"),  FILE_SHOPPING_ROUTE_SIMPLE),
+            (self._parent._t("open_route_zh"),         FILE_SHOPPING_ROUTE_ZH),
+            (self._parent._t("open_route_html_en"),    FILE_SHOPPING_HTML),
+            (self._parent._t("open_route_html_zh"),    FILE_SHOPPING_HTML_ZH),
+        ]
+
+        menu = tk.Menu(self._d, tearoff=False,
+                       font=("Segoe UI", 10),
+                       bg="#ffffff", fg="#1e293b",
+                       activebackground=COLORS["accent"],
+                       activeforeground="#ffffff",
+                       relief=tk.FLAT, bd=0)
+
+        # Title row (disabled, acts as a visual header)
+        menu.add_command(
+            label=self._parent._t("open_route_menu_title"),
+            state=tk.DISABLED,
+            font=("Segoe UI", 9, "bold"),
+        )
+        menu.add_separator()
+
+        def _make_opener(p: Path):
+            def _open():
+                if not p.exists():
+                    from tkinter import messagebox as _mb
+                    _mb.showinfo(
+                        self._parent._t("file_missing_title"),
+                        self._parent._t("file_missing_body", path=str(p)),
+                        parent=self._d,
+                    )
+                    return
+                try:
+                    if sys.platform == "win32":
+                        os.startfile(p)
+                    elif sys.platform == "darwin":
+                        subprocess.run(["open", str(p)], check=False)
+                    else:
+                        subprocess.run(["xdg-open", str(p)], check=False)
+                except OSError as e:
+                    from tkinter import messagebox as _mb
+                    _mb.showerror(
+                        self._parent._t("file_open_fail_title"),
+                        self._parent._t("file_open_fail_body", err=e),
+                        parent=self._d,
+                    )
+            return _open
+
+        for label, path in _routes:
+            exists = path.exists()
+            display = label if exists else f"{label}  \u2014 {missing_hint}"
+            menu.add_command(
+                label=display,
+                command=_make_opener(path),
+                foreground="#1e293b" if exists else "#94a3b8",
+                activeforeground="#ffffff" if exists else "#cbd5e1",
+            )
+
+        # Position the menu flush below the button that triggered it
+        btn = self._btn_open_route
+        bx = btn.winfo_rootx()
+        by = btn.winfo_rooty() + btn.winfo_height()
+        menu.tk_popup(bx, by)
+        menu.grab_release()
+
+    # ── Delete selected orders ────────────────────────────────────────
+
+    def _delete_selected_orders(self) -> None:
+        """Remove every selected row (and its backing ResolvedItem) from the cache."""
+        from tkinter import messagebox as _mb
+
+        sel = self._tree.selection()
+        if not sel:
+            _mb.showinfo(
+                "No selection" if self._lang == "en" else "未选择",
+                "Select one or more rows to delete." if self._lang == "en"
+                else "请先选择要删除的行。",
+                parent=self._d,
+            )
+            return
+
+        items = self._cg_items if self._mode == "casegrip" else self._ch_items
+        n = len(sel)
+        label = (
+            f"Delete {n} selected order item{'s' if n != 1 else ''}?\n\n"
+            "This cannot be undone — the entries will be permanently removed from the cache."
+            if self._lang == "en" else
+            f"确认删除所选的 {n} 条订单记录？\n\n此操作无法撤销，数据将从缓存中永久删除。"
+        )
+        if not _mb.askyesno(
+            "Confirm Delete" if self._lang == "en" else "确认删除",
+            label,
+            icon="warning",
+            parent=self._d,
+        ):
+            return
+
+        # Collect (order_number, norm_title) keys to remove
+        keys_to_delete: set[tuple[str, str]] = set()
+        for iid in sel:
+            try:
+                d = items[int(iid)]
+            except (ValueError, IndexError):
+                continue
+            keys_to_delete.add((d["order"], d["norm_title"]))
+
+        if not keys_to_delete:
+            return
+
+        # Remove matching ResolvedItems from self._items
+        self._items = [
+            r for r in self._items
+            if (_normalize(r.item.title), r.order.order_number)
+            not in {(norm, order) for order, norm in keys_to_delete}
+        ]
+
+        # Persist updated cache
+        try:
+            _existing_pdfs: set[str] = set()
+            if load_cache is not None and FILE_ORDERS_CACHE.exists():
+                try:
+                    _, _existing_pdfs = load_cache(FILE_ORDERS_CACHE)
+                except Exception:
+                    _existing_pdfs = set()
+            if save_cache is not None:
+                save_cache(FILE_ORDERS_CACHE, self._items, _existing_pdfs)
+        except Exception as e:
+            _mb.showwarning(
+                "Cache warning" if self._lang == "en" else "缓存警告",
+                f"{'Items removed from view but failed to persist to cache' if self._lang == 'en' else '已从视图中移除但缓存保存失败'}:\n{e}",
+                parent=self._d,
+            )
+
+        # Persist deletion tombstone so the generator never restores these
+        # orders from the Excel safety-net or from re-processing PDFs.
+        try:
+            import json as _json
+            FILE_DELETED_ORDERS.parent.mkdir(parents=True, exist_ok=True)
+            _tomb: list[dict] = []
+            if FILE_DELETED_ORDERS.exists():
+                try:
+                    _tomb = _json.loads(
+                        FILE_DELETED_ORDERS.read_text(encoding="utf-8")
+                    ).get("deleted", [])
+                except Exception:
+                    _tomb = []
+            _tomb_set = {(e["order"], e["norm_title"]) for e in _tomb}
+            for _ord, _nt in keys_to_delete:
+                if (_ord, _nt) not in _tomb_set:
+                    _tomb.append({"order": _ord, "norm_title": _nt})
+            FILE_DELETED_ORDERS.write_text(
+                _json.dumps({"deleted": _tomb}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass  # tombstone write failure is non-fatal; cache deletion already saved
+
+        # Rebuild + refresh UI
+        self._build_item_lists()
+        self._populate_tree()
+        self._clear_detail()
+        removed_label = (
+            f"\U0001F5D1 {n} item{'s' if n != 1 else ''} deleted"
+            if self._lang == "en" else
+            f"\U0001F5D1 已删除 {n} 条记录"
+        )
+        self._save_status.config(text=removed_label, fg="#dc2626")
+        self._d.after(3000, lambda: self._save_status.config(text="", fg="#047857"))
 
     # ── Manual order add ─────────────────────────────────────────────
 
