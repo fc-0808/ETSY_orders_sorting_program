@@ -2773,7 +2773,12 @@ class App(tk.Tk):
                 return
             set_preview(row_by_iid.get(sel[0]))
 
-        filt.trace_add("write", lambda *_: refill_tree())
+        _rf_after: list[str | None] = [None]
+        def _sched_refill_disc(*_):
+            if _rf_after[0]:
+                d.after_cancel(_rf_after[0])
+            _rf_after[0] = d.after(300, refill_tree)
+        filt.trace_add("write", _sched_refill_disc)
         refill_tree()
         tree.bind("<<TreeviewSelect>>", on_tree_select)
 
@@ -3195,25 +3200,22 @@ class _OrdersDashboardDialog:
     _THUMB = 64
     _ROW_H = 74
 
-    _CG_FILTERS = ("all", "ready", "needs_info", "unmatched")
-    _CH_FILTERS = ("all", "assigned", "needs_code", "needs_shop")
+    _CG_FILTERS = ("all", "ready", "unmatched")
+    _CH_FILTERS = ("all", "assigned", "needs_shop")
 
     _FILTER_LABELS = {
-        "en": {"all": "All", "ready": "Ready", "needs_info": "Needs Info",
+        "en": {"all": "All", "ready": "Ready",
                "unmatched": "Unmatched", "assigned": "Assigned",
-               "needs_code": "Needs Code", "needs_shop": "Needs Shop"},
+               "needs_shop": "Unassigned"},
         "zh": {"all": "\u5168\u90e8", "ready": "\u5c31\u7eea",
-               "needs_info": "\u5f85\u586b\u4fe1\u606f",
                "unmatched": "\u672a\u5339\u914d", "assigned": "\u5df2\u5206\u914d",
-               "needs_code": "\u5f85\u5206\u914d\u7f16\u7801",
-               "needs_shop": "\u5f85\u5206\u914d\u5e97\u94fa"},
+               "needs_shop": "\u5f85\u5206\u914d"},
     }
 
     _FILTER_COLORS = {
         "all": ("#1F4E79", "#ffffff"), "ready": ("#047857", "#ffffff"),
-        "needs_info": ("#1e40af", "#ffffff"), "unmatched": ("#92400e", "#ffffff"),
-        "assigned": ("#5b21b6", "#ffffff"), "needs_code": ("#92400e", "#ffffff"),
-        "needs_shop": ("#1e40af", "#ffffff"),
+        "unmatched": ("#92400e", "#ffffff"),
+        "assigned": ("#5b21b6", "#ffffff"), "needs_shop": ("#92400e", "#ffffff"),
     }
 
     def __init__(
@@ -3245,6 +3247,7 @@ class _OrdersDashboardDialog:
         # Kept mutable so photo-upload updates propagate live without a restart.
         self._catalog_photos: dict[str, bytes] = dict(catalog_photos or {})
         self._tk_img_refs: list[object] = []
+        self._thumb_cache: dict[int, object] = {}
         self._hover_photo: list[object] = []
         self._hover_tip: tk.Toplevel | None = None
         self._hover_after_id: list[object | None] = [None]
@@ -3276,6 +3279,11 @@ class _OrdersDashboardDialog:
         # component = "case" | "grip" | "charm"
         # Only non-Pending values are stored (Pending is the default/omitted key).
         self._pstatuses: dict[tuple[str, str, str], str] = {}
+        # Inclusion set — (order_number, norm_title) pairs excluded from route gen.
+        # All items are included by default; only explicitly excluded keys are stored.
+        self._excl_keys: set[tuple[str, str]] = set()
+        # Selection count label reference (updated on every inclusion toggle)
+        self._sel_badge: tk.Label | None = None
         # Purchase-list button + its separator — both live inside _filter_frame
         # and must be destroyed/recreated on every mode switch to avoid duplicates.
         self._purchase_list_btn: tk.Button | None = None
@@ -3340,7 +3348,12 @@ class _OrdersDashboardDialog:
         self._filter_btns: list[tk.Button] = []
 
         self._search_var = tk.StringVar()
-        self._search_var.trace_add("write", lambda *_: self._populate_tree())
+        _pop_after: list[str | None] = [None]
+        def _sched_populate(*_):
+            if _pop_after[0]:
+                self._d.after_cancel(_pop_after[0])
+            _pop_after[0] = self._d.after(300, self._populate_tree)
+        self._search_var.trace_add("write", _sched_populate)
         se = ttk.Entry(toolbar, textvariable=self._search_var,
                        font=("Segoe UI", 10), width=30)
         se.pack(side=tk.RIGHT, padx=(0, 14), pady=6)
@@ -3405,17 +3418,13 @@ class _OrdersDashboardDialog:
         # Tag colors
         for tag, bg, fg in [
             ("ready",              "#d1fae5", "#065f46"),
-            ("needs_info",         "#dbeafe", "#1e3a8a"),
             ("unmatched",          "#fef3c7", "#78350f"),
             ("assigned",           "#ede9fe", "#4c1d95"),
-            ("needs_code",         "#fef3c7", "#78350f"),
-            ("needs_shop",         "#dbeafe", "#1e3a8a"),
+            ("needs_shop",         "#fef3c7", "#78350f"),
             ("alt_ready",          "#ecfdf5", "#065f46"),
-            ("alt_needs_info",     "#eff6ff", "#1e3a8a"),
             ("alt_unmatched",      "#fffbeb", "#78350f"),
             ("alt_assigned",       "#f5f3ff", "#4c1d95"),
-            ("alt_needs_code",     "#fffbeb", "#78350f"),
-            ("alt_needs_shop",     "#eff6ff", "#1e3a8a"),
+            ("alt_needs_shop",     "#fffbeb", "#78350f"),
             # Purchase-status override tags (same palette as the route Excel)
             ("ps_purchased",       "#c6efce", "#276221"),
             ("ps_oos",             "#ffeb9c", "#7d4e00"),
@@ -3425,6 +3434,9 @@ class _OrdersDashboardDialog:
             ("alt_ps_oop",         "#ffe4e8", "#9c0006"),
         ]:
             self._tree.tag_configure(tag, background=bg, foreground=fg)
+        # Excluded-from-route tag: grey foreground overlaid on status background.
+        # Applied as a SECOND tag so the status background is preserved.
+        self._tree.tag_configure("excluded", foreground="#b0b8c8")
 
         # ── Detail panel (right) — FIXED 330px, never resizes ────────
         panel_outer = tk.Frame(body, width=330, bg=COLORS["card"],
@@ -3468,12 +3480,24 @@ class _OrdersDashboardDialog:
         )
         self._detail_meta.pack(fill=tk.X, padx=10, pady=(0, 2))
 
+        # Notes display — click anywhere on it to open the inline note editor
+        # via a synthetic popup anchored to the selected tree row.
         self._detail_notes = tk.Label(
             self._order_info_frame, text="", font=("Segoe UI", 8, "italic"),
             fg="#7c3aed", bg="#f8faff", anchor=tk.W,
-            wraplength=296, justify=tk.LEFT,
+            wraplength=280, justify=tk.LEFT,
+            cursor="hand2",
         )
-        self._detail_notes.pack(fill=tk.X, padx=10, pady=(0, 8))
+        self._detail_notes.pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        # "Edit note" affordance — appears as a faint hint under the note text
+        self._detail_notes_edit_btn = tk.Label(
+            self._order_info_frame,
+            text="",   # filled in dynamically by _on_select
+            font=("Segoe UI", 7), fg="#a78bfa", bg="#f8faff",
+            anchor=tk.W, cursor="hand2",
+        )
+        self._detail_notes_edit_btn.pack(fill=tk.X, padx=10, pady=(0, 6))
 
         # ── Photo preview + upload (shown only for single-selection) ──────
         self._detail_photo_frame = tk.Frame(self._order_info_frame, bg="#f8faff")
@@ -3562,6 +3586,53 @@ class _OrdersDashboardDialog:
             command=self._delete_selected_orders,
         )
         self._btn_delete.pack(side=tk.LEFT, padx=(10, 0))
+
+        # ── Inclusion controls (route order selection) ─────────────────
+        _incl_sep = tk.Frame(foot, bg=COLORS["border"], width=1, highlightthickness=0)
+        _incl_sep.pack(side=tk.LEFT, fill=tk.Y, padx=(12, 10), pady=3)
+
+        # Compact pill-group: [☑ All] [☐ None] — shares a 1 px border frame
+        _incl_group = tk.Frame(
+            foot,
+            bg="#e0e7ff",
+            highlightthickness=1, highlightbackground="#a5b4fc",
+        )
+        _incl_group.pack(side=tk.LEFT, pady=3)
+
+        _btn_all = tk.Button(
+            _incl_group,
+            text="\u2611  All" if self._lang == "en" else "\u2611  \u5168\u9009",
+            font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT, bd=0, padx=10, pady=3,
+            cursor="hand2",
+            bg="#e0e7ff", fg="#3730a3",
+            activebackground="#c7d2fe", activeforeground="#1e1b4b",
+            command=lambda: self._set_all_incl(True),
+        )
+        _btn_all.pack(side=tk.LEFT)
+
+        _grp_div = tk.Frame(_incl_group, bg="#a5b4fc", width=1)
+        _grp_div.pack(side=tk.LEFT, fill=tk.Y, pady=3)
+
+        _btn_none = tk.Button(
+            _incl_group,
+            text="\u2610  None" if self._lang == "en" else "\u2610  \u5168\u4e0d\u9009",
+            font=("Segoe UI", 9),
+            relief=tk.FLAT, bd=0, padx=10, pady=3,
+            cursor="hand2",
+            bg="#e0e7ff", fg="#4338ca",
+            activebackground="#c7d2fe", activeforeground="#1e1b4b",
+            command=lambda: self._set_all_incl(False),
+        )
+        _btn_none.pack(side=tk.LEFT)
+
+        # Selection badge — shown as "● 9 / 14" pill when not all selected
+        self._sel_badge = tk.Label(
+            foot, text="", font=("Segoe UI", 9, "bold"),
+            fg="#4f46e5", bg=COLORS["app"],
+        )
+        self._sel_badge.pack(side=tk.LEFT, padx=(10, 0))
+
         self._save_status = tk.Label(foot, text="", font=("Segoe UI", 10, "bold"),
                                      fg="#047857", bg=COLORS["app"])
         self._save_status.pack(side=tk.LEFT, padx=(16, 0))
@@ -3571,6 +3642,7 @@ class _OrdersDashboardDialog:
         self._load_pstatuses_cache()
 
         self._set_mode("casegrip")
+        self._update_selection_badge()
         d.protocol("WM_DELETE_WINDOW", d.destroy)
 
         # ── Keyboard shortcuts ─────────────────────────────────────────
@@ -3635,10 +3707,6 @@ class _OrdersDashboardDialog:
             if has_case or has_grip:
                 if has_loc:
                     st = "ready"
-                elif sup is not None:
-                    # Matched a catalog entry but supplier/stall not filled yet —
-                    # open supplier_catalog.xlsx and fill in Shop Name + Stall.
-                    st = "needs_info"
                 else:
                     st = "unmatched"
                 cg.append({**base, "supplier": shop, "stall": stall,
@@ -3649,11 +3717,8 @@ class _OrdersDashboardDialog:
                 if c_code and c_shop:
                     cst = "assigned"
                 elif not c_code:
-                    # No charm code yet — this is always the first gap to fill:
-                    # you must know which specific charm before assigning a shop.
-                    cst = "needs_code"
+                    cst = "needs_shop"
                 else:
-                    # Code is known; still needs a shop to buy it from.
                     cst = "needs_shop"
                 # Stall comes from the Charm Shops tab, not the product supplier
                 charm_stall = self._charm_shop_stalls.get(c_shop, "") if c_shop else ""
@@ -3668,6 +3733,10 @@ class _OrdersDashboardDialog:
     def _thumb(self, raw: bytes | None) -> object | None:
         if not self._pil_ok or not raw or Image is None or ImageTk is None:
             return None
+        key = hash(raw)
+        cached = self._thumb_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             im = Image.open(BytesIO(raw))
             if im.mode not in ("RGB", "RGBA"):
@@ -3678,7 +3747,7 @@ class _OrdersDashboardDialog:
                 im = bg
             im.thumbnail((self._THUMB, self._THUMB), Image.Resampling.LANCZOS)
             ph = ImageTk.PhotoImage(im)
-            self._tk_img_refs.append(ph)
+            self._thumb_cache[key] = ph
             return ph
         except Exception:
             return None
@@ -3776,6 +3845,7 @@ class _OrdersDashboardDialog:
         self._build_mode_panel()   # builds the always-visible charm gallery or CG form
         self._update_filter_styles()
         self._populate_tree()
+        self._update_selection_badge()
         self._clear_detail()
 
     def _set_filter(self, fid: str) -> None:
@@ -3863,8 +3933,12 @@ class _OrdersDashboardDialog:
                 tree.heading(col, text=label, anchor=anchor)
 
         if self._mode == "casegrip":
-            tree["columns"] = ("seq", "order", "product", "etsy_shop", "supplier", "stall",
+            tree["columns"] = ("incl", "seq", "order", "product", "etsy_shop", "supplier", "stall",
                                "case", "grip", "phone", "qty", "status", "notes")
+            # "incl" heading is clickable: toggles all items between included/excluded
+            tree.heading("incl", text="\u2611", anchor=tk.CENTER,
+                         command=self._toggle_all_incl)
+            self._col_base_labels["incl"] = "\u2611"
             _hdr("seq",       "#",             anchor=tk.CENTER, sortable=False)
             _hdr("order",     "Order #",       anchor=tk.CENTER, sortable=True)
             _hdr("product",   "Product",       sortable=True)
@@ -3878,6 +3952,7 @@ class _OrdersDashboardDialog:
             _hdr("qty",       "Qty",           anchor=tk.CENTER, sortable=False)
             _hdr("status",    "Match",         anchor=tk.CENTER, sortable=True)
             _hdr("notes",     "Private Notes", sortable=True)
+            tree.column("incl",      width=28,  minwidth=28,  anchor=tk.CENTER, stretch=False)
             tree.column("seq",       width=32,  minwidth=26,  anchor=tk.CENTER, stretch=False)
             tree.column("order",     width=95,  minwidth=80,  anchor=tk.CENTER, stretch=False)
             tree.column("product",   width=200, minwidth=120, stretch=True)
@@ -3891,8 +3966,11 @@ class _OrdersDashboardDialog:
             tree.column("status",    width=72,  minwidth=50,  anchor=tk.CENTER, stretch=False)
             tree.column("notes",     width=160, minwidth=80,  stretch=False)
         else:
-            tree["columns"] = ("seq", "order", "product", "etsy_shop", "charm_code", "charm_shop",
-                               "stall", "qty", "status", "buy_status", "notes")
+            tree["columns"] = ("incl", "seq", "order", "product", "etsy_shop", "charm_code",
+                               "charm_shop", "stall", "qty", "status", "buy_status", "notes")
+            tree.heading("incl", text="\u2611", anchor=tk.CENTER,
+                         command=self._toggle_all_incl)
+            self._col_base_labels["incl"] = "\u2611"
             _hdr("seq",        "#",             anchor=tk.CENTER, sortable=False)
             _hdr("order",      "Order #",       anchor=tk.CENTER, sortable=True)
             _hdr("product",    "Product",       sortable=True)
@@ -3905,6 +3983,7 @@ class _OrdersDashboardDialog:
             # Charm purchase status column
             _hdr("buy_status", "Buy Status",    anchor=tk.CENTER, sortable=True)
             _hdr("notes",      "Private Notes", sortable=True)
+            tree.column("incl",       width=28,  minwidth=28,  anchor=tk.CENTER, stretch=False)
             tree.column("seq",        width=32,  minwidth=26,  anchor=tk.CENTER, stretch=False)
             tree.column("order",      width=95,  minwidth=80,  anchor=tk.CENTER, stretch=False)
             tree.column("product",    width=200, minwidth=120, stretch=True)
@@ -4202,7 +4281,12 @@ class _OrdersDashboardDialog:
         filter_row.columnconfigure(0, weight=1)
 
         self._charm_filter_var = tk.StringVar()
-        self._charm_filter_var.trace_add("write", lambda *_: self._layout_charm_tiles())
+        _cf_after: list[str | None] = [None]
+        def _sched_layout(*_):
+            if _cf_after[0]:
+                self._d.after_cancel(_cf_after[0])
+            _cf_after[0] = self._d.after(200, self._layout_charm_tiles)
+        self._charm_filter_var.trace_add("write", _sched_layout)
         filter_entry = ttk.Entry(filter_row, textvariable=self._charm_filter_var,
                                  font=("Segoe UI", 9))
         filter_entry.grid(row=0, column=0, sticky="ew")
@@ -4678,7 +4762,7 @@ class _OrdersDashboardDialog:
                                      charm_code="", charm_shop="")
             d["charm_code"] = ""
             d["charm_shop"] = ""
-            d["status"] = "needs_code"
+            d["status"] = "needs_shop"
             self._selected_charm_code = ""
             self._highlight_charm_tile("")
             if "shop_var" in self._edit_widgets:
@@ -4980,7 +5064,6 @@ class _OrdersDashboardDialog:
     def _populate_tree(self) -> None:
         tree = self._tree
         tree.delete(*tree.get_children())
-        self._tk_img_refs.clear()
 
         items = self._cg_items if self._mode == "casegrip" else self._ch_items
         filt   = self._active_filter
@@ -5054,6 +5137,12 @@ class _OrdersDashboardDialog:
             raw_notes = (d.get("private_notes") or "").strip()
             notes_short = (raw_notes[:38] + "\u2026") if len(raw_notes) > 40 else raw_notes
 
+            # Inclusion indicator (☑ included / ☐ excluded from route generation)
+            _item_key = (d.get("order", ""), d.get("norm_title", ""))
+            _excluded = _item_key in self._excl_keys
+            incl_cell = "\u2610" if _excluded else "\u2611"
+            row_tags = (tag, "excluded") if _excluded else (tag,)
+
             # Compute per-component purchase status display text.
             # Use [:50] to match the key format used by generate_shopping_route.py.
             _order  = d.get("order", "")
@@ -5072,7 +5161,7 @@ class _OrdersDashboardDialog:
                     grip_cell = _pd.get(_gs, _gs)
                 else:
                     grip_cell = "\u2014"
-                vals = (seq, f"#{d['order']}", title_short,
+                vals = (incl_cell, seq, f"#{d['order']}", title_short,
                         d.get("etsy_shop") or "\u2014",
                         d["supplier"] or "\u2014", d["stall"] or "\u2014",
                         case_cell, grip_cell, d["phone"],
@@ -5080,13 +5169,13 @@ class _OrdersDashboardDialog:
             else:
                 _chps = self._pstatuses.get((_order, _norm, "charm"), "Pending")
                 charm_buy_cell = _pd.get(_chps, _chps)
-                vals = (seq, f"#{d['order']}", title_short,
+                vals = (incl_cell, seq, f"#{d['order']}", title_short,
                         d.get("etsy_shop") or "\u2014",
                         d.get("charm_code") or "\u2014",
                         d.get("charm_shop") or "\u2014",
                         d.get("stall") or "\u2014",
                         d["qty"], st_text, charm_buy_cell, notes_short)
-            tree.insert("", tk.END, iid=str(orig_idx), values=vals, tags=(tag,), **kw)
+            tree.insert("", tk.END, iid=str(orig_idx), values=vals, tags=row_tags, **kw)
 
         # Update column heading sort indicators
         self._refresh_sort_indicators()
@@ -5142,6 +5231,7 @@ class _OrdersDashboardDialog:
                     text=f"\u603b\u6570\u91cf: {total_qty}  \u2022  Ctrl/Shift \u70b9\u51fb\u6dfb\u52a0\u9009\u62e9"
                 )
             self._detail_notes.config(text="")
+            self._detail_notes_edit_btn.config(text="")
             # Hide photo frame for multi-select
             self._detail_photo_frame.pack_forget()
         else:
@@ -5157,7 +5247,25 @@ class _OrdersDashboardDialog:
                 parts.append(d["etsy_shop"])
             self._detail_meta.config(text="  \u2022  ".join(parts))
             notes = d.get("private_notes", "")
-            self._detail_notes.config(text=f"\U0001F4CB {notes}" if notes else "")
+            self._detail_notes.config(text=f"\U0001F4CB  {notes}" if notes else "")
+            edit_hint = (
+                "\u270e  Edit note" if self._lang == "en" else "\u270e  \u7f16\u8f91\u5907\u6ce8"
+            )
+            self._detail_notes_edit_btn.config(text=edit_hint)
+
+            # Wire panel-note label + edit hint to open the inline editor
+            # anchored to the "notes" column cell of the selected row.
+            _primary_iid = str(indices[-1])
+            def _open_note_editor_from_panel(_event=None, _iid=_primary_iid,
+                                              _idx=indices[-1], _d=d) -> None:
+                try:
+                    bbox = self._tree.bbox(_iid, "notes")
+                except Exception:
+                    bbox = None
+                if bbox:
+                    self._show_notes_popup(bbox, _idx, _d)
+            self._detail_notes.bind("<Button-1>", _open_note_editor_from_panel)
+            self._detail_notes_edit_btn.bind("<Button-1>", _open_note_editor_from_panel)
 
             # ── Photo preview ──────────────────────────────────────────
             self._upload_photo_status.config(text="")
@@ -5231,6 +5339,7 @@ class _OrdersDashboardDialog:
         self._detail_title.config(text="")
         self._detail_meta.config(text="")
         self._detail_notes.config(text="")
+        self._detail_notes_edit_btn.config(text="")
         self._save_status_lbl.config(text="")
         # Clear photo preview
         self._detail_photo_frame.pack_forget()
@@ -5750,12 +5859,7 @@ class _OrdersDashboardDialog:
             return
         items = self._cg_items if self._mode == "casegrip" else self._ch_items
 
-        # Always refresh the row mapping before writing so stale row numbers
-        # (from catalog sorts / rebuilds that happened since the dashboard opened)
-        # never reach update_product_map_cells.
-        self._refresh_title_to_row()
-
-        # ── Resolve what to write ──────────────────────────────────────
+        # ── Resolve what to write (all in-memory, instant) ────────────
         if self._mode == "casegrip":
             new_sup   = self._edit_widgets["sup_var"].get().strip()
             new_stall = self._edit_widgets["stall_var"].get().strip()
@@ -5773,15 +5877,9 @@ class _OrdersDashboardDialog:
                 )
                 return
             # ── Enforce canonical shop (1:1 rule) ─────────────────────
-            # A charm code must always map to the same shop.  Override
-            # whatever is in the dropdown with the established canonical
-            # shop so this invariant can never be violated from the UI.
             _canonical = self._canonical_charm_shop(new_code)
             if _canonical:
                 if new_shop and new_shop != _canonical:
-                    # Silently correct the mismatch — the tile-click handler
-                    # should have already set the right shop, but guard here
-                    # as a second line of defence.
                     new_shop = _canonical
                     sv = self._edit_widgets.get("shop_var")
                     if sv:
@@ -5792,90 +5890,154 @@ class _OrdersDashboardDialog:
                     if sv:
                         sv.set(new_shop)
 
-        # ── Batch loop — write every selected row ──────────────────────
-        skipped: list[str] = []
-        saved_count = 0
-        errors: list[str] = []
+        # ── Optimistic in-memory update + immediate UI refresh ─────────
+        # Update in-memory data and repaint the tree right away so the UI
+        # feels instant.  The actual Excel writes happen on a background
+        # thread; if they fail we show an error but keep the in-memory state
+        # (user can retry without data loss).
+        indices_snapshot = list(self._selected_indices)
+        mode_snapshot    = self._mode
+        save_tasks: list[tuple[int, dict, int]] = []   # (idx, d, row_num)
+        skipped_titles: list[str] = []
 
-        for idx in self._selected_indices:
+        # Use existing (potentially slightly stale) mapping for the immediate
+        # in-memory update.  Background thread will refresh before writing.
+        for idx in indices_snapshot:
             if idx < 0 or idx >= len(items):
                 continue
             d = items[idx]
             row_num = self._row_num_for_item(d)
             if row_num is None:
-                skipped.append(d["title"][:40])
+                skipped_titles.append(d["title"][:40])
                 continue
-            try:
-                if self._mode == "casegrip":
-                    update_product_map_cells(
-                        FILE_SUPPLIER_CATALOG, row_num,
-                        shop_name=new_sup, stall=new_stall,
-                    )
-                    d["supplier"] = new_sup
-                    d["stall"]    = new_stall
-                    d["status"]   = "ready" if (new_sup or new_stall) else d["status"]
-                else:
-                    update_product_map_cells(
-                        FILE_SUPPLIER_CATALOG, row_num,
-                        charm_code=new_code, charm_shop=new_shop,
-                    )
-                    d["charm_code"] = new_code
-                    d["charm_shop"] = new_shop
-                    if new_code and new_shop:
-                        d["status"] = "assigned"
-                    elif not new_code:
-                        d["status"] = "needs_code"
-                    else:
-                        d["status"] = "needs_shop"
-                saved_count += 1
-            except Exception as e:
-                errors.append(str(e))
-
-        # ── Feedback ───────────────────────────────────────────────────
-        if errors:
-            from tkinter import messagebox
-            messagebox.showerror(
-                "Batch save — errors",
-                f"{saved_count} saved, {len(errors)} failed:\n" + "\n".join(errors[:5]),
-            )
-        elif skipped:
-            from tkinter import messagebox
-            messagebox.showwarning(
-                "Batch save — not found",
-                f"{saved_count} saved.\n"
-                f"{len(skipped)} product(s) not in catalog:\n" + "\n".join(skipped[:5]),
-            )
-
-        if saved_count:
-            n = len(self._selected_indices)
-            if self._lang == "en":
-                msg = (f"\u2713 Saved {saved_count} order{'s' if n > 1 else ''}"
-                       if saved_count == n else
-                       f"\u2713 Saved {saved_count} / {n}")
+            save_tasks.append((idx, d, row_num))
+            if mode_snapshot == "casegrip":
+                d["supplier"] = new_sup
+                d["stall"]    = new_stall
+                d["status"]   = "ready" if (new_sup or new_stall) else d["status"]
             else:
-                msg = f"\u2713 \u5df2\u4fdd\u5b58 {saved_count} \u4e2a\u8ba2\u5355"
-            self._save_status_lbl.config(text=msg)
+                d["charm_code"] = new_code
+                d["charm_shop"] = new_shop
+                d["status"] = "assigned" if (new_code and new_shop) else "needs_shop"
 
-            # After a successful charm save, run the catalog normaliser so that
-            # any sibling product-map rows sharing the same charm code are also
-            # corrected to use the canonical shop — enforcing 1:1 consistency
-            # on disk without the user having to do anything extra.
-            if self._mode == "charms" and normalize_catalog_charm_shops is not None:
+        # Immediate visual feedback
+        save_btn = self._edit_widgets.get("save_btn")
+        if save_btn:
+            save_btn.config(state=tk.DISABLED)
+        self._save_status_lbl.config(
+            text="\u29d7 Saving\u2026" if self._lang == "en" else "\u29d7 \u4fdd\u5b58\u4e2d\u2026"
+        )
+        self._populate_tree()
+
+        n_total = len(save_tasks)
+
+        def _bg_save() -> None:
+            # Refresh row mapping in background (keeps it current with any
+            # external catalog changes without blocking the main thread).
+            fresh_map: dict[str, int] = dict(self._title_to_row)
+            if list_product_map_rows_for_picker is not None and FILE_SUPPLIER_CATALOG.exists():
+                try:
+                    m: dict[str, int] = {}
+                    for pr in list_product_map_rows_for_picker(FILE_SUPPLIER_CATALOG):
+                        fk = _normalize(pr.title)
+                        m[fk] = pr.row_num
+                        m[fk[:50]] = pr.row_num
+                    fresh_map = m
+                except Exception:
+                    pass
+
+            def _get_row(d_: dict) -> int | None:
+                row = fresh_map.get(d_["norm_title"])
+                if row is not None:
+                    return row
+                short = d_["norm_title"][:50]
+                row = fresh_map.get(short)
+                if row is not None:
+                    return row
+                for key, r in fresh_map.items():
+                    if key.startswith(d_["norm_title"]) or d_["norm_title"].startswith(key):
+                        return r
+                return None
+
+            saved_count = 0
+            errors: list[str] = []
+            for idx, d, _old_row in save_tasks:
+                row_num = _get_row(d)
+                if row_num is None:
+                    errors.append(f"Row not found: {d['title'][:40]}")
+                    continue
+                try:
+                    if mode_snapshot == "casegrip":
+                        update_product_map_cells(
+                            FILE_SUPPLIER_CATALOG, row_num,
+                            shop_name=new_sup, stall=new_stall,
+                        )
+                    else:
+                        update_product_map_cells(
+                            FILE_SUPPLIER_CATALOG, row_num,
+                            charm_code=new_code, charm_shop=new_shop,
+                        )
+                    saved_count += 1
+                except Exception as e:
+                    errors.append(str(e))
+
+            # Charm normalisation (best-effort, background)
+            if mode_snapshot == "charms" and not errors and normalize_catalog_charm_shops is not None:
                 try:
                     normalize_catalog_charm_shops(FILE_SUPPLIER_CATALOG)
                 except Exception:
-                    pass   # normalisation is best-effort; never block the UI
+                    pass
 
-            # Auto-refresh the Purchase List popup so the updated quantities
-            # are visible immediately, without the user clicking Refresh.
-            if (self._mode == "charms"
-                    and self._summary_win
-                    and self._summary_win.winfo_exists()):
-                self._summary_win.destroy()
-                self._summary_win = None
-                self._show_charm_purchase_summary()
+            self._d.after(0, lambda sc=saved_count, er=errors, fm=fresh_map:
+                          _on_done(sc, er, fm))
 
-            self._populate_tree()
+        def _on_done(saved_count: int, errors: list, fresh_map: dict) -> None:
+            # Re-enable save button
+            if save_btn:
+                save_btn.config(state=tk.NORMAL)
+
+            # Absorb the refreshed row mapping
+            self._title_to_row = fresh_map
+
+            if errors:
+                from tkinter import messagebox
+                messagebox.showerror(
+                    "Batch save — errors",
+                    f"{saved_count} saved, {len(errors)} failed:\n" + "\n".join(errors[:5]),
+                )
+            elif skipped_titles:
+                from tkinter import messagebox
+                messagebox.showwarning(
+                    "Batch save — not found",
+                    f"{saved_count} saved.\n"
+                    f"{len(skipped_titles)} product(s) not in catalog:\n"
+                    + "\n".join(skipped_titles[:5]),
+                )
+
+            if saved_count:
+                if self._lang == "en":
+                    status_msg = (
+                        f"\u2713 Saved {saved_count} order{'s' if n_total > 1 else ''}"
+                        if saved_count == n_total else
+                        f"\u2713 Saved {saved_count} / {n_total}"
+                    )
+                else:
+                    status_msg = f"\u2713 \u5df2\u4fdd\u5b58 {saved_count} \u4e2a\u8ba2\u5355"
+                self._save_status_lbl.config(text=status_msg)
+
+                # Auto-refresh the Purchase List popup after a charm save.
+                if (mode_snapshot == "charms"
+                        and self._summary_win
+                        and self._summary_win.winfo_exists()):
+                    self._summary_win.destroy()
+                    self._summary_win = None
+                    self._show_charm_purchase_summary()
+
+                self._populate_tree()
+            else:
+                self._save_status_lbl.config(text="")
+
+        threading.Thread(target=_bg_save, daemon=True).start()
 
     def _save_phone(self) -> None:
         """Save the phone model edit to the in-memory items and the order cache."""
@@ -5973,15 +6135,45 @@ class _OrdersDashboardDialog:
             return
         col_name = columns[col_n]
 
+        items = self._cg_items if self._mode == "casegrip" else self._ch_items
+        try:
+            item_idx = int(iid)
+        except ValueError:
+            return
+        if item_idx < 0 or item_idx >= len(items):
+            return
+
+        # Toggle route-inclusion checkbox
+        if col_name == "incl":
+            d = items[item_idx]
+            key = (d.get("order", ""), d.get("norm_title", ""))
+            if key in self._excl_keys:
+                self._excl_keys.discard(key)
+            else:
+                self._excl_keys.add(key)
+            prev_sel = set(self._tree.selection())
+            self._populate_tree()
+            self._update_selection_badge()
+            for s in prev_sel:
+                try:
+                    self._tree.selection_set(s)
+                except Exception:
+                    pass
+            return
+
+        # Private notes inline editor
+        if col_name == "notes":
+            try:
+                bbox = self._tree.bbox(iid, col_name)
+            except Exception:
+                return
+            if not bbox:
+                return
+            self._show_notes_popup(bbox, item_idx, items[item_idx])
+            return
+
         # Inline phone-model picker (Case/Grip mode only)
         if self._mode == "casegrip" and col_name == "phone":
-            items = self._cg_items
-            try:
-                item_idx = int(iid)
-            except ValueError:
-                return
-            if item_idx < 0 or item_idx >= len(items):
-                return
             try:
                 bbox = self._tree.bbox(iid, col_name)
             except Exception:
@@ -6000,13 +6192,6 @@ class _OrdersDashboardDialog:
         if comp is None:
             return
 
-        items = self._cg_items if self._mode == "casegrip" else self._ch_items
-        try:
-            item_idx = int(iid)
-        except ValueError:
-            return
-        if item_idx < 0 or item_idx >= len(items):
-            return
         d = items[item_idx]
 
         # Skip N/A cells (component absent from this order)
@@ -6024,6 +6209,330 @@ class _OrdersDashboardDialog:
             return      # row may be scrolled out of view
 
         self._show_status_popup(bbox, item_idx, comp, d)
+
+    # ── Inclusion helpers ─────────────────────────────────────────────
+
+    def _update_selection_badge(self) -> None:
+        """Refresh the footer badge showing how many items are included."""
+        if self._sel_badge is None:
+            return
+        all_items = self._cg_items + self._ch_items
+        # Count unique (order, norm_title) pairs
+        all_keys: set[tuple[str, str]] = {
+            (d.get("order", ""), d.get("norm_title", "")) for d in all_items
+        }
+        total = len(all_keys)
+        excl  = len(self._excl_keys & all_keys)
+        incl  = total - excl
+        if excl == 0:
+            self._sel_badge.config(text="", fg="#4f46e5")
+            self._regen_btn.config(
+                text="Regenerate Shopping Route" if self._lang == "en"
+                else "\u91cd\u65b0\u751f\u6210\u91c7\u8d2d\u6e05\u5355"
+            )
+        else:
+            badge_txt = (
+                f"\u25cf  {incl} / {total}  orders in route"
+                if self._lang == "en" else
+                f"\u25cf  {incl} / {total}  \u4e2a\u8ba2\u5355\u5165\u8def\u7ebf"
+            )
+            self._sel_badge.config(text=badge_txt, fg="#4f46e5")
+            regen_txt = (
+                f"Regenerate  ({incl} orders)"
+                if self._lang == "en" else
+                f"\u91cd\u65b0\u751f\u6210\uff08{incl} \u4e2a\uff09"
+            )
+            self._regen_btn.config(text=regen_txt)
+
+    def _set_all_incl(self, include: bool) -> None:
+        """Include or exclude every item across both modes."""
+        if include:
+            self._excl_keys.clear()
+        else:
+            all_items = self._cg_items + self._ch_items
+            for d in all_items:
+                key = (d.get("order", ""), d.get("norm_title", ""))
+                self._excl_keys.add(key)
+        self._populate_tree()
+        self._update_selection_badge()
+
+    def _toggle_all_incl(self) -> None:
+        """Column-header click: select all if any are excluded, else deselect all."""
+        all_items = self._cg_items + self._ch_items
+        all_keys: set[tuple[str, str]] = {
+            (d.get("order", ""), d.get("norm_title", "")) for d in all_items
+        }
+        has_excl = bool(self._excl_keys & all_keys)
+        self._set_all_incl(not has_excl)
+
+    # ── Private-notes inline editor ───────────────────────────────────
+
+    def _show_notes_popup(self, bbox: tuple, item_idx: int, d: dict) -> None:
+        """Floating multi-line editor for the Private Notes cell.
+
+        Design mirrors the status/phone pickers: shadow shell + 1 px border card.
+        Ctrl+Enter saves; Escape dismisses without saving.
+        A dedicated Clear button removes the note entirely.
+        """
+        bx, by, bw, bh = bbox
+        current = (d.get("private_notes") or "").strip()
+
+        # ── Design tokens ─────────────────────────────────────────────
+        BG          = "#ffffff"
+        BG_HEADER   = "#faf5ff"   # faint purple wash for the header strip
+        BORDER      = "#e9d5ff"   # soft purple border
+        BORDER_MID  = "#ede9fe"
+        ACCENT      = "#7c3aed"
+        ACCENT_DARK = "#6d28d9"
+        TEXT        = "#1e1b4b"
+        TEXT_AREA   = "#374151"
+        MUTED       = "#9ca3af"
+        CLEAR_BG    = "#f9fafb"
+        CLEAR_FG    = "#6b7280"
+        PW          = max(bw, 340)
+
+        # ── Shadow shell ──────────────────────────────────────────────
+        shadow = tk.Toplevel(self._d)
+        shadow.wm_overrideredirect(True)
+        shadow.attributes("-topmost", True)
+        shadow.configure(bg="#c4b5fd")   # purple-tinted shadow
+
+        card = tk.Frame(shadow, bg=BORDER, highlightthickness=0)
+        card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        # ── Purple accent bar at top ──────────────────────────────────
+        accent_bar = tk.Frame(card, bg=ACCENT, height=3)
+        accent_bar.pack(fill=tk.X)
+
+        # ── Header strip ─────────────────────────────────────────────
+        hdr = tk.Frame(card, bg=BG_HEADER)
+        hdr.pack(fill=tk.X)
+
+        tk.Label(
+            hdr,
+            text="\U0001F4CB  " + ("Private Note" if self._lang == "en" else "\u79c1\u4fe1\u5907\u6ce8"),
+            font=("Segoe UI", 9, "bold"),
+            fg=ACCENT, bg=BG_HEADER,
+        ).pack(side=tk.LEFT, padx=12, pady=(7, 6))
+
+        kbd_lbl = tk.Label(
+            hdr,
+            text="Ctrl+\u23ce save  \u2022  Esc cancel" if self._lang == "en"
+            else "Ctrl+\u23ce \u4fdd\u5b58  \u2022  Esc \u53d6\u6d88",
+            font=("Segoe UI", 7),
+            fg=MUTED, bg=BG_HEADER,
+        )
+        kbd_lbl.pack(side=tk.RIGHT, padx=12)
+
+        # ── Thin divider ─────────────────────────────────────────────
+        tk.Frame(card, bg=BORDER_MID, height=1).pack(fill=tk.X)
+
+        # ── Text area wrapper (gives the inset-shadow feel) ───────────
+        ta_wrap = tk.Frame(card, bg=BG, padx=12, pady=10)
+        ta_wrap.pack(fill=tk.X)
+
+        ta_border = tk.Frame(
+            ta_wrap, bg=BORDER,
+            highlightthickness=0,
+        )
+        ta_border.pack(fill=tk.X)
+
+        txt = tk.Text(
+            ta_border,
+            height=5, wrap=tk.WORD,
+            font=("Segoe UI", 10),
+            fg=TEXT_AREA, bg=BG,
+            insertbackground=ACCENT,
+            relief=tk.FLAT, bd=0,
+            highlightthickness=0,
+            padx=9, pady=7,
+        )
+        vsb = ttk.Scrollbar(ta_border, orient=tk.VERTICAL, command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        if current:
+            txt.insert("1.0", current)
+            txt.mark_set(tk.INSERT, tk.END)
+
+        # Live focus ring on the textarea border
+        def _on_focus_in(_e=None):
+            ta_border.configure(bg=ACCENT)
+        def _on_focus_out(_e=None):
+            ta_border.configure(bg=BORDER)
+        txt.bind("<FocusIn>",  _on_focus_in)
+        txt.bind("<FocusOut>", _on_focus_out)
+
+        # ── Divider before buttons ────────────────────────────────────
+        tk.Frame(card, bg=BORDER_MID, height=1).pack(fill=tk.X)
+
+        # ── Button row ────────────────────────────────────────────────
+        btn_row = tk.Frame(card, bg=BG)
+        btn_row.pack(fill=tk.X, padx=12, pady=8)
+
+        def _save(_e=None) -> None:
+            value = txt.get("1.0", tk.END).strip()
+            shadow.destroy()
+            self._apply_notes_from_popup(item_idx, value)
+
+        def _clear_note(_e=None) -> None:
+            shadow.destroy()
+            self._apply_notes_from_popup(item_idx, "")
+
+        def _cancel(_e=None) -> None:
+            shadow.destroy()
+
+        # Save — filled accent button
+        save_btn = tk.Button(
+            btn_row,
+            text="\u2713  " + ("Save" if self._lang == "en" else "\u4fdd\u5b58"),
+            font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT, bd=0, padx=14, pady=5,
+            cursor="hand2",
+            bg=ACCENT, fg="#ffffff",
+            activebackground=ACCENT_DARK, activeforeground="#ffffff",
+            command=_save,
+        )
+        save_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        # Clear — subtle outlined style
+        clear_btn = tk.Button(
+            btn_row,
+            text="\u2715  " + ("Clear note" if self._lang == "en" else "\u6e05\u9664\u5907\u6ce8"),
+            font=("Segoe UI", 9),
+            relief=tk.FLAT, bd=0, padx=10, pady=5,
+            cursor="hand2",
+            bg=CLEAR_BG, fg=CLEAR_FG,
+            activebackground="#f3f4f6", activeforeground="#374151",
+            command=_clear_note,
+        )
+        clear_btn.pack(side=tk.LEFT)
+
+        # Cancel — right-aligned ghost
+        cancel_btn = tk.Button(
+            btn_row,
+            text="Cancel" if self._lang == "en" else "\u53d6\u6d88",
+            font=("Segoe UI", 9),
+            relief=tk.FLAT, bd=0, padx=10, pady=5,
+            cursor="hand2",
+            bg=BG, fg=MUTED,
+            activebackground="#f9fafb", activeforeground="#6b7280",
+            command=_cancel,
+        )
+        cancel_btn.pack(side=tk.RIGHT)
+
+        # ── Position popup below (or above) the cell ──────────────────
+        shadow.update_idletasks()
+        ph = shadow.winfo_reqheight()
+        tx = self._tree.winfo_rootx()
+        ty = self._tree.winfo_rooty()
+        px = tx + bx
+        py = ty + by + bh + 6
+
+        sw_ = shadow.winfo_screenwidth()
+        sh_ = shadow.winfo_screenheight()
+        if px + PW > sw_:
+            px = max(0, sw_ - PW - 8)
+        if py + ph > sh_:
+            py = ty + by - ph - 6   # flip above cell
+
+        shadow.geometry(f"{PW + 2}x{ph + 2}+{px}+{py}")
+        card.place(x=0, y=0, width=PW, height=ph)
+
+        # ── Focus + keyboard shortcuts ────────────────────────────────
+        shadow.grab_set()
+        txt.focus_set()
+
+        txt.bind("<Control-Return>",    _save)
+        txt.bind("<Control-KP_Enter>",  _save)
+        shadow.bind("<Escape>", lambda _: shadow.destroy())
+
+        def _dismiss_if_outside(event: tk.Event) -> None:
+            hit = shadow.winfo_containing(event.x_root, event.y_root)
+            if hit is None or not str(hit).startswith(str(shadow)):
+                shadow.destroy()
+
+        shadow.bind("<Button-1>", _dismiss_if_outside)
+
+    def _apply_notes_from_popup(self, item_idx: int, new_notes: str) -> None:
+        """Persist a private note edit from the inline cell editor.
+
+        Updates the item dict, the backing ResolvedItem, the detail panel label,
+        the tree row display, and the order cache on disk.
+        """
+        items = self._cg_items if self._mode == "casegrip" else self._ch_items
+        if item_idx < 0 or item_idx >= len(items):
+            return
+        d = items[item_idx]
+        old_notes = (d.get("private_notes") or "").strip()
+        if new_notes == old_notes:
+            return
+
+        order_num  = d.get("order", "")
+        norm_title = d.get("norm_title", "")
+
+        # Update the display dict in BOTH cg_items and ch_items so the same
+        # order's note stays consistent regardless of which tab is active.
+        for item_list in (self._cg_items, self._ch_items):
+            for item_d in item_list:
+                if (item_d.get("order") == order_num
+                        and item_d.get("norm_title") == norm_title):
+                    item_d["private_notes"] = new_notes
+
+        # Sync to the backing ResolvedItem so save_cache writes the new value.
+        for r in self._items:
+            if (r.order.order_number == order_num
+                    and _normalize is not None
+                    and _normalize(r.item.title) == norm_title):
+                r.order.private_notes = new_notes
+                break
+
+        # Persist to the orders cache
+        if save_cache is not None:
+            try:
+                _existing_pdfs: set = set()
+                if load_cache is not None and FILE_ORDERS_CACHE.exists():
+                    try:
+                        _, _existing_pdfs = load_cache(FILE_ORDERS_CACHE)
+                    except Exception:
+                        pass
+                save_cache(FILE_ORDERS_CACHE, self._items, _existing_pdfs)
+            except Exception:
+                pass
+
+        # Refresh the detail panel notes label if this item is selected
+        if self._selected and (
+            self._selected.get("order") == order_num
+            and self._selected.get("norm_title") == norm_title
+        ):
+            self._detail_notes.config(
+                text=f"\U0001F4CB  {new_notes}" if new_notes else ""
+            )
+            edit_hint = (
+                "\u270e  Edit note" if self._lang == "en" else "\u270e  \u7f16\u8f91\u5907\u6ce8"
+            )
+            self._detail_notes_edit_btn.config(text=edit_hint)
+
+        # Repopulate tree and restore selection
+        prev_sel = set(self._tree.selection())
+        self._populate_tree()
+        iid = str(item_idx)
+        try:
+            self._tree.selection_set(iid)
+            self._tree.see(iid)
+        except Exception:
+            for s in prev_sel:
+                try:
+                    self._tree.selection_set(s)
+                except Exception:
+                    pass
+
+        # Flash save confirmation
+        self._save_status_lbl.config(
+            text="\u2713 Note saved" if self._lang == "en" else "\u2713 \u5907\u6ce8\u5df2\u4fdd\u5b58"
+        )
+        self._d.after(2500, lambda: self._save_status_lbl.config(text=""))
 
     def _show_status_popup(
         self, bbox: tuple, item_idx: int, comp: str, d: dict
@@ -6542,9 +7051,54 @@ class _OrdersDashboardDialog:
     def _regen(self) -> None:
         if self._parent._run_busy:
             return
+
+        # ── Build exclusion file when the user has deselected some orders ──
+        import json as _json
+        import tempfile as _tempfile
+
+        _excl_file: str | None = None
+        _all_items = self._cg_items + self._ch_items
+        _all_keys: set[tuple[str, str]] = {
+            (d.get("order", ""), d.get("norm_title", "")) for d in _all_items
+        }
+        _active_excl = self._excl_keys & _all_keys
+        n_excl  = len(_active_excl)
+        n_total = len(_all_keys)
+        n_incl  = n_total - n_excl
+
+        if _active_excl:
+            try:
+                _excl_payload = [
+                    {"order": o, "norm_title": nt}
+                    for o, nt in _active_excl
+                ]
+                _tf = _tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".json", delete=False,
+                    encoding="utf-8", prefix="excl_orders_",
+                )
+                _json.dump(_excl_payload, _tf, ensure_ascii=False)
+                _tf.close()
+                _excl_file = _tf.name
+            except Exception:
+                _excl_file = None
+
         self._parent._run_busy = True
         self._parent._set_chrome_busy(True)
-        self._parent._append_log("Regenerating shopping route...\n")
+
+        if _excl_file:
+            log_msg = (
+                f"Regenerating shopping route ({n_incl} of {n_total} orders selected)...\n"
+                if self._lang == "en" else
+                f"\u91cd\u65b0\u751f\u6210\u91c7\u8d2d\u6e05\u5355\uff08\u5df2\u9009 {n_incl} / {n_total} \u4e2a\u8ba2\u5355\uff09...\n"
+            )
+        else:
+            log_msg = (
+                "Regenerating shopping route...\n"
+                if self._lang == "en" else
+                "\u91cd\u65b0\u751f\u6210\u91c7\u8d2d\u6e05\u5355...\n"
+            )
+        self._parent._append_log(log_msg)
+
         # Use _collect_generator_args so every user-configured flag (--chinese,
         # --html, --threshold, etc.) is forwarded.  Previously this built the
         # command manually with only --refresh-catalog, which silently skipped
@@ -6553,6 +7107,8 @@ class _OrdersDashboardDialog:
         gen_args = self._parent._collect_generator_args(
             "refresh_catalog", include_charm_steps=False
         )
+        if _excl_file:
+            gen_args = list(gen_args) + ["--exclude-orders-file", _excl_file]
         cmd = [sys.executable, str(GENERATOR), *gen_args]
 
         def _work():
@@ -6568,17 +7124,23 @@ class _OrdersDashboardDialog:
             except Exception as e:
                 self._parent._log_q.put(str(e))
             finally:
+                # Clean up temp exclusion file
+                if _excl_file:
+                    try:
+                        import os as _os
+                        _os.unlink(_excl_file)
+                    except Exception:
+                        pass
+
                 def _done():
                     self._parent._run_busy = False
                     self._parent._set_chrome_busy(False)
-                    self._save_status.config(
-                        text="\u2713 Route regenerated" if self._lang == "en"
+                    ok_text = (
+                        "\u2713 Route regenerated" if self._lang == "en"
                         else "\u2713 \u5df2\u91cd\u65b0\u751f\u6210"
                     )
-                    self._save_status_lbl.config(
-                        text="\u2713 Route regenerated" if self._lang == "en"
-                        else "\u2713 \u5df2\u91cd\u65b0\u751f\u6210"
-                    )
+                    self._save_status.config(text=ok_text)
+                    self._save_status_lbl.config(text=ok_text)
                 self._parent.after(0, _done)
 
         threading.Thread(target=_work, daemon=True).start()
@@ -7386,6 +7948,7 @@ class _ProductMapEditorDialog:
         self._charm_entries  = charm_entries
         self._charm_codes    = list(charm_entries.keys())
         self._tk_img_refs: list[object] = []
+        self._thumb_cache: dict[int, object] = {}
         self._row_by_iid: dict[str, object] = {}
         self._selected_row: object | None = None
         self._preview_photo_ref: list[object] = []
@@ -7678,7 +8241,12 @@ class _ProductMapEditorDialog:
 
         # ── Populate + bindings ──
         self._refill_tree()
-        self._filt.trace_add("write", lambda *_: self._refill_tree())
+        _pme_rf_id: list[str | None] = [None]
+        def _sched_refill_tree(*_):
+            if _pme_rf_id[0]:
+                self._d.after_cancel(_pme_rf_id[0])
+            _pme_rf_id[0] = self._d.after(300, self._refill_tree)
+        self._filt.trace_add("write", _sched_refill_tree)
         tree.bind("<<TreeviewSelect>>", self._on_select)
 
         # Hover zoom
@@ -7698,6 +8266,10 @@ class _ProductMapEditorDialog:
     def _thumb(self, raw: bytes | None) -> object | None:
         if not self._pil_ok or not raw or Image is None or ImageTk is None:
             return None
+        key = hash(raw)
+        cached = self._thumb_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             im = Image.open(BytesIO(raw))
             if im.mode not in ("RGB", "RGBA"):
@@ -7708,7 +8280,7 @@ class _ProductMapEditorDialog:
                 im = bg
             im.thumbnail((self._THUMB, self._THUMB), Image.Resampling.LANCZOS)
             ph = ImageTk.PhotoImage(im)
-            self._tk_img_refs.append(ph)
+            self._thumb_cache[key] = ph
             return ph
         except Exception:
             return None
@@ -7718,7 +8290,6 @@ class _ProductMapEditorDialog:
     def _refill_tree(self) -> None:
         self._tree.delete(*self._tree.get_children())
         self._row_by_iid.clear()
-        self._tk_img_refs.clear()
         q = self._filt.get().strip().lower()
         for r in self._all_rows:
             if q:
@@ -7957,65 +8528,81 @@ class _ProductMapEditorDialog:
         self._upload_photo_btn.config(state=tk.DISABLED)
         self._d.update_idletasks()
 
-        try:
-            update_product_map_cells(
-                FILE_SUPPLIER_CATALOG,
-                r.row_num,
-                shop_name=new_shop,
-                stall=new_stall,
-                charm_shop=new_charm_shop,
-                charm_code=new_charm_code,
-            )
-            if pending_photo and update_product_map_photo is not None:
-                update_product_map_photo(FILE_SUPPLIER_CATALOG, r.row_num, pending_photo)
-        except Exception as e:
-            messagebox.showerror(
-                self._t("file_open_fail_title"), str(e), parent=self._d,
-            )
-            return
-        finally:
+        def _restore_ui() -> None:
             self._d.config(cursor=prev_cursor)
             self._save_btn.config(state=tk.NORMAL)
             self._disc_btn.config(state=tk.NORMAL)
             self._upload_photo_btn.config(state=tk.NORMAL)
 
-        # Clear pending photo state
-        self._pending_photo_bytes = None
-        self._upload_status_lbl.config(text="")
-
-        # Reload photos + rows so the treeview thumbnail reflects the new photo
-        if pending_photo:
+        def _bg_work() -> None:
             try:
-                if extract_photos_from_xlsx is not None:
-                    self._row_photos = extract_photos_from_xlsx(
+                update_product_map_cells(
+                    FILE_SUPPLIER_CATALOG,
+                    r.row_num,
+                    shop_name=new_shop,
+                    stall=new_stall,
+                    charm_shop=new_charm_shop,
+                    charm_code=new_charm_code,
+                )
+                if pending_photo and update_product_map_photo is not None:
+                    update_product_map_photo(FILE_SUPPLIER_CATALOG, r.row_num, pending_photo)
+            except Exception as exc:
+                self._d.after(0, lambda e=exc: _on_error(e))
+                return
+
+            # Reload data while still in the background thread
+            new_row_photos = self._row_photos
+            if pending_photo and extract_photos_from_xlsx is not None:
+                try:
+                    new_row_photos = extract_photos_from_xlsx(
                         FILE_SUPPLIER_CATALOG, sheet_name=CATALOG_SHEET, photo_col_idx=0,
                     )
+                except Exception:
+                    pass
+            new_all_rows = self._all_rows
+            try:
+                new_all_rows = list_product_map_rows_for_picker(FILE_SUPPLIER_CATALOG)
             except Exception:
                 pass
-        try:
-            self._all_rows = list_product_map_rows_for_picker(FILE_SUPPLIER_CATALOG)
-        except Exception:
-            pass
-        cur_iid = f"r{r.row_num}"
-        self._refill_tree()
-        if self._tree.exists(cur_iid):
-            self._tree.selection_set(cur_iid)
-            self._tree.see(cur_iid)
-            self._set_edit_panel(self._row_by_iid.get(cur_iid))
+            self._d.after(0, lambda p=new_row_photos, a=new_all_rows: _on_success(p, a))
 
-        short = r.title if len(r.title) <= 60 else r.title[:57] + "…"
-        if pending_photo:
-            messagebox.showinfo(
-                self._t("edit_title"),
-                self._t("edit_photo_saved", title=short),
-                parent=self._d,
+        def _on_error(exc: Exception) -> None:
+            _restore_ui()
+            messagebox.showerror(
+                self._t("file_open_fail_title"), str(exc), parent=self._d,
             )
-        else:
-            messagebox.showinfo(
-                self._t("edit_title"),
-                self._t("edit_saved", title=short),
-                parent=self._d,
-            )
+
+        def _on_success(new_row_photos: dict, new_all_rows: list) -> None:
+            _restore_ui()
+            if pending_photo:
+                self._row_photos = new_row_photos
+                self._thumb_cache.clear()
+            self._all_rows = new_all_rows
+            self._pending_photo_bytes = None
+            self._upload_status_lbl.config(text="")
+
+            cur_iid = f"r{r.row_num}"
+            self._refill_tree()
+            if self._tree.exists(cur_iid):
+                self._tree.selection_set(cur_iid)
+                self._tree.see(cur_iid)
+                self._set_edit_panel(self._row_by_iid.get(cur_iid))
+
+            short = r.title if len(r.title) <= 60 else r.title[:57] + "…"
+            if pending_photo:
+                messagebox.showinfo(
+                    self._t("edit_title"),
+                    self._t("edit_photo_saved", title=short),
+                    parent=self._d,
+                )
+            else:
+                messagebox.showinfo(
+                    self._t("edit_title"),
+                    self._t("edit_saved", title=short),
+                    parent=self._d,
+                )
+
+        threading.Thread(target=_bg_work, daemon=True).start()
 
     # ── mark discontinued ──
 
@@ -8047,35 +8634,49 @@ class _ProductMapEditorDialog:
         self._disc_btn.config(state=tk.DISABLED)
         self._d.update_idletasks()
 
-        try:
-            mark_product_map_discontinued_by_row(FILE_SUPPLIER_CATALOG, r.row_num)
-        except Exception as e:
-            messagebox.showerror(
-                self._t("file_open_fail_title"), str(e), parent=self._d,
-            )
-            return
-        finally:
+        def _bg_disc() -> None:
+            try:
+                mark_product_map_discontinued_by_row(FILE_SUPPLIER_CATALOG, r.row_num)
+            except Exception as exc:
+                self._d.after(0, lambda e=exc: _on_disc_error(e))
+                return
+
+            new_all_rows: list = []
+            new_row_photos: dict = {}
+            try:
+                new_all_rows = list_product_map_rows_for_picker(FILE_SUPPLIER_CATALOG)
+                if extract_photos_from_xlsx is not None:
+                    new_row_photos = extract_photos_from_xlsx(
+                        FILE_SUPPLIER_CATALOG, sheet_name=CATALOG_SHEET, photo_col_idx=0,
+                    )
+            except Exception:
+                pass
+            self._d.after(0, lambda a=new_all_rows, p=new_row_photos: _on_disc_success(a, p))
+
+        def _on_disc_error(exc: Exception) -> None:
             self._d.config(cursor=prev_cursor)
+            self._save_btn.config(state=tk.NORMAL)
+            self._disc_btn.config(state=tk.NORMAL)
+            messagebox.showerror(
+                self._t("file_open_fail_title"), str(exc), parent=self._d,
+            )
 
-        # Reload the product list — discontinued row is now gone from Product Map
-        try:
-            self._all_rows = list_product_map_rows_for_picker(FILE_SUPPLIER_CATALOG)
-            self._row_photos = {}
-            if extract_photos_from_xlsx is not None:
-                self._row_photos = extract_photos_from_xlsx(
-                    FILE_SUPPLIER_CATALOG, sheet_name=CATALOG_SHEET, photo_col_idx=0,
-                )
-        except Exception:
-            pass
+        def _on_disc_success(new_all_rows: list, new_row_photos: dict) -> None:
+            self._d.config(cursor=prev_cursor)
+            self._save_btn.config(state=tk.NORMAL)
+            self._disc_btn.config(state=tk.NORMAL)
+            self._all_rows = new_all_rows
+            self._row_photos = new_row_photos
+            self._thumb_cache.clear()
+            self._set_edit_panel(None)
+            self._refill_tree()
+            messagebox.showinfo(
+                self._t("edit_discontinue_confirm_title"),
+                self._t("edit_discontinue_done"),
+                parent=self._d,
+            )
 
-        self._set_edit_panel(None)
-        self._refill_tree()
-
-        messagebox.showinfo(
-            self._t("edit_discontinue_confirm_title"),
-            self._t("edit_discontinue_done"),
-            parent=self._d,
-        )
+        threading.Thread(target=_bg_disc, daemon=True).start()
 
     # ── hover zoom (same pattern as discontinue dialog) ──
 
@@ -8203,6 +8804,7 @@ class _CharmPickerPopup:
         self._lang     = lang
         self._callback = callback
         self._tk_img_refs: list[object] = []
+        self._thumb_cache: dict[int, object] = {}
 
         pil_ok = Image is not None and ImageTk is not None
         self._pil_ok = pil_ok
@@ -8290,7 +8892,12 @@ class _CharmPickerPopup:
         self._hover_active_iid: list[str | None] = [None]
 
         self._refill()
-        self._filt.trace_add("write", lambda *_: self._refill())
+        _cp_rf_id: list[str | None] = [None]
+        def _sched_refill_charm(*_):
+            if _cp_rf_id[0]:
+                self._d.after_cancel(_cp_rf_id[0])
+            _cp_rf_id[0] = self._d.after(300, self._refill)
+        self._filt.trace_add("write", _sched_refill_charm)
         tree.bind("<Double-1>", lambda _e: self._pick())
         tree.bind("<Return>",   lambda _e: self._pick())
 
@@ -8304,6 +8911,10 @@ class _CharmPickerPopup:
     def _thumb(self, raw: bytes | None) -> object | None:
         if not self._pil_ok or not raw or Image is None or ImageTk is None:
             return None
+        key = hash(raw)
+        cached = self._thumb_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             im = Image.open(BytesIO(raw))
             if im.mode not in ("RGB", "RGBA"):
@@ -8314,7 +8925,7 @@ class _CharmPickerPopup:
                 im = bg
             im.thumbnail((self._THUMB, self._THUMB), Image.Resampling.LANCZOS)
             ph = ImageTk.PhotoImage(im)
-            self._tk_img_refs.append(ph)
+            self._thumb_cache[key] = ph
             return ph
         except Exception:
             return None
@@ -8322,7 +8933,6 @@ class _CharmPickerPopup:
     def _refill(self) -> None:
         self._hide_charm_hover()
         self._tree.delete(*self._tree.get_children())
-        self._tk_img_refs.clear()
         q = self._filt.get().strip().lower()
 
         # "(none)" row — lets the user clear the charm code
