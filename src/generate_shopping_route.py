@@ -9454,6 +9454,18 @@ def main() -> None:
             "supplier_catalog_backups/ (current file is backed up first)."
         ),
     )
+    ap.add_argument(
+        "--exclude-orders-file",
+        default="",
+        metavar="FILE",
+        help=(
+            "Path to a JSON file produced by the dashboard containing orders to exclude "
+            "from the generated route output.  The JSON is a list of objects with "
+            "'order' (order number string) and 'norm_title' (normalised product title) keys.  "
+            "Matching items are removed from the route XLSX/HTML output only — the cache "
+            "is not modified and all orders remain visible in the dashboard."
+        ),
+    )
     args = ap.parse_args()
 
     if not args.import_charm_patterns:
@@ -10392,15 +10404,47 @@ def main() -> None:
     save_cache(cache_path, all_resolved, processed_pdfs)
 
     # ------------------------------------------------------------------ #
+    # Step 7b -- Apply order exclusions (dashboard route-gen selection)    #
+    # The cache always contains every order; the exclusion only affects    #
+    # the XLSX / HTML output files generated in the steps below.          #
+    # ------------------------------------------------------------------ #
+    route_resolved = all_resolved   # default: include everything
+    if (args.exclude_orders_file or "").strip():
+        import json as _excl_json
+        _excl_path = Path(args.exclude_orders_file.strip())
+        if _excl_path.is_file():
+            try:
+                _excl_list = _excl_json.loads(_excl_path.read_text(encoding="utf-8"))
+                _excl_set: set[tuple[str, str]] = {
+                    (str(e.get("order", "")), str(e.get("norm_title", "")))
+                    for e in _excl_list
+                    if isinstance(e, dict)
+                }
+                if _excl_set:
+                    route_resolved = [
+                        r for r in all_resolved
+                        if (_normalize(r.item.title), r.order.order_number)
+                        not in {(nt, o) for o, nt in _excl_set}
+                    ]
+                    n_excl = len(all_resolved) - len(route_resolved)
+                    log.info(
+                        "Route generation: %d of %d item(s) included "
+                        "(%d excluded by dashboard selection)",
+                        len(route_resolved), len(all_resolved), n_excl,
+                    )
+            except Exception as _excl_err:
+                log.warning("Could not apply --exclude-orders-file: %s", _excl_err)
+
+    # ------------------------------------------------------------------ #
     # Step 8 -- Generate Excel (with preserved statuses overlaid)         #
     # ------------------------------------------------------------------ #
-    generate_xlsx(all_resolved, output_path, statuses=existing_statuses,
+    generate_xlsx(route_resolved, output_path, statuses=existing_statuses,
                   charm_shops=charm_shops, charm_library=charm_library,
                   charm_images_dir=charm_images_dir)
 
     # Step 8b-simple -- Always generate simplified shopping route (minimal columns)
     simple_output_path = output_path.with_stem(output_path.stem + "_simple")
-    generate_xlsx_simple(all_resolved, simple_output_path, statuses=existing_statuses,
+    generate_xlsx_simple(route_resolved, simple_output_path, statuses=existing_statuses,
                          charm_shops=charm_shops, charm_library=charm_library,
                          charm_images_dir=charm_images_dir)
 
@@ -10418,11 +10462,11 @@ def main() -> None:
         if args.chinese_exclude_shops:
             excluded_shops = {s.strip().lower() for s in args.chinese_exclude_shops.split(",") if s.strip()}
         zh_items = [
-            r for r in all_resolved
+            r for r in route_resolved
             if r.order.etsy_shop.lower() not in excluded_shops
         ]
         zh_item_count  = len(zh_items)
-        zh_excluded_ct = len(all_resolved) - zh_item_count
+        zh_excluded_ct = len(route_resolved) - zh_item_count
         zh_excluded_shops_str = args.chinese_exclude_shops or ""
 
         if excluded_shops:
@@ -10458,7 +10502,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     if args.html:
         html_path = output_path.with_suffix(".html")
-        generate_html(all_resolved, html_path, statuses=existing_statuses,
+        generate_html(route_resolved, html_path, statuses=existing_statuses,
                       lang="en", charm_shops=charm_shops,
                       charm_library=charm_library,
                       charm_images_dir=charm_images_dir)
@@ -10531,7 +10575,11 @@ def main() -> None:
     remaining_ct = len(all_resolved)
     if purged_count or partial_purge_count:
         print(f"  [>>]  {remaining_ct} item(s) still need attention")
-    print(f"  --->  {output_path.resolve()}  ({len(all_resolved)} items)")
+    _route_item_ct = len(route_resolved)
+    _all_item_ct   = len(all_resolved)
+    _excl_note     = (f"  [{_all_item_ct - _route_item_ct} excluded by dashboard selection]"
+                      if _route_item_ct < _all_item_ct else "")
+    print(f"  --->  {output_path.resolve()}  ({_route_item_ct} items{_excl_note})")
     print(f"  [SIMPLE]  {simple_output_path.resolve()}  (simplified — no floor/product/order cols)")
     if manifest_written_path is not None:
         print(
