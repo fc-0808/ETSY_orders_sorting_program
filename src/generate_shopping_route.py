@@ -118,6 +118,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -211,6 +212,7 @@ CHARM_SHOPS_INSTRUCTION_TEXT = (
 OUTPUT_FILE       = "shopping_route.xlsx"
 CHARM_MANIFEST_FILE = "charm_manifest.json"   # default under data/ with --project-dir
 CACHE_FILE        = "orders_cache.json"
+DB_FILE           = "etsy_orders.db"         # SQLite DB (replaces xlsx catalog reads + JSON cache)
 OOP_LOG_FILE      = "out_of_production_log.csv"   # append-only log of purged OOP items
 ZH_TRANS_CACHE    = "translations_zh_cache.json"   # persisted product-title translations
 MATCH_THRESHOLD   = 65
@@ -820,11 +822,159 @@ def _parse_right_column(lines: list[str]) -> tuple[list[OrderItem], str]:
 
 
 # ---------------------------------------------------------------------------
+# SQLite connection and on-demand data accessors
+# ---------------------------------------------------------------------------
+
+
+def get_db_connection(db_path: Path) -> sqlite3.Connection:
+    """Open a WAL-mode SQLite connection with Row factory and FK enforcement.
+
+    Use as a context manager or close explicitly when done:
+        conn = get_db_connection(db_path)
+        ...
+        conn.close()
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def get_unprocessed_orders(conn: sqlite3.Connection) -> list[ResolvedItem]:
+    """Return every order line-item currently stored in the SQLite database.
+
+    Results are ordered by ``order_number`` then original insertion order.
+    ``supplier`` is always ``None``; callers must invoke ``match_items()``
+    to populate supplier information before generating routes.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            o.order_number, o.etsy_shop, o.buyer_name, o.buyer_username,
+            o.ship_to_name, o.ship_to_country, o.order_date, o.private_notes,
+            i.title, i.quantity, i.phone_model, i.style, i.photo_bytes
+        FROM order_items i
+        JOIN orders o ON i.order_number = o.order_number
+        ORDER BY o.order_number, i.id
+        """
+    ).fetchall()
+
+    items: list[ResolvedItem] = []
+    for row in rows:
+        order = Order(
+            order_number    = row["order_number"],
+            etsy_shop       = row["etsy_shop"]       or "",
+            buyer_name      = row["buyer_name"]      or "",
+            buyer_username  = row["buyer_username"]  or "",
+            ship_to_name    = row["ship_to_name"]    or "",
+            ship_to_country = row["ship_to_country"] or "",
+            order_date      = row["order_date"]      or "",
+            private_notes   = row["private_notes"]   or "",
+        )
+        item = OrderItem(
+            title       = row["title"],
+            quantity    = row["quantity"]    or 1,
+            phone_model = row["phone_model"] or "",
+            style       = row["style"]       or "",
+            photo_bytes = bytes(row["photo_bytes"]) if row["photo_bytes"] else None,
+        )
+        order.items = [item]
+        items.append(
+            ResolvedItem(order=order, item=item, supplier=None, match_score=0.0)
+        )
+    return items
+
+
+def get_charm_details(
+    conn: sqlite3.Connection,
+    charm_code: str,
+) -> CharmLibraryEntry | None:
+    """Fetch a single charm by its stable code from the SQLite database.
+
+    Returns ``None`` when the code is not found.
+    """
+    row = conn.execute(
+        "SELECT code, sku, default_charm_shop, notes, photo "
+        "FROM charm_library WHERE code = ?",
+        (charm_code.strip(),),
+    ).fetchone()
+    if row is None:
+        return None
+    return CharmLibraryEntry(
+        code               = row["code"],
+        sku                = row["sku"]                or "",
+        default_charm_shop = row["default_charm_shop"] or "",
+        notes              = row["notes"]              or "",
+        photo_bytes        = bytes(row["photo"]) if row["photo"] else None,
+    )
+
+
+def get_charm_shop(
+    conn: sqlite3.Connection,
+    shop_name: str,
+) -> CharmShop | None:
+    """Fetch a charm shop entry by name from the SQLite database.
+
+    Returns ``None`` when the name is not found.
+    """
+    row = conn.execute(
+        "SELECT shop_name, stall, notes FROM charm_shops WHERE shop_name = ?",
+        (shop_name.strip(),),
+    ).fetchone()
+    if row is None:
+        return None
+    return CharmShop(
+        shop_name = row["shop_name"],
+        stall     = row["stall"] or "",
+        notes     = row["notes"] or "",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Supplier catalog -- load
 # ---------------------------------------------------------------------------
 
 
 def load_catalog(path: Path) -> list[CatalogEntry]:
+    """Load the full product catalog into memory as ``CatalogEntry`` objects.
+
+    Reads from ``data/etsy_orders.db`` (SQLite) when the database exists
+    alongside the catalog file.  Falls back to parsing
+    ``supplier_catalog.xlsx`` when the database has not yet been
+    initialised — run ``python src/migrate_to_sqlite.py`` once to seed it.
+    """
+    db_path = path.parent / DB_FILE
+    if db_path.exists():
+        try:
+            conn = get_db_connection(db_path)
+            rows = conn.execute(
+                "SELECT product_title, shop_name, stall, price, "
+                "       charm_shop, charm_code, notes "
+                "FROM   catalog ORDER BY id"
+            ).fetchall()
+            conn.close()
+            entries = [
+                CatalogEntry(
+                    product_title = row["product_title"],
+                    category      = "",               # not stored in SQLite schema
+                    shop_name     = row["shop_name"]  or "",
+                    stall         = row["stall"]       or "",
+                    price         = row["price"]       or "",
+                    charm_shop    = row["charm_shop"]  or "",
+                    charm_code    = row["charm_code"]  or "",
+                    notes         = row["notes"]       or "",
+                )
+                for row in rows
+            ]
+            log.info("Loaded %d products from SQLite catalog", len(entries))
+            return entries
+        except Exception as exc:
+            log.warning(
+                "SQLite catalog load failed (%s) — falling back to xlsx", exc
+            )
+
+    # ── xlsx fallback (used before migration or when DB is absent) ─────────
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     ws = wb[CATALOG_SHEET]
     h3 = str(ws.cell(1, 3).value or "").strip().lower()
@@ -841,39 +991,39 @@ def load_catalog(path: Path) -> list[CatalogEntry]:
             continue
         if has_category:
             if legacy_notes_first:
-                notes = str(row[6]).strip() if len(row) > 6 and row[6] is not None else ""
+                notes      = str(row[6]).strip() if len(row) > 6 and row[6] is not None else ""
                 charm_shop = str(row[7]).strip() if len(row) > 7 and row[7] is not None else ""
                 charm_code = str(row[8]).strip() if len(row) > 8 and row[8] is not None else ""
             else:
                 charm_shop = str(row[6]).strip() if len(row) > 6 and row[6] is not None else ""
                 charm_code = str(row[7]).strip() if len(row) > 7 and row[7] is not None else ""
-                notes = str(row[8]).strip() if len(row) > 8 and row[8] is not None else ""
-            cat_v = str(row[2]).strip() if row[2] is not None else ""
-            shop_v = str(row[3]).strip() if row[3] is not None else ""
+                notes      = str(row[8]).strip() if len(row) > 8 and row[8] is not None else ""
+            cat_v   = str(row[2]).strip() if row[2] is not None else ""
+            shop_v  = str(row[3]).strip() if row[3] is not None else ""
             stall_v = str(row[4]).strip() if row[4] is not None else ""
             price_v = str(row[5]).strip() if len(row) > 5 and row[5] is not None else ""
         else:
-            # 8-column layout: B title, C shop, D stall, E price, F/G charm, H notes
-            cat_v = ""
-            shop_v = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
-            stall_v = str(row[3]).strip() if len(row) > 3 and row[3] is not None else ""
-            price_v = str(row[4]).strip() if len(row) > 4 and row[4] is not None else ""
+            # Current 8-column layout: B title, C shop, D stall, E price, F/G charm, H notes
+            cat_v      = ""
+            shop_v     = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+            stall_v    = str(row[3]).strip() if len(row) > 3 and row[3] is not None else ""
+            price_v    = str(row[4]).strip() if len(row) > 4 and row[4] is not None else ""
             charm_shop = str(row[5]).strip() if len(row) > 5 and row[5] is not None else ""
             charm_code = str(row[6]).strip() if len(row) > 6 and row[6] is not None else ""
-            notes = str(row[7]).strip() if len(row) > 7 and row[7] is not None else ""
+            notes      = str(row[7]).strip() if len(row) > 7 and row[7] is not None else ""
         entries.append(CatalogEntry(
             product_title = title.strip(),
-            category   = cat_v,
-            shop_name  = shop_v,
-            stall      = stall_v,
-            price      = price_v,
-            notes      = notes,
-            charm_shop = charm_shop,
-            charm_code = charm_code,
+            category      = cat_v,
+            shop_name     = shop_v,
+            stall         = stall_v,
+            price         = price_v,
+            notes         = notes,
+            charm_shop    = charm_shop,
+            charm_code    = charm_code,
         ))
 
     wb.close()
-    log.info("Loaded %d products from catalog", len(entries))
+    log.info("Loaded %d products from catalog (xlsx fallback)", len(entries))
     return entries
 
 
@@ -1694,10 +1844,42 @@ def init_charm_library_sheet(path: Path) -> None:
 
 
 def load_charm_library(path: Path) -> dict[str, CharmLibraryEntry]:
+    """Return a ``charm_code → CharmLibraryEntry`` mapping (with photo BLOBs).
+
+    Reads from ``data/etsy_orders.db`` (SQLite) when available; falls back
+    to parsing the ``Charm Library`` sheet of ``supplier_catalog.xlsx``.
     """
-    Load charm rows from ``Charm Library`` and return a mapping
-    ``charm_code → CharmLibraryEntry`` (photo bytes from embedded images).
-    """
+    db_path = path.parent / DB_FILE
+    if db_path.exists():
+        try:
+            conn = get_db_connection(db_path)
+            rows = conn.execute(
+                "SELECT code, sku, default_charm_shop, notes, photo "
+                "FROM charm_library ORDER BY code"
+            ).fetchall()
+            conn.close()
+            by_code: dict[str, CharmLibraryEntry] = {
+                row["code"]: CharmLibraryEntry(
+                    code               = row["code"],
+                    sku                = row["sku"]                or "",
+                    default_charm_shop = row["default_charm_shop"] or "",
+                    notes              = row["notes"]              or "",
+                    photo_bytes        = bytes(row["photo"]) if row["photo"] else None,
+                )
+                for row in rows
+            }
+            n_img = sum(1 for e in by_code.values() if e.photo_bytes)
+            log.info(
+                "Loaded %d charm(s) from SQLite (%d with photos)",
+                len(by_code), n_img,
+            )
+            return by_code
+        except Exception as exc:
+            log.warning(
+                "SQLite charm library load failed (%s) — falling back to xlsx", exc
+            )
+
+    # ── xlsx fallback ─────────────────────────────────────────────────────
     if not path.exists():
         return {}
     try:
@@ -1714,16 +1896,16 @@ def load_charm_library(path: Path) -> dict[str, CharmLibraryEntry]:
             wb.close()
             return {}
         ws = wb[CHARM_LIBRARY_SHEET]
-        by_code: dict[str, CharmLibraryEntry] = {}
+        by_code = {}
         for r_num, row in enumerate(
             ws.iter_rows(min_row=2, values_only=True), start=2
         ):
             code = str(row[1]).strip() if len(row) > 1 and row[1] else ""
             if not code or code.lower() == "charm code":
                 continue
-            sku_val = str(row[2]).strip() if len(row) > 2 and row[2] else ""
+            sku_val  = str(row[2]).strip() if len(row) > 2 and row[2] else ""
             def_shop = str(row[3]).strip() if len(row) > 3 and row[3] else ""
-            notes = str(row[4]).strip() if len(row) > 4 and row[4] else ""
+            notes    = str(row[4]).strip() if len(row) > 4 and row[4] else ""
             ent = CharmLibraryEntry(
                 code=code,
                 sku=sku_val,
@@ -1740,7 +1922,7 @@ def load_charm_library(path: Path) -> dict[str, CharmLibraryEntry]:
         wb.close()
         n_img = sum(1 for e in by_code.values() if e.photo_bytes)
         log.info(
-            "Loaded %d charm(s) from '%s' (%d with photos)",
+            "Loaded %d charm(s) from '%s' (%d with photos) (xlsx fallback)",
             len(by_code), CHARM_LIBRARY_SHEET, n_img,
         )
         return by_code
@@ -1750,11 +1932,36 @@ def load_charm_library(path: Path) -> dict[str, CharmLibraryEntry]:
 
 
 def load_charm_shops(path: Path) -> list[CharmShop]:
+    """Load the charm-shop reference list.
+
+    Reads from ``data/etsy_orders.db`` (SQLite) when available; falls back
+    to the ``Charm Shops`` sheet of ``supplier_catalog.xlsx``.
+    Returns an empty list (with a warning) if neither source has data.
     """
-    Load charm shop entries from the ``Charm Shops`` sheet of
-    *supplier_catalog.xlsx*.  Returns an empty list (with a warning) if the
-    sheet is absent.
-    """
+    db_path = path.parent / DB_FILE
+    if db_path.exists():
+        try:
+            conn = get_db_connection(db_path)
+            rows = conn.execute(
+                "SELECT shop_name, stall, notes FROM charm_shops ORDER BY id"
+            ).fetchall()
+            conn.close()
+            shops = [
+                CharmShop(
+                    shop_name = row["shop_name"],
+                    stall     = row["stall"] or "",
+                    notes     = row["notes"] or "",
+                )
+                for row in rows
+            ]
+            log.info("Loaded %d charm shop(s) from SQLite", len(shops))
+            return shops
+        except Exception as exc:
+            log.warning(
+                "SQLite charm shops load failed (%s) — falling back to xlsx", exc
+            )
+
+    # ── xlsx fallback ─────────────────────────────────────────────────────
     try:
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         if CHARM_SHOPS_SHEET not in wb.sheetnames:
@@ -1766,19 +1973,18 @@ def load_charm_shops(path: Path) -> list[CharmShop]:
             )
             return []
         ws = wb[CHARM_SHOPS_SHEET]
-        shops: list[CharmShop] = []
+        shops = []
         for row in ws.iter_rows(min_row=2, values_only=True):
             name  = str(row[0] or "").strip() if row[0]               else ""
             stall = str(row[1] or "").strip() if len(row) > 1 and row[1] else ""
             notes = str(row[2] or "").strip() if len(row) > 2 and row[2] else ""
-            # Both shop name AND stall are required for a valid entry.
-            # This prevents instructional/note rows (which have no stall) from
-            # being treated as shops.
+            # Both name AND stall required; skips instructional/note rows.
             if name and stall:
                 shops.append(CharmShop(shop_name=name, stall=stall, notes=notes))
         wb.close()
         log.info(
-            "Loaded %d charm shop(s) from '%s'", len(shops), CHARM_SHOPS_SHEET
+            "Loaded %d charm shop(s) from '%s' (xlsx fallback)",
+            len(shops), CHARM_SHOPS_SHEET,
         )
         return shops
     except Exception as exc:
@@ -2642,17 +2848,46 @@ def list_product_map_rows_for_picker(path: Path) -> list[ProductMapPickerRow]:
 
 
 def get_catalog_photo_map(catalog_path: Path) -> dict[str, bytes]:
-    """Return a mapping of *normalized product title* → canonical JPEG photo bytes.
+    """Return a mapping of *normalized product title* → canonical photo bytes.
 
-    Reads embedded photos from column A of the Product Map sheet.  Used by the
-    Orders Dashboard so that every order for the same product always displays the
-    same photo regardless of which PDF it was extracted from.
+    Used by the Orders Dashboard so every order for the same product always
+    displays the same photo regardless of which PDF it was extracted from.
 
-    The dict contains two entries per product:
-      • The full normalized title (exact match priority).
-      • The first 50 characters (backward-compat for older cached items whose
-        norm_title was stored with [:50] truncation).
+    Each product contributes two keys:
+      • The full normalized title (exact-match priority).
+      • The first 50 characters (backward-compat for older cache entries).
+
+    Reads photo BLOBs from ``data/etsy_orders.db`` (SQLite) when the
+    database exists; falls back to extracting them from column A of the
+    Product Map sheet in ``supplier_catalog.xlsx``.
     """
+    db_path = catalog_path.parent / DB_FILE
+    if db_path.exists():
+        try:
+            conn = get_db_connection(db_path)
+            rows = conn.execute(
+                "SELECT product_title, photo FROM catalog WHERE photo IS NOT NULL"
+            ).fetchall()
+            conn.close()
+            result: dict[str, bytes] = {}
+            for row in rows:
+                photo = bytes(row["photo"])
+                key   = _normalize(row["product_title"])
+                result[key] = photo
+                short = key[:50]
+                if short not in result:
+                    result[short] = photo
+            log.info(
+                "Catalog photo map: %d product(s) have canonical photos (SQLite)",
+                len(result),
+            )
+            return result
+        except Exception as exc:
+            log.warning(
+                "SQLite catalog photo map failed (%s) — falling back to xlsx", exc
+            )
+
+    # ── xlsx fallback ─────────────────────────────────────────────────────
     if not catalog_path.exists():
         return {}
     try:
@@ -2662,7 +2897,7 @@ def get_catalog_photo_map(catalog_path: Path) -> dict[str, bytes]:
         row_photos = extract_photos_from_xlsx(
             catalog_path, sheet_name=CATALOG_SHEET, photo_col_idx=0
         )
-        result: dict[str, bytes] = {}
+        result = {}
         for row in rows:
             photo = row_photos.get(row.row_num)
             if not photo:
@@ -2673,7 +2908,8 @@ def get_catalog_photo_map(catalog_path: Path) -> dict[str, bytes]:
             if short not in result:
                 result[short] = photo
         log.info(
-            "Catalog photo map: %d product(s) have canonical photos", len(result)
+            "Catalog photo map: %d product(s) have canonical photos (xlsx fallback)",
+            len(result),
         )
         return result
     except Exception as exc:
@@ -3588,38 +3824,212 @@ def save_cache(
     resolved: list[ResolvedItem],
     processed_pdfs: set[str] | None = None,
 ) -> None:
-    """Write all resolved items (including photo bytes) to a JSON cache file.
+    """Persist resolved items and processed PDF filenames.
 
-    ``processed_pdfs`` is a set of PDF base-filenames that have already been
-    fully ingested.  It is persisted alongside the order items so that
-    ``--new-batch`` can skip re-parsing them on future runs.
+    Writes to ``data/etsy_orders.db`` (SQLite) when the database exists
+    alongside the project root.  Falls back to writing
+    ``orders_cache.json`` when the database is absent or unavailable
+    (run ``python src/migrate_to_sqlite.py`` once to seed it).
+
+    ``processed_pdfs`` is the set of PDF base-filenames already ingested so
+    that ``--new-batch`` can skip re-parsing them on future runs.
     """
+    db_path = path.parent.parent / "data" / DB_FILE
+    if db_path.exists():
+        try:
+            _save_cache_sqlite(db_path, resolved, processed_pdfs)
+            return
+        except Exception as exc:
+            log.warning(
+                "SQLite cache save failed (%s) — falling back to JSON", exc
+            )
+
+    # ── JSON fallback ──────────────────────────────────────────────────────
     data = {
         "processed_pdfs": sorted(processed_pdfs or []),
         "items": [_resolved_to_dict(r) for r in resolved],
     }
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info("Cache saved: %d items -> %s", len(resolved), path.name)
+    log.info("Cache saved (JSON fallback): %d items -> %s", len(resolved), path.name)
+
+
+def _save_cache_sqlite(
+    db_path: Path,
+    resolved: list[ResolvedItem],
+    processed_pdfs: set[str] | None = None,
+) -> None:
+    """Write resolved items and processed PDF filenames to the SQLite database.
+
+    Each call is a complete state-refresh for the orders in *resolved*:
+    existing ``order_items`` rows for those order numbers are deleted and
+    re-inserted, mirroring the full-rewrite behaviour of the JSON approach.
+    """
+    conn = get_db_connection(db_path)
+    try:
+        cur = conn.cursor()
+
+        # ── Processed PDF filenames (additive — never removes old entries) ─
+        for filename in (processed_pdfs or []):
+            cur.execute(
+                "INSERT OR IGNORE INTO processed_pdfs (filename) VALUES (?)",
+                (filename,),
+            )
+
+        # ── Delete stale order_items rows then re-insert all items ─────────
+        order_numbers = list({r.order.order_number for r in resolved})
+        if order_numbers:
+            placeholders = ",".join("?" * len(order_numbers))
+            cur.execute(
+                f"DELETE FROM order_items WHERE order_number IN ({placeholders})",  # noqa: S608
+                order_numbers,
+            )
+
+        for r in resolved:
+            # Upsert order header
+            cur.execute(
+                """
+                INSERT INTO orders
+                    (order_number, etsy_shop, buyer_name, buyer_username,
+                     ship_to_name, ship_to_country, order_date, private_notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(order_number) DO UPDATE SET
+                    etsy_shop       = excluded.etsy_shop,
+                    buyer_name      = excluded.buyer_name,
+                    buyer_username  = excluded.buyer_username,
+                    ship_to_name    = excluded.ship_to_name,
+                    ship_to_country = excluded.ship_to_country,
+                    order_date      = excluded.order_date,
+                    private_notes   = excluded.private_notes
+                """,
+                (
+                    r.order.order_number,
+                    r.order.etsy_shop,
+                    r.order.buyer_name,
+                    r.order.buyer_username,
+                    r.order.ship_to_name,
+                    r.order.ship_to_country,
+                    r.order.order_date,
+                    r.order.private_notes,
+                ),
+            )
+            # Insert line item (fresh row every time — stale rows deleted above)
+            cur.execute(
+                """
+                INSERT INTO order_items
+                    (order_number, title, quantity, phone_model, style, photo_bytes)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    r.order.order_number,
+                    r.item.title,
+                    r.item.quantity,
+                    r.item.phone_model,
+                    r.item.style,
+                    r.item.photo_bytes,
+                ),
+            )
+
+        conn.commit()
+        log.info(
+            "Cache saved (SQLite): %d item(s) -> %s",
+            len(resolved), db_path.name,
+        )
+    finally:
+        conn.close()
 
 
 def load_cache(path: Path) -> tuple[list[ResolvedItem], set[str]]:
     """Load previously cached resolved items.
 
-    Returns ``(items, processed_pdfs)`` where *processed_pdfs* is the set of
-    PDF filenames that were already ingested in a prior run.
-    Returns ``([], set())`` if the cache is absent or corrupt.
+    Reads from ``data/etsy_orders.db`` (SQLite) when the database exists;
+    falls back to ``orders_cache.json`` when the database is absent.
+
+    Returns ``(items, processed_pdfs)`` where *processed_pdfs* is the set
+    of PDF filenames already ingested in a prior run.
+    Returns ``([], set())`` if neither source is available or both fail.
     """
+    db_path = path.parent.parent / "data" / DB_FILE
+    if db_path.exists():
+        try:
+            return _load_cache_sqlite(db_path)
+        except Exception as exc:
+            log.warning(
+                "SQLite cache load failed (%s) — trying JSON fallback", exc
+            )
+
+    # ── JSON fallback ──────────────────────────────────────────────────────
     if not path.exists():
         return [], set()
     try:
         data           = json.loads(path.read_text(encoding="utf-8"))
         items          = [_dict_to_resolved(d) for d in data.get("items", [])]
         processed_pdfs = set(data.get("processed_pdfs", []))
-        log.info("Cache loaded: %d prior order(s) from %s", len(items), path.name)
+        log.info(
+            "Cache loaded (JSON fallback): %d prior order(s) from %s",
+            len(items), path.name,
+        )
         return items, processed_pdfs
     except Exception as e:
         log.warning("Cache load failed (%s) -- starting fresh", e)
         return [], set()
+
+
+def _load_cache_sqlite(
+    db_path: Path,
+) -> tuple[list[ResolvedItem], set[str]]:
+    """Load resolved items and the processed-PDFs set from SQLite.
+
+    ``supplier`` is always ``None`` on the returned items; the main pipeline
+    immediately re-matches every cached item against the current catalog so
+    the supplier field is authoritative only after that step.
+    """
+    conn = get_db_connection(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                o.order_number, o.etsy_shop, o.buyer_name, o.buyer_username,
+                o.ship_to_name, o.ship_to_country, o.order_date, o.private_notes,
+                i.title, i.quantity, i.phone_model, i.style, i.photo_bytes
+            FROM order_items i
+            JOIN orders o ON i.order_number = o.order_number
+            ORDER BY o.order_number, i.id
+            """
+        ).fetchall()
+        pdf_rows = conn.execute(
+            "SELECT filename FROM processed_pdfs"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    items: list[ResolvedItem] = []
+    for row in rows:
+        order = Order(
+            order_number    = row["order_number"],
+            etsy_shop       = row["etsy_shop"]       or "",
+            buyer_name      = row["buyer_name"]      or "",
+            buyer_username  = row["buyer_username"]  or "",
+            ship_to_name    = row["ship_to_name"]    or "",
+            ship_to_country = row["ship_to_country"] or "",
+            order_date      = row["order_date"]      or "",
+            private_notes   = row["private_notes"]   or "",
+        )
+        item = OrderItem(
+            title       = row["title"],
+            quantity    = row["quantity"]    or 1,
+            phone_model = row["phone_model"] or "",
+            style       = row["style"]       or "",
+            photo_bytes = bytes(row["photo_bytes"]) if row["photo_bytes"] else None,
+        )
+        order.items = [item]
+        items.append(ResolvedItem(order=order, item=item, supplier=None, match_score=0.0))
+
+    processed_pdfs = {row["filename"] for row in pdf_rows}
+    log.info(
+        "Cache loaded (SQLite): %d item(s), %d PDF(s) tracked",
+        len(items), len(processed_pdfs),
+    )
+    return items, processed_pdfs
 
 
 def extract_photos_from_xlsx(
@@ -4319,17 +4729,130 @@ def _route_item_sort_key(r: ResolvedItem) -> tuple[str, str, str]:
     )
 
 
+def get_fts_candidates(
+    conn: sqlite3.Connection,
+    normalized_title: str,
+    limit: int = 15,
+) -> list[str]:
+    """Return up to *limit* ``product_title`` strings from the FTS5 trigram index.
+
+    Results are ordered by BM25 relevance (most similar first).  The caller
+    should apply ``_normalize`` to each returned title before fuzzy scoring.
+
+    The entire query term is wrapped in double-quotes so FTS5 treats it as a
+    phrase literal — inner double-quotes are doubled to satisfy the syntax.
+    This prevents operator keywords (AND, OR, NOT, ``*``, ``-``) that appear
+    in product titles from being mis-interpreted by the FTS5 query parser.
+
+    Returns an empty list on any error so callers can fall back gracefully.
+    """
+    # Phrase-quote the whole normalized title; double any embedded quotes.
+    safe_term = '"{}"'.format(normalized_title.replace('"', '""'))
+    try:
+        rows = conn.execute(
+            """
+            SELECT c.product_title
+            FROM   catalog_fts f
+            JOIN   catalog     c ON f.rowid = c.id
+            WHERE  catalog_fts MATCH ?
+            ORDER  BY bm25(catalog_fts)
+            LIMIT  ?
+            """,
+            (safe_term, limit),
+        ).fetchall()
+        return [row["product_title"] for row in rows]
+    except Exception as exc:
+        # Log at DEBUG so a bad title doesn't flood the console; the caller
+        # will silently fall back to the full O(N) scan.
+        log.debug("FTS5 candidate query failed for %r: %s", normalized_title, exc)
+        return []
+
+
 def match_items(
     orders: list[Order],
     catalog: list[CatalogEntry],
     threshold: int,
+    *,
+    db_path: Path | None = None,
 ) -> list[ResolvedItem]:
+    """Match every order line-item against the product catalog.
+
+    **FTS5 path** (when *db_path* points to a live SQLite database):
+
+    1. ``get_fts_candidates()`` fires a single indexed query against the
+       ``catalog_fts`` trigram table and returns ≤15 candidate titles in
+       BM25 order — O(1) lookup regardless of catalog size.
+    2. ``rapidfuzz.process.extractOne`` scores only those 15 candidates
+       instead of the full catalog, keeping all existing thresholds
+       (``EMPTY_ENTRY_MATCH_THRESHOLD``, ``FILLED_ENTRY_MATCH_THRESHOLD``,
+       ``SAME_PRODUCT_THRESHOLD``, ``VARIANT_HINT_THRESHOLD``) intact.
+
+    **O(N) fallback** (when the database is absent, unavailable, or when
+    FTS returns no candidates for a particular title):
+
+    The original full-catalog ``process.extractOne`` scan is used so the
+    result is identical to the pre-migration behaviour.
+    """
     catalog_titles = [_normalize(e.product_title) for e in catalog]
+
+    # Pre-build a normalized-title → catalog-index map for O(1) FTS lookups.
+    # When duplicate normalized titles exist the last index wins — consistent
+    # with extractOne picking the last match on ties.
+    title_to_idx: dict[str, int] = {t: i for i, t in enumerate(catalog_titles)}
+
+    # Open one DB connection for the whole batch; None means O(N) fallback.
+    conn: sqlite3.Connection | None = None
+    if db_path is not None and db_path.exists():
+        try:
+            conn = get_db_connection(db_path)
+        except Exception as exc:
+            log.warning(
+                "match_items: cannot open SQLite DB (%s) — using O(N) scan", exc
+            )
+
+    fts_active = conn is not None
     resolved: list[ResolvedItem] = []
 
     for order in orders:
         for item in order.items:
             norm = _normalize(item.title)
+
+            # ── FTS5 pre-filter path ───────────────────────────────────────
+            if conn is not None:
+                candidate_titles = get_fts_candidates(conn, norm)
+                if candidate_titles:
+                    # Map each FTS candidate title back to its in-memory
+                    # CatalogEntry.  Products added mid-session via
+                    # update_catalog() live in `catalog` but may not yet be
+                    # in the FTS index; they are handled by the fallback below.
+                    cand_norm: list[str] = []
+                    cand_entries: list[CatalogEntry] = []
+                    for raw_title in candidate_titles:
+                        n = _normalize(raw_title)
+                        idx = title_to_idx.get(n)
+                        if idx is not None:
+                            cand_norm.append(n)
+                            cand_entries.append(catalog[idx])
+
+                    if cand_norm:
+                        result = process.extractOne(
+                            norm,
+                            cand_norm,
+                            scorer=fuzz.token_sort_ratio,
+                            score_cutoff=threshold,
+                        )
+                        if result:
+                            _, score, ci = result
+                            resolved.append(
+                                ResolvedItem(order, item, cand_entries[ci], score)
+                            )
+                        else:
+                            resolved.append(ResolvedItem(order, item, None, 0.0))
+                        continue   # item handled — skip the O(N) scan below
+
+            # ── O(N) fallback: full catalog scan ──────────────────────────
+            # Used when: DB absent | FTS returned no candidates | candidate
+            # titles did not map to any in-memory entry.
             result = process.extractOne(
                 norm,
                 catalog_titles,
@@ -4342,9 +4865,14 @@ def match_items(
             else:
                 resolved.append(ResolvedItem(order, item, None, 0.0))
 
+    if conn is not None:
+        conn.close()
+
     matched = sum(1 for r in resolved if r.supplier)
     log.info(
-        "Matched %d / %d items (threshold %d%%)", matched, len(resolved), threshold
+        "Matched %d / %d items (threshold %d%%, %s)",
+        matched, len(resolved), threshold,
+        "FTS5+rapidfuzz" if fts_active else "O(N) rapidfuzz",
     )
     return resolved
 
@@ -10169,7 +10697,8 @@ def main() -> None:
         log.info("Re-matching %d prior item(s) against current catalog "
                  "(picks up catalog edits) ...", len(cached_items))
         rematched_all = match_items(
-            [r.order for r in cached_items], catalog, args.threshold
+            [r.order for r in cached_items], catalog, args.threshold,
+            db_path=catalog_path.parent / DB_FILE,
         )
         # Swap in updated supplier info; keep original item data (photos, etc.)
         updated_cached: list[ResolvedItem] = []
@@ -10230,7 +10759,10 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     new_resolved: list[ResolvedItem] = []
     if all_new_orders:
-        new_resolved = match_items(all_new_orders, catalog, args.threshold)
+        new_resolved = match_items(
+            all_new_orders, catalog, args.threshold,
+            db_path=catalog_path.parent / DB_FILE,
+        )
 
     # Deduplicate new items against the cache using the same normalised
     # (order_number, norm_title[:50], style_components) key.  This lets
