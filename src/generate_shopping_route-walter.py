@@ -1987,7 +1987,12 @@ def update_catalog(path: Path, resolved: list[ResolvedItem]) -> int:
         tc.border    = _BORDER
         ws.row_dimensions[total_row_num].height = 20
 
-        sync_suppliers_from_product_map(wb)
+        # NOTE: sync_suppliers_from_product_map is intentionally NOT called here.
+        # Calling it on every catalog update would resurrect suppliers that the
+        # user has explicitly deleted via the "Manage Suppliers" dialog, because
+        # existing Product Map rows still carry the old shop/stall values.
+        # Supplier list management (add/remove) is owned by the dialog; use
+        # --sync-suppliers or --rebuild-catalog to do a one-off forced sync.
         _refresh_all_product_map_validations(wb, ws)
         set_supplier_catalog_active_to_product_map(wb)
         backup_supplier_catalog_before_write(path, "append_new_products")

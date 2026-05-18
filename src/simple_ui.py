@@ -50,6 +50,7 @@ try:
         save_cache,
         update_product_map_cells,
         update_product_map_photo,
+        CatalogEntry,
         Order,
         OrderItem,
         ResolvedItem,
@@ -77,6 +78,7 @@ except ImportError:
     save_cache = None  # type: ignore[assignment, misc]
     update_product_map_cells = None  # type: ignore[assignment, misc]
     update_product_map_photo = None  # type: ignore[assignment, misc]
+    CatalogEntry = None  # type: ignore[assignment, misc]
     Order = None  # type: ignore[assignment, misc]
     OrderItem = None  # type: ignore[assignment, misc]
     ResolvedItem = None  # type: ignore[assignment, misc]
@@ -1104,6 +1106,7 @@ class App(tk.Tk):
         self._w_zx_lbl: ttk.Label | None = None
         self._w_cd_lbl: ttk.Label | None = None
         self._run_btn: tk.Button | None = None
+        self._active_dashboard: object | None = None   # _OrdersDashboardDialog ref
         self._w_run_hint: tk.Label | None = None
         self._log_frame: ttk.LabelFrame | None = None
         self._notebook: ttk.Notebook | None = None
@@ -2156,6 +2159,15 @@ class App(tk.Tk):
                 def done() -> None:
                     self._run_busy = False
                     self._set_chrome_busy(False)
+                    # If the Orders Dashboard is open, flag its data as stale —
+                    # the cache on disk was just rewritten by the generator.
+                    dash = self._active_dashboard
+                    if dash is not None:
+                        try:
+                            if dash._d.winfo_exists():
+                                dash._notify_data_stale()
+                        except Exception:
+                            pass
 
                 self.after(0, done)
 
@@ -2294,7 +2306,7 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        _OrdersDashboardDialog(
+        dlg = _OrdersDashboardDialog(
             self, items,
             title_to_row=title_to_row,
             supplier_shops=sup_shops,
@@ -2307,6 +2319,11 @@ class App(tk.Tk):
             charm_shop_stalls=charm_shop_stalls,
             catalog_photos=catalog_photos,
         )
+        self._active_dashboard = dlg
+        def _on_dashboard_closed() -> None:
+            self._active_dashboard = None
+            dlg._d.destroy()
+        dlg._d.protocol("WM_DELETE_WINDOW", _on_dashboard_closed)
 
     def _open_edit_products_dialog(self) -> None:
         if update_product_map_cells is None or list_product_map_rows_for_picker is None:
@@ -3307,7 +3324,8 @@ class _OrdersDashboardDialog:
         d.geometry("1640x880")
         d.minsize(1260, 680)
         d.grid_columnconfigure(0, weight=1)
-        d.grid_rowconfigure(2, weight=1)
+        d.grid_rowconfigure(3, weight=1)   # row 2 = stale banner (zero height when hidden)
+        self._stale_banner: tk.Frame | None = None
 
         # ── Row 0: Hero ───────────────────────────────────────────────
         hero = tk.Frame(d, bg=COLORS["hero"], highlightthickness=0)
@@ -3372,9 +3390,24 @@ class _OrdersDashboardDialog:
         )
         self._btn_add_order.pack(side=tk.RIGHT, padx=(0, 14), pady=6)
 
-        # ── Row 2: Body (tree left + detail panel right) ──────────────
+        # "Refresh" button — reloads cache + catalog and rebuilds item lists
+        self._refresh_btn = tk.Button(
+            toolbar,
+            text="\u21bb  Refresh" if self._lang == "en" else "\u21bb  \u5237\u65b0",
+            font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT, bd=0, padx=10, pady=5, cursor="hand2",
+            bg=COLORS["strip"], fg=COLORS["text"],
+            activebackground=COLORS["border"], activeforeground=COLORS["text"],
+            command=self._do_refresh,
+        )
+        self._refresh_btn.pack(side=tk.RIGHT, padx=(0, 6), pady=6)
+
+        # ── Row 2: Stale-data banner (hidden by default, shown after external changes) ──
+        # Created at row 2; the body sits at row 3 so the banner never displaces content.
+
+        # ── Row 3: Body (tree left + detail panel right) ──────────────
         body = tk.Frame(d, bg=COLORS["app"])
-        body.grid(row=2, column=0, sticky="nsew", padx=12, pady=(8, 0))
+        body.grid(row=3, column=0, sticky="nsew", padx=12, pady=(8, 0))
         # Tree takes all available horizontal space; right panel is a FIXED 330px
         body.grid_columnconfigure(0, weight=1)
         body.grid_columnconfigure(1, weight=0)   # never resizes
@@ -3555,9 +3588,9 @@ class _OrdersDashboardDialog:
         # Edit fields storage
         self._edit_widgets: dict[str, object] = {}
 
-        # ── Row 3: Footer ─────────────────────────────────────────────
+        # ── Row 4: Footer ─────────────────────────────────────────────
         foot = tk.Frame(d, bg=COLORS["app"])
-        foot.grid(row=3, column=0, sticky="ew", padx=14, pady=(8, 12))
+        foot.grid(row=4, column=0, sticky="ew", padx=14, pady=(8, 12))
         ttk.Button(foot, text="Close" if self._lang == "en" else "\u5173\u95ed",
                    command=d.destroy, style="Tool.TButton").pack(side=tk.RIGHT)
         self._regen_btn = ttk.Button(
@@ -3727,6 +3760,212 @@ class _OrdersDashboardDialog:
 
         self._cg_items = cg
         self._ch_items = ch
+
+    # ── Stale-data banner + refresh ───────────────────────────────────
+
+    def _notify_data_stale(self) -> None:
+        """Called by App when the route generator completes and the cache is fresh.
+
+        Shows a dismissible banner so the user knows the in-memory data no longer
+        matches the file on disk.  Auto-triggers a background refresh rather than
+        waiting for the user to click.
+        """
+        self._show_stale_banner()
+        # Auto-refresh after a short delay so the banner is visible briefly
+        # before the data updates — gives the user awareness of what happened.
+        self._d.after(800, self._do_refresh)
+
+    def _show_stale_banner(self) -> None:
+        """Display the amber 'data stale' strip between toolbar and body."""
+        if self._stale_banner is not None:
+            try:
+                if self._stale_banner.winfo_exists():
+                    return   # already shown
+            except Exception:
+                pass
+
+        banner = tk.Frame(self._d, bg="#78350f", highlightthickness=0)
+        banner.grid(row=2, column=0, sticky="ew")
+        banner.grid_columnconfigure(0, weight=1)
+
+        msg = (
+            "\u26a0\ufe0f  Route was regenerated — refreshing data\u2026"
+            if self._lang == "en" else
+            "\u26a0\ufe0f  \u8def\u7ebf\u5df2\u91cd\u65b0\u751f\u6210 \u2014 \u6b63\u5728\u5237\u65b0\u6570\u636e\u2026"
+        )
+        tk.Label(
+            banner, text=msg,
+            font=("Segoe UI", 9, "bold"), fg="#fef3c7", bg="#78350f",
+            anchor=tk.W,
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=6)
+
+        tk.Button(
+            banner,
+            text="\u2715",
+            font=("Segoe UI", 9, "bold"),
+            bg="#78350f", fg="#fef3c7",
+            activebackground="#92400e", activeforeground="#fef3c7",
+            relief=tk.FLAT, bd=0, padx=8, cursor="hand2",
+            command=self._dismiss_stale_banner,
+        ).grid(row=0, column=1, sticky="e", padx=8, pady=4)
+
+        self._stale_banner = banner
+
+    def _dismiss_stale_banner(self) -> None:
+        if self._stale_banner is not None:
+            try:
+                self._stale_banner.grid_remove()
+                self._stale_banner.destroy()
+            except Exception:
+                pass
+            self._stale_banner = None
+
+    def _do_refresh(self) -> None:
+        """Reload orders cache + catalog metadata, rebuild item lists, repaint tree.
+
+        All I/O runs in a background thread; UI is locked with a watch cursor
+        and the refresh button is disabled until the reload completes.
+        """
+        if not FILE_ORDERS_CACHE.exists():
+            return
+
+        self._dismiss_stale_banner()
+        prev_cursor = self._d.cget("cursor")
+        self._d.config(cursor="watch")
+        self._refresh_btn.config(state=tk.DISABLED)
+        self._d.update_idletasks()
+
+        def _bg() -> None:
+            # ── 1. Reload order cache ─────────────────────────────────
+            new_items: list = []
+            try:
+                if load_cache is not None:
+                    new_items, _ = load_cache(FILE_ORDERS_CACHE)
+            except Exception:
+                pass
+
+            if not new_items:
+                self._d.after(0, lambda: _done(None))
+                return
+
+            # ── 2. Reload title→row mapping ───────────────────────────
+            new_title_to_row: dict[str, int] = {}
+            if list_product_map_rows_for_picker is not None and FILE_SUPPLIER_CATALOG.exists():
+                try:
+                    for pr in list_product_map_rows_for_picker(FILE_SUPPLIER_CATALOG):
+                        fk = _normalize(pr.title)
+                        new_title_to_row[fk] = pr.row_num
+                        new_title_to_row[fk[:50]] = pr.row_num
+                except Exception:
+                    pass
+
+            # ── 3. Reload supplier metadata ───────────────────────────
+            new_sup_shops: list[str] = []
+            new_sup_stalls: list[str] = []
+            new_sup_shop_stalls: dict[str, str] = {}
+            new_sup_stall_shops: dict[str, str] = {}
+            try:
+                import openpyxl as _xl
+                _wb = _xl.load_workbook(FILE_SUPPLIER_CATALOG, read_only=True, data_only=True)
+                if "Suppliers" in _wb.sheetnames:
+                    _ws = _wb["Suppliers"]
+                    _shop_ci = _stall_ci = None
+                    for ci in range(1, 20):
+                        h = str(_ws.cell(1, ci).value or "").strip().lower()
+                        if h == "shop name":
+                            _shop_ci = ci
+                        elif h == "stall":
+                            _stall_ci = ci
+                    for row in _ws.iter_rows(min_row=2, values_only=False):
+                        _sv  = str(row[_shop_ci  - 1].value or "").strip() if _shop_ci  else ""
+                        _stv = str(row[_stall_ci - 1].value or "").strip() if _stall_ci else ""
+                        if _sv and _sv not in new_sup_shops:
+                            new_sup_shops.append(_sv)
+                        if _stv and _stv not in new_sup_stalls:
+                            new_sup_stalls.append(_stv)
+                        if _sv and _stv:
+                            new_sup_shop_stalls.setdefault(_sv, _stv)
+                            new_sup_stall_shops.setdefault(_stv, _sv)
+                _wb.close()
+            except Exception:
+                pass
+
+            # ── 4. Reload charm library + shops ───────────────────────
+            new_charm_library: dict = {}
+            new_charm_codes: list[str] = []
+            new_charm_shops: list[str] = []
+            new_charm_shop_stalls: dict[str, str] = {}
+            try:
+                if load_charm_library is not None and FILE_SUPPLIER_CATALOG.exists():
+                    new_charm_library = load_charm_library(FILE_SUPPLIER_CATALOG)
+                    new_charm_codes = list(new_charm_library.keys())
+                if load_charm_shops is not None and FILE_SUPPLIER_CATALOG.exists():
+                    for cs in load_charm_shops(FILE_SUPPLIER_CATALOG):
+                        if cs.shop_name:
+                            new_charm_shops.append(cs.shop_name)
+                            if cs.stall:
+                                new_charm_shop_stalls[cs.shop_name] = cs.stall
+            except Exception:
+                pass
+
+            # ── 5. Reload catalog photos ──────────────────────────────
+            new_catalog_photos: dict[str, bytes] = {}
+            if get_catalog_photo_map is not None and FILE_SUPPLIER_CATALOG.exists():
+                try:
+                    new_catalog_photos = get_catalog_photo_map(FILE_SUPPLIER_CATALOG)
+                except Exception:
+                    pass
+
+            result = {
+                "items": new_items,
+                "title_to_row": new_title_to_row,
+                "sup_shops": new_sup_shops, "sup_stalls": new_sup_stalls,
+                "sup_shop_stalls": new_sup_shop_stalls, "sup_stall_shops": new_sup_stall_shops,
+                "charm_library": new_charm_library, "charm_codes": new_charm_codes,
+                "charm_shops": new_charm_shops, "charm_shop_stalls": new_charm_shop_stalls,
+                "catalog_photos": new_catalog_photos,
+            }
+            self._d.after(0, lambda r=result: _done(r))
+
+        def _done(result: dict | None) -> None:
+            self._d.config(cursor=prev_cursor)
+            self._refresh_btn.config(state=tk.NORMAL)
+
+            if result is None:
+                return
+
+            # Absorb fresh data
+            self._items               = result["items"]
+            self._title_to_row        = result["title_to_row"]
+            self._sup_shops           = result["sup_shops"]
+            self._sup_stalls          = result["sup_stalls"]
+            self._sup_shop_stalls     = result["sup_shop_stalls"]
+            self._sup_stall_shops     = result["sup_stall_shops"]
+            self._charm_library       = result["charm_library"]
+            self._charm_codes         = result["charm_codes"]
+            self._charm_shops         = result["charm_shops"]
+            self._charm_shop_stalls   = result["charm_shop_stalls"]
+            self._catalog_photos      = dict(result["catalog_photos"])
+
+            # Clear thumbnail cache — photos may have changed
+            self._thumb_cache.clear()
+            self._charm_lib_photo_ref.clear()
+
+            # Rebuild classified item lists and repaint
+            self._build_item_lists()
+            # Rebuild charm gallery if in charms mode (new charm library may differ)
+            if self._mode == "charms":
+                self._rebuild_gallery()
+            else:
+                self._populate_tree()
+            self._update_selection_badge()
+            self._clear_detail()
+
+            # Brief confirmation flash on the refresh button
+            self._refresh_btn.config(fg="#047857")
+            self._d.after(1500, lambda: self._refresh_btn.config(fg=COLORS["text"]))
+
+        threading.Thread(target=_bg, daemon=True).start()
 
     # ── Thumbnails ────────────────────────────────────────────────────
 
@@ -5932,40 +6171,16 @@ class _OrdersDashboardDialog:
         n_total = len(save_tasks)
 
         def _bg_save() -> None:
-            # Refresh row mapping in background (keeps it current with any
-            # external catalog changes without blocking the main thread).
-            fresh_map: dict[str, int] = dict(self._title_to_row)
-            if list_product_map_rows_for_picker is not None and FILE_SUPPLIER_CATALOG.exists():
-                try:
-                    m: dict[str, int] = {}
-                    for pr in list_product_map_rows_for_picker(FILE_SUPPLIER_CATALOG):
-                        fk = _normalize(pr.title)
-                        m[fk] = pr.row_num
-                        m[fk[:50]] = pr.row_num
-                    fresh_map = m
-                except Exception:
-                    pass
-
-            def _get_row(d_: dict) -> int | None:
-                row = fresh_map.get(d_["norm_title"])
-                if row is not None:
-                    return row
-                short = d_["norm_title"][:50]
-                row = fresh_map.get(short)
-                if row is not None:
-                    return row
-                for key, r in fresh_map.items():
-                    if key.startswith(d_["norm_title"]) or d_["norm_title"].startswith(key):
-                        return r
-                return None
-
+            # Use the pre-validated row numbers from save_tasks directly.
+            # Re-reading the entire Excel workbook just to refresh the row
+            # mapping is unnecessary (row numbers only change during a catalog
+            # rebuild, not when individual cells are updated) and was the
+            # primary source of the ~10-second delay after every save.
             saved_count = 0
             errors: list[str] = []
-            for idx, d, _old_row in save_tasks:
-                row_num = _get_row(d)
-                if row_num is None:
-                    errors.append(f"Row not found: {d['title'][:40]}")
-                    continue
+            successfully_saved: list[tuple[int, dict]] = []
+
+            for idx, d, row_num in save_tasks:
                 try:
                     if mode_snapshot == "casegrip":
                         update_product_map_cells(
@@ -5978,6 +6193,7 @@ class _OrdersDashboardDialog:
                             charm_code=new_code, charm_shop=new_shop,
                         )
                     saved_count += 1
+                    successfully_saved.append((idx, d))
                 except Exception as e:
                     errors.append(str(e))
 
@@ -5988,33 +6204,73 @@ class _OrdersDashboardDialog:
                 except Exception:
                     pass
 
-            self._d.after(0, lambda sc=saved_count, er=errors, fm=fresh_map:
-                          _on_done(sc, er, fm))
+            self._d.after(0, lambda sc=saved_count, er=errors, ss=successfully_saved:
+                          _on_done(sc, er, ss))
 
-        def _on_done(saved_count: int, errors: list, fresh_map: dict) -> None:
+        def _on_done(saved_count: int, errors: list, successfully_saved: list) -> None:
             # Re-enable save button
             if save_btn:
                 save_btn.config(state=tk.NORMAL)
 
-            # Absorb the refreshed row mapping
-            self._title_to_row = fresh_map
-
             if errors:
                 from tkinter import messagebox
                 messagebox.showerror(
-                    "Batch save — errors",
+                    "Batch save \u2014 errors",
                     f"{saved_count} saved, {len(errors)} failed:\n" + "\n".join(errors[:5]),
                 )
             elif skipped_titles:
                 from tkinter import messagebox
                 messagebox.showwarning(
-                    "Batch save — not found",
+                    "Batch save \u2014 not found",
                     f"{saved_count} saved.\n"
                     f"{len(skipped_titles)} product(s) not in catalog:\n"
                     + "\n".join(skipped_titles[:5]),
                 )
 
             if saved_count:
+                # Mirror the supplier changes into self._items (ResolvedItem
+                # objects) so that _do_refresh → _build_item_lists reads the
+                # correct supplier/stall instead of reverting to stale cache
+                # values.  CatalogEntry is a plain mutable dataclass, so we
+                # can update its fields in-place.
+                for _idx, _d in successfully_saved:
+                    _onum  = _d.get("order",      "")
+                    _norm  = _d.get("norm_title", "")
+                    for _r in self._items:
+                        if (_r.order.order_number == _onum
+                                and _normalize(_r.item.title) == _norm):
+                            if mode_snapshot == "casegrip":
+                                if _r.supplier is None:
+                                    _r.supplier = CatalogEntry(
+                                        product_title=_r.item.title,
+                                        shop_name=new_sup,
+                                        stall=new_stall,
+                                    )
+                                else:
+                                    _r.supplier.shop_name = new_sup
+                                    _r.supplier.stall     = new_stall
+                            else:
+                                if _r.supplier is None:
+                                    _r.supplier = CatalogEntry(
+                                        product_title=_r.item.title,
+                                        charm_code=new_code,
+                                        charm_shop=new_shop,
+                                    )
+                                else:
+                                    _r.supplier.charm_code = new_code
+                                    _r.supplier.charm_shop = new_shop
+                            break
+
+                # Persist to the order cache so that _do_refresh (which
+                # reloads self._items from this JSON file) sees the updated
+                # supplier values and the panel never reverts.
+                if save_cache is not None and FILE_ORDERS_CACHE.exists():
+                    try:
+                        _, _existing_pdfs = load_cache(FILE_ORDERS_CACHE)
+                        save_cache(FILE_ORDERS_CACHE, self._items, _existing_pdfs)
+                    except Exception:
+                        pass
+
                 if self._lang == "en":
                     status_msg = (
                         f"\u2713 Saved {saved_count} order{'s' if n_total > 1 else ''}"
@@ -6703,10 +6959,13 @@ class _OrdersDashboardDialog:
         # that our JSON cache and the xlsx status round-trip use identical keys.
         k = (d.get("order", ""), (d.get("norm_title") or "")[:50], comp)
 
-        if status == "Pending":
-            self._pstatuses.pop(k, None)
-        else:
-            self._pstatuses[k] = status
+        # Always store the status, including "Pending".  Explicitly writing
+        # "Pending" is essential so the generator's _load_ui_status_cache can
+        # use it as a priority override against stale "Purchased" values that
+        # may linger in the old shopping_route.xlsx from a previous session.
+        # Without this, popping the key leaves the xlsx value unchallenged and
+        # the item appears fully-purchased even though the user reset it.
+        self._pstatuses[k] = status
         self._save_pstatuses_cache()
 
         # Repopulate and restore selection + scroll position
@@ -11153,25 +11412,113 @@ class _SuppliersManagerDialog:
         self._repopulate()
         self._write()
 
+    def _count_product_map_refs(self, shop: str, stall: str) -> int:
+        """Return how many Product Map rows have both Shop Name == *shop* and Stall == *stall*."""
+        try:
+            import openpyxl as _xl
+            _wb = _xl.load_workbook(self._catalog_path, read_only=True, data_only=True)
+            if CATALOG_SHEET not in _wb.sheetnames:
+                _wb.close()
+                return 0
+            _ws = _wb[CATALOG_SHEET]
+            count = 0
+            for _row in _ws.iter_rows(min_row=2, values_only=True):
+                if len(_row) >= 4:
+                    _rs = str(_row[2] or "").strip()   # col C = Shop Name
+                    _rt = str(_row[3] or "").strip()   # col D = Stall
+                    if _rs == shop and _rt == stall:
+                        count += 1
+            _wb.close()
+            return count
+        except Exception:
+            return 0
+
+    def _clear_product_map_refs(self, shop: str, stall: str) -> int:
+        """Clear Shop Name (col C) and Stall (col D) from every Product Map row
+        that references *shop* + *stall*.
+
+        This prevents ``sync_suppliers_from_product_map`` from resurrecting a
+        deleted supplier on the next catalog-update or ``--sync-suppliers`` run,
+        because those functions only re-add pairs that still appear in the
+        Product Map.  Clearing the references makes the deletion permanent.
+
+        Returns the number of Product Map rows that were cleared.
+        """
+        try:
+            if backup_supplier_catalog_before_write is not None:
+                backup_supplier_catalog_before_write(
+                    self._catalog_path, "manage_suppliers_clear"
+                )
+            import openpyxl as _xl
+            _wb = _xl.load_workbook(self._catalog_path)
+            if CATALOG_SHEET not in _wb.sheetnames:
+                _wb.close()
+                return 0
+            _ws = _wb[CATALOG_SHEET]
+            cleared = 0
+            for _r in range(2, _ws.max_row + 1):
+                _rs = str(_ws.cell(_r, 3).value or "").strip()   # Shop Name
+                _rt = str(_ws.cell(_r, 4).value or "").strip()   # Stall
+                if _rs == shop and _rt == stall:
+                    _ws.cell(_r, 3).value = None
+                    _ws.cell(_r, 4).value = None
+                    cleared += 1
+            if cleared:
+                _wb.save(self._catalog_path)
+            _wb.close()
+            return cleared
+        except Exception as _e:
+            messagebox.showerror(
+                "Save failed" if self._lang == "en" else "\u4fdd\u5b58\u5931\u8d25",
+                str(_e), parent=self._d,
+            )
+            return 0
+
     def _remove_entry(self) -> None:
         sel = self._tree.selection()
         if not sel:
             return
-        idx  = self._tree.index(sel[0])
-        name = self._rows[idx]["shop"]
-        if not messagebox.askyesno(
-            "Remove supplier" if self._lang == "en" else "\u5220\u9664\u4f9b\u5e94\u5546",
-            (f"Remove \u2018{name}\u2019 from the Suppliers list?"
-             if self._lang == "en" else
-             f"\u5220\u9664\u300c{name}\u300d\uff1f"),
-            parent=self._d,
-        ):
+        idx   = self._tree.index(sel[0])
+        row   = self._rows[idx]
+        name  = row["shop"]
+        stall = row["stall"]
+
+        # Count Product Map rows referencing this supplier so the user knows
+        # how many product assignments will be cleared.
+        pm_count = self._count_product_map_refs(name, stall)
+
+        if self._lang == "en":
+            _title = "Remove supplier"
+            _msg   = f"Remove \u2018{name}\u2019 (stall {stall}) from the Suppliers list?"
+            if pm_count:
+                _msg += (
+                    f"\n\nThe supplier assignment will also be cleared from "
+                    f"{pm_count} product(s) in the catalog, so this supplier "
+                    f"cannot reappear automatically on future runs."
+                )
+        else:
+            _title = "\u5220\u9664\u4f9b\u5e94\u5546"
+            _msg   = f"\u5220\u9664\u300c{name}\u300d\uff08\u6444\u4f4d {stall}\uff09\uff1f"
+            if pm_count:
+                _msg += (
+                    f"\n\n\u5c06\u540c\u65f6\u6e05\u9664\u4ea7\u54c1\u76ee\u5f55\u4e2d "
+                    f"{pm_count} \u4e2a\u5546\u54c1\u7684\u4f9b\u5e94\u5546\u5206\u914d\uff0c"
+                    f"\u907f\u514d\u8be5\u4f9b\u5e94\u5546\u5728\u4e0b\u6b21\u8fd0\u884c\u65f6\u81ea\u52a8\u91cd\u73b0\u3002"
+                )
+
+        if not messagebox.askyesno(_title, _msg, parent=self._d):
             return
         del self._rows[idx]
         self._repopulate()
         self._edit_btn.config(state="disabled")
         self._remove_btn.config(state="disabled")
-        self._write()
+        self._write()   # update Suppliers sheet
+
+        # Clear orphaned Product Map references so sync_suppliers_from_product_map
+        # (whether triggered implicitly or via --sync-suppliers) cannot
+        # re-add this supplier entry from stale catalog data.
+        if pm_count:
+            self._clear_product_map_refs(name, stall)
 
     def _close(self) -> None:
         self._d.destroy()

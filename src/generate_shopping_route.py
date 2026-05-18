@@ -36,6 +36,12 @@ blue "Awaiting Supplier Info" section so they are never buried in the table.
    **When Charm Code is blank**, the order is shown in a separate **"Awaiting Charm Code"**
    sub-section with the product photo and a prompt to assign a code in the catalog.
 
+   **Charm section vs dashboard:** Only line items whose charm Buy Status is still actionable
+   (Pending or Out of Stock — not Purchased or Out of Production) appear in the route Charm
+   section, so the spreadsheet lists what you still need to buy.  Line items you uncheck in
+   the dashboard are removed from *all* route sections (including charm aggregation) via
+   ``--exclude-orders-file``.
+
    Typical setup: add every distinct charm to the library once; for each catalog product
    that ships with that charm, pick the matching **G** (shop) and **H** (code).  **G** can
    match **D** from the library as a default, but you may override **G** per product if
@@ -2058,7 +2064,12 @@ def update_catalog(path: Path, resolved: list[ResolvedItem]) -> int:
         tc.border    = _BORDER
         ws.row_dimensions[total_row_num].height = 20
 
-        sync_suppliers_from_product_map(wb)
+        # NOTE: sync_suppliers_from_product_map is intentionally NOT called here.
+        # Calling it on every catalog update would resurrect suppliers that the
+        # user has explicitly deleted via the "Manage Suppliers" dialog, because
+        # existing Product Map rows still carry the old shop/stall values.
+        # Supplier list management (add/remove) is owned by the dialog; use
+        # --sync-suppliers or --rebuild-catalog to do a one-off forced sync.
         _refresh_all_product_map_validations(wb, ws)
         set_supplier_catalog_active_to_product_map(wb)
         backup_supplier_catalog_before_write(path, "append_new_products")
@@ -3496,7 +3507,7 @@ def _resolved_to_dict(r: ResolvedItem) -> dict:
 def _dict_to_resolved(d: dict) -> ResolvedItem:
     """Deserialise a cached dict back into a ResolvedItem."""
     order = Order(
-        order_number    = d["order_number"],
+        order_number    = str(d.get("order_number", "") or "").strip(),
         etsy_shop       = d["etsy_shop"],
         buyer_name      = d.get("buyer_name",      ""),
         buyer_username  = d.get("buyer_username",  ""),
@@ -3985,7 +3996,11 @@ def _load_ui_status_cache(
     try:
         import json as _json
         raw: dict = _json.loads(cache_path.read_text(encoding="utf-8"))
-        valid = {"Purchased", "Out of Stock", "Out of Production"}
+        # "Pending" is included so an explicit UI reset to Pending can override
+        # a stale "Purchased" value that load_existing_statuses may have read
+        # from the previous shopping_route.xlsx.  Without "Pending" here, the
+        # xlsx stale value would win and the item would appear fully-purchased.
+        valid = {"Pending", "Purchased", "Out of Stock", "Out of Production"}
         result: dict[tuple[str, str, str], str] = {}
         for k_str, val in raw.items():
             if val not in valid:
@@ -4065,6 +4080,55 @@ def _section_complete(status: str | None) -> bool:
     Both "Purchased" and "Out of Production" are terminal — no further action.
     """
     return status in ("Purchased", "Out of Production")
+
+
+def _charm_status_key(r: ResolvedItem) -> tuple[str, str, str]:
+    """Same key shape as load_existing_statuses / route_statuses_cache (50-char norm)."""
+    return (
+        str(r.order.order_number).strip(),
+        _normalize(r.item.title)[:50],
+        "charm",
+    )
+
+
+def _charm_line_in_shopping_route(
+    r: ResolvedItem,
+    statuses: dict[tuple[str, str, str], str] | None,
+) -> bool:
+    """True when this line item should appear in the route Charm section (Excel/HTML).
+
+    Without this filter, every order line with a charm in ``style`` was included,
+    so Purchased / Out-of-Production charms still inflated counts and shop lists
+    even though the dashboard already showed them as done.
+    """
+    if not _style_has(r.item.style)[2]:
+        return False
+    st = (statuses or {}).get(_charm_status_key(r), "Pending")
+    return not _section_complete(st)
+
+
+def _load_dashboard_route_exclusions(path: Path) -> set[tuple[str, str]]:
+    """Parse ``--exclude-orders-file`` JSON from the Orders Dashboard.
+
+    Returns a set of ``(normalized_title, order_number_str)`` for fast lookup.
+    """
+    import json as _json
+    raw = _json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        log.warning(
+            "exclude-orders-file: expected a JSON array, got %s — ignoring",
+            type(raw).__name__,
+        )
+        return set()
+    out: set[tuple[str, str]] = set()
+    for e in raw:
+        if not isinstance(e, dict):
+            continue
+        o = str(e.get("order", "")).strip()
+        nt = _normalize(str(e.get("norm_title", "")))
+        if o and nt:
+            out.add((nt, o))
+    return out
 
 
 def _items_to_purchase(
@@ -5781,10 +5845,11 @@ def _sheet_route(ws, items: list[ResolvedItem],
                   and _needs_casegrip(r)]
     unmatched  = [r for r in items if (not r.supplier or _needs_catalog_entry(r)) and _needs_casegrip(r)]
 
-    # Charm items: any order whose style includes a charm component.
-    # These receive a dedicated CHARMS section at the bottom of the sheet,
-    # completely separate from the case/grip supplier sections.
-    charm_items     = [r for r in items if _style_has(r.item.style)[2]]
+    # Charm items: style includes a charm AND the charm is not already bought
+    # (Purchased / Out of Production).  Otherwise the Charm section mirrored
+    # the whole dashboard instead of the actual procurement list.
+    _st = statuses or {}
+    charm_items     = [r for r in items if _charm_line_in_shopping_route(r, _st)]
     total_charm_qty = sum(r.item.quantity for r in charm_items)
 
     supplier_stops = len({(r.supplier.shop_name, r.supplier.stall) for r in routable})
@@ -6983,7 +7048,7 @@ def _sheet_route_simple(
     routable   = [r for r in items if _has_loc(r)]
     needs_info = [r for r in items if r.supplier and not _has_loc(r) and not _needs_catalog_entry(r)]
     unmatched  = [r for r in items if not r.supplier or _needs_catalog_entry(r)]
-    charm_items = [r for r in items if _style_has(r.item.style)[2]]
+    charm_items = [r for r in items if _charm_line_in_shopping_route(r, _statuses)]
 
     total_charm_qty = sum(r.item.quantity for r in charm_items)
     supplier_stops  = len({(r.supplier.shop_name, r.supplier.stall) for r in routable})
@@ -8075,7 +8140,7 @@ def generate_html(items: list[ResolvedItem], output: Path,
     needs_info  = [r for r in items
                    if r.supplier and not _has_loc(r) and not _needs_catalog_entry(r)]
     unmatched   = [r for r in items if not r.supplier or _needs_catalog_entry(r)]
-    charm_items = [r for r in items if _style_has(r.item.style)[2]]
+    charm_items = [r for r in items if _charm_line_in_shopping_route(r, _statuses)]
 
     groups: dict[tuple[str, str], list[ResolvedItem]] = defaultdict(list)
     for r in routable:
@@ -10410,23 +10475,34 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     route_resolved = all_resolved   # default: include everything
     if (args.exclude_orders_file or "").strip():
-        import json as _excl_json
         _excl_path = Path(args.exclude_orders_file.strip())
         if _excl_path.is_file():
             try:
-                _excl_list = _excl_json.loads(_excl_path.read_text(encoding="utf-8"))
-                _excl_set: set[tuple[str, str]] = {
-                    (str(e.get("order", "")), str(e.get("norm_title", "")))
-                    for e in _excl_list
-                    if isinstance(e, dict)
-                }
-                if _excl_set:
+                _excl_pairs = _load_dashboard_route_exclusions(_excl_path)
+                if _excl_pairs:
                     route_resolved = [
                         r for r in all_resolved
-                        if (_normalize(r.item.title), r.order.order_number)
-                        not in {(nt, o) for o, nt in _excl_set}
+                        if (
+                            _normalize(r.item.title),
+                            str(r.order.order_number).strip(),
+                        ) not in _excl_pairs
                     ]
                     n_excl = len(all_resolved) - len(route_resolved)
+                    if n_excl == 0:
+                        log.error(
+                            "exclude-orders-file: loaded %d exclusion entr(y/ies) but "
+                            "NONE matched the current cache — no line items were removed "
+                            "from the route (check dashboard Refresh and that order "
+                            "numbers / titles match orders_cache.json)",
+                            len(_excl_pairs),
+                        )
+                    elif n_excl != len(_excl_pairs):
+                        log.warning(
+                            "exclude-orders-file: %d distinct entr(y/ies) in JSON but "
+                            "only %d cache line item(s) excluded — some keys may be stale",
+                            len(_excl_pairs),
+                            n_excl,
+                        )
                     log.info(
                         "Route generation: %d of %d item(s) included "
                         "(%d excluded by dashboard selection)",
