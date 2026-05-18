@@ -33,9 +33,12 @@ try:
         CATALOG_SHEET,
         CHARM_LIBRARY_SHEET,
         CHARM_SHOPS_SHEET,
+        DB_FILE,
         ProductMapPickerRow,
         extract_photos_from_xlsx,
         get_catalog_photo_map,
+        get_db_connection,
+        get_supplier_dropdowns,
         normalize_catalog_charm_shops,
         import_charm_screenshot_assets,
         list_product_map_rows_for_picker,
@@ -61,9 +64,12 @@ except ImportError:
     CATALOG_SHEET = "Product Map"  # type: ignore[assignment, misc]
     CHARM_LIBRARY_SHEET = "Charm Library"  # type: ignore[assignment, misc]
     CHARM_SHOPS_SHEET = "Charm Shops"  # type: ignore[assignment, misc]
+    DB_FILE = "etsy_orders.db"  # type: ignore[assignment, misc]
     ProductMapPickerRow = None  # type: ignore[assignment, misc]
     extract_photos_from_xlsx = None  # type: ignore[assignment, misc]
     get_catalog_photo_map = None  # type: ignore[assignment, misc]
+    get_db_connection = None  # type: ignore[assignment, misc]
+    get_supplier_dropdowns = None  # type: ignore[assignment, misc]
     normalize_catalog_charm_shops = None  # type: ignore[assignment, misc]
     import_charm_screenshot_assets = None  # type: ignore[assignment, misc]
     list_product_map_rows_for_picker = None  # type: ignore[assignment, misc]
@@ -2236,48 +2242,48 @@ class App(tk.Tk):
             messagebox.showinfo("No data", "Order cache is empty.\nRun a job first.")
             return
 
+        # title_to_row is only needed when saving a photo; populate lazily.
         title_to_row: dict[str, int] = {}
-        if list_product_map_rows_for_picker is not None and FILE_SUPPLIER_CATALOG.exists():
-            try:
-                for pr in list_product_map_rows_for_picker(FILE_SUPPLIER_CATALOG):
-                    full_key = _normalize(pr.title)
-                    # Register both the full key and the 50-char-truncated variant.
-                    # Items cached before this fix stored norm_title with [:50];
-                    # registering both ensures either lookup hits the right row.
-                    title_to_row[full_key] = pr.row_num
-                    title_to_row[full_key[:50]] = pr.row_num
-            except Exception:
-                pass
 
+        # Load supplier shop/stall lists from SQLite (instant) with xlsx fallback.
         sup_shops: list[str] = []
         sup_stalls: list[str] = []
         sup_shop_stalls: dict[str, str] = {}   # shop_name → stall
         sup_stall_shops: dict[str, str] = {}   # stall → shop_name
-        try:
-            import openpyxl as _xl
-            _wb = _xl.load_workbook(FILE_SUPPLIER_CATALOG, read_only=True, data_only=True)
-            if "Suppliers" in _wb.sheetnames:
-                _ws = _wb["Suppliers"]
-                _shop_ci = _stall_ci = None
-                for ci in range(1, 20):
-                    h = str(_ws.cell(1, ci).value or "").strip().lower()
-                    if h == "shop name":
-                        _shop_ci = ci
-                    elif h == "stall":
-                        _stall_ci = ci
-                for r in _ws.iter_rows(min_row=2, values_only=False):
-                    _sv = str(r[_shop_ci - 1].value or "").strip() if _shop_ci else ""
-                    _stv = str(r[_stall_ci - 1].value or "").strip() if _stall_ci else ""
-                    if _sv and _sv not in sup_shops:
-                        sup_shops.append(_sv)
-                    if _stv and _stv not in sup_stalls:
-                        sup_stalls.append(_stv)
-                    if _sv and _stv:
-                        sup_shop_stalls.setdefault(_sv, _stv)
-                        sup_stall_shops.setdefault(_stv, _sv)
-            _wb.close()
-        except Exception:
-            pass
+        _db = DATA_DIR / DB_FILE
+        if get_supplier_dropdowns is not None and _db.exists():
+            try:
+                sup_shops, sup_stalls, sup_shop_stalls, sup_stall_shops = (
+                    get_supplier_dropdowns(_db)
+                )
+            except Exception:
+                pass
+        if not sup_shops and FILE_SUPPLIER_CATALOG.exists():
+            try:
+                import openpyxl as _xl
+                _wb = _xl.load_workbook(FILE_SUPPLIER_CATALOG, read_only=True, data_only=True)
+                if "Suppliers" in _wb.sheetnames:
+                    _ws = _wb["Suppliers"]
+                    _shop_ci = _stall_ci = None
+                    for ci in range(1, 20):
+                        h = str(_ws.cell(1, ci).value or "").strip().lower()
+                        if h == "shop name":
+                            _shop_ci = ci
+                        elif h == "stall":
+                            _stall_ci = ci
+                    for r in _ws.iter_rows(min_row=2, values_only=False):
+                        _sv = str(r[_shop_ci - 1].value or "").strip() if _shop_ci else ""
+                        _stv = str(r[_stall_ci - 1].value or "").strip() if _stall_ci else ""
+                        if _sv and _sv not in sup_shops:
+                            sup_shops.append(_sv)
+                        if _stv and _stv not in sup_stalls:
+                            sup_stalls.append(_stv)
+                        if _sv and _stv:
+                            sup_shop_stalls.setdefault(_sv, _stv)
+                            sup_stall_shops.setdefault(_stv, _sv)
+                _wb.close()
+            except Exception:
+                pass
 
         charm_library: dict = {}
         charm_codes: list[str] = []
@@ -3848,47 +3854,48 @@ class _OrdersDashboardDialog:
                 self._d.after(0, lambda: _done(None))
                 return
 
-            # ── 2. Reload title→row mapping ───────────────────────────
-            new_title_to_row: dict[str, int] = {}
-            if list_product_map_rows_for_picker is not None and FILE_SUPPLIER_CATALOG.exists():
-                try:
-                    for pr in list_product_map_rows_for_picker(FILE_SUPPLIER_CATALOG):
-                        fk = _normalize(pr.title)
-                        new_title_to_row[fk] = pr.row_num
-                        new_title_to_row[fk[:50]] = pr.row_num
-                except Exception:
-                    pass
+            # ── 2. title→row kept as-is; refreshed lazily before photo saves ──
+            new_title_to_row: dict[str, int] = self._title_to_row
 
-            # ── 3. Reload supplier metadata ───────────────────────────
+            # ── 3. Reload supplier metadata from SQLite (instant) ─────────────
             new_sup_shops: list[str] = []
             new_sup_stalls: list[str] = []
             new_sup_shop_stalls: dict[str, str] = {}
             new_sup_stall_shops: dict[str, str] = {}
-            try:
-                import openpyxl as _xl
-                _wb = _xl.load_workbook(FILE_SUPPLIER_CATALOG, read_only=True, data_only=True)
-                if "Suppliers" in _wb.sheetnames:
-                    _ws = _wb["Suppliers"]
-                    _shop_ci = _stall_ci = None
-                    for ci in range(1, 20):
-                        h = str(_ws.cell(1, ci).value or "").strip().lower()
-                        if h == "shop name":
-                            _shop_ci = ci
-                        elif h == "stall":
-                            _stall_ci = ci
-                    for row in _ws.iter_rows(min_row=2, values_only=False):
-                        _sv  = str(row[_shop_ci  - 1].value or "").strip() if _shop_ci  else ""
-                        _stv = str(row[_stall_ci - 1].value or "").strip() if _stall_ci else ""
-                        if _sv and _sv not in new_sup_shops:
-                            new_sup_shops.append(_sv)
-                        if _stv and _stv not in new_sup_stalls:
-                            new_sup_stalls.append(_stv)
-                        if _sv and _stv:
-                            new_sup_shop_stalls.setdefault(_sv, _stv)
-                            new_sup_stall_shops.setdefault(_stv, _sv)
-                _wb.close()
-            except Exception:
-                pass
+            _db = DATA_DIR / DB_FILE
+            if get_supplier_dropdowns is not None and _db.exists():
+                try:
+                    new_sup_shops, new_sup_stalls, new_sup_shop_stalls, new_sup_stall_shops = (
+                        get_supplier_dropdowns(_db)
+                    )
+                except Exception:
+                    pass
+            if not new_sup_shops and FILE_SUPPLIER_CATALOG.exists():
+                try:
+                    import openpyxl as _xl
+                    _wb = _xl.load_workbook(FILE_SUPPLIER_CATALOG, read_only=True, data_only=True)
+                    if "Suppliers" in _wb.sheetnames:
+                        _ws = _wb["Suppliers"]
+                        _shop_ci = _stall_ci = None
+                        for ci in range(1, 20):
+                            h = str(_ws.cell(1, ci).value or "").strip().lower()
+                            if h == "shop name":
+                                _shop_ci = ci
+                            elif h == "stall":
+                                _stall_ci = ci
+                        for row in _ws.iter_rows(min_row=2, values_only=False):
+                            _sv  = str(row[_shop_ci  - 1].value or "").strip() if _shop_ci  else ""
+                            _stv = str(row[_stall_ci - 1].value or "").strip() if _stall_ci else ""
+                            if _sv and _sv not in new_sup_shops:
+                                new_sup_shops.append(_sv)
+                            if _stv and _stv not in new_sup_stalls:
+                                new_sup_stalls.append(_stv)
+                            if _sv and _stv:
+                                new_sup_shop_stalls.setdefault(_sv, _stv)
+                                new_sup_stall_shops.setdefault(_stv, _sv)
+                    _wb.close()
+                except Exception:
+                    pass
 
             # ── 4. Reload charm library + shops ───────────────────────
             new_charm_library: dict = {}
@@ -4414,38 +4421,45 @@ class _OrdersDashboardDialog:
         ).pack(fill=tk.X, padx=14, pady=(10, 10))
 
     def _reload_supplier_dropdowns(self) -> None:
-        """Re-read the Suppliers sheet and refresh the Supplier/Stall comboboxes."""
+        """Refresh the Supplier/Stall comboboxes from SQLite (instant) with xlsx fallback."""
         shops: list[str] = []
         stalls: list[str] = []
         shop_stalls: dict[str, str] = {}
         stall_shops: dict[str, str] = {}
-        try:
-            import openpyxl as _xl
-            _wb = _xl.load_workbook(
-                FILE_SUPPLIER_CATALOG, read_only=True, data_only=True
-            )
-            if "Suppliers" in _wb.sheetnames:
-                _ws = _wb["Suppliers"]
-                _shop_ci = _stall_ci = None
-                for ci in range(1, 15):
-                    h = str(_ws.cell(1, ci).value or "").strip().lower()
-                    if h == "shop name":
-                        _shop_ci = ci
-                    elif h == "stall":
-                        _stall_ci = ci
-                for r in _ws.iter_rows(min_row=2, values_only=False):
-                    sv  = str(r[_shop_ci  - 1].value or "").strip() if _shop_ci  else ""
-                    stv = str(r[_stall_ci - 1].value or "").strip() if _stall_ci else ""
-                    if sv and sv not in shops:
-                        shops.append(sv)
-                    if stv and stv not in stalls:
-                        stalls.append(stv)
-                    if sv and stv:
-                        shop_stalls.setdefault(sv, stv)
-                        stall_shops.setdefault(stv, sv)
-            _wb.close()
-        except Exception:
-            pass
+        _db = DATA_DIR / DB_FILE
+        if get_supplier_dropdowns is not None and _db.exists():
+            try:
+                shops, stalls, shop_stalls, stall_shops = get_supplier_dropdowns(_db)
+            except Exception:
+                pass
+        if not shops and FILE_SUPPLIER_CATALOG.exists():
+            try:
+                import openpyxl as _xl
+                _wb = _xl.load_workbook(
+                    FILE_SUPPLIER_CATALOG, read_only=True, data_only=True
+                )
+                if "Suppliers" in _wb.sheetnames:
+                    _ws = _wb["Suppliers"]
+                    _shop_ci = _stall_ci = None
+                    for ci in range(1, 15):
+                        h = str(_ws.cell(1, ci).value or "").strip().lower()
+                        if h == "shop name":
+                            _shop_ci = ci
+                        elif h == "stall":
+                            _stall_ci = ci
+                    for r in _ws.iter_rows(min_row=2, values_only=False):
+                        sv  = str(r[_shop_ci  - 1].value or "").strip() if _shop_ci  else ""
+                        stv = str(r[_stall_ci - 1].value or "").strip() if _stall_ci else ""
+                        if sv and sv not in shops:
+                            shops.append(sv)
+                        if stv and stv not in stalls:
+                            stalls.append(stv)
+                        if sv and stv:
+                            shop_stalls.setdefault(sv, stv)
+                            stall_shops.setdefault(stv, sv)
+                _wb.close()
+            except Exception:
+                pass
 
         # Persist updated data on self
         self._sup_shops       = shops
@@ -4894,6 +4908,20 @@ class _OrdersDashboardDialog:
         if not d:
             return
 
+        # Open the file picker immediately — don't parse xlsx until a file is chosen.
+        from tkinter import filedialog
+        path_str = filedialog.askopenfilename(
+            parent=self._d,
+            title="Choose product photo" if self._lang == "en" else "\u9009\u62e9\u5546\u54c1\u56fe\u7247",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path_str:
+            return
+
+        # Now that a file was chosen, look up the xlsx row (may parse catalog).
         self._refresh_title_to_row()
         row_num = self._row_num_for_item(d)
         if row_num is None:
@@ -4906,18 +4934,6 @@ class _OrdersDashboardDialog:
                 if self._lang == "en" else
                 "\u6b64\u5546\u54c1\u5c1a\u672a\u5efa\u7acb\u76ee\u5f55\u6761\u76ee\uff0c\u8bf7\u5148\u8fd0\u884c\u4e00\u6b21\u4efb\u52a1\u5c06\u5176\u6dfb\u52a0\u5230 supplier_catalog.xlsx\u3002",
             )
-            return
-
-        from tkinter import filedialog
-        path_str = filedialog.askopenfilename(
-            parent=self._d,
-            title="Choose product photo" if self._lang == "en" else "\u9009\u62e9\u5546\u54c1\u56fe\u7247",
-            filetypes=[
-                ("Image files", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"),
-                ("All files", "*.*"),
-            ],
-        )
-        if not path_str:
             return
 
         # ── Re-encode as JPEG ─────────────────────────────────────────────
@@ -5324,15 +5340,25 @@ class _OrdersDashboardDialog:
         if item_key:
             reverse = (self._sort_dir == "desc")
             if item_key == "stall":
-                # Rank by the exact row order of the Stall column in the
-                # Suppliers sheet of supplier_catalog.xlsx.
-                _stall_rank: dict[str, int] = {
-                    s: i for i, s in enumerate(self._sup_stalls)
-                }
-                _fallback = len(self._sup_stalls)
+                # Natural stall sort: floor number first, then stall code, then shop.
+                # Mirrors _stall_sort_key used by the shopping-route generator so the
+                # dashboard order always matches the physical walking route.
+                import re as _re
+                def _stall_floor(stall: str) -> int:
+                    if not stall or stall in ("\u2014", "???"):
+                        return 999
+                    if _re.match(r"^A2", stall, _re.IGNORECASE):
+                        return 2
+                    m = _re.match(r"^(\d)", stall)
+                    if m:
+                        return int(m.group(1))
+                    m = _re.search(r"(\d)[A-Za-z]", stall)
+                    return int(m.group(1)) if m else 999
                 def _sort_key(pair: tuple):  # type: ignore[misc]
-                    s = str(pair[1].get("stall") or "").strip()
-                    return _stall_rank.get(s, _fallback)
+                    d_ = pair[1]
+                    stall = str(d_.get("stall") or "").strip()
+                    shop  = str(d_.get("supplier") or "").strip().lower()
+                    return (_stall_floor(stall), stall.lower(), shop)
             elif item_key.startswith("_ps_"):
                 # Purchase-status sort: rank by _PSTATUS_SORT_ORDER priority.
                 # _ps_case / _ps_grip / _ps_charm

@@ -103,13 +103,23 @@ CREATE TABLE IF NOT EXISTS orders (
 
 -- ── Order line items ──────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS order_items (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_number TEXT    NOT NULL REFERENCES orders(order_number) ON DELETE CASCADE,
-    title        TEXT    NOT NULL,
-    quantity     INTEGER NOT NULL DEFAULT 1,
-    phone_model  TEXT    NOT NULL DEFAULT '',
-    style        TEXT    NOT NULL DEFAULT '',
-    photo_bytes  BLOB
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_number    TEXT    NOT NULL REFERENCES orders(order_number) ON DELETE CASCADE,
+    title           TEXT    NOT NULL,
+    quantity        INTEGER NOT NULL DEFAULT 1,
+    phone_model     TEXT    NOT NULL DEFAULT '',
+    style           TEXT    NOT NULL DEFAULT '',
+    photo_bytes     BLOB,
+    -- Supplier / match fields (mirroring _resolved_to_dict output)
+    shop_name       TEXT    NOT NULL DEFAULT '',
+    stall           TEXT    NOT NULL DEFAULT '',
+    charm_shop      TEXT    NOT NULL DEFAULT '',
+    charm_code      TEXT    NOT NULL DEFAULT '',
+    match_score     REAL    NOT NULL DEFAULT 0.0,
+    in_catalog      INTEGER NOT NULL DEFAULT 0,
+    category        TEXT    NOT NULL DEFAULT '',
+    price           TEXT    NOT NULL DEFAULT '',
+    supplier_notes  TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_number);
 
@@ -490,8 +500,10 @@ def migrate_orders_cache(
         cur.execute(
             """
             INSERT INTO order_items
-                (order_number, title, quantity, phone_model, style, photo_bytes)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (order_number, title, quantity, phone_model, style, photo_bytes,
+                 shop_name, stall, charm_shop, charm_code, match_score,
+                 in_catalog, category, price, supplier_notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order_number,
@@ -500,6 +512,15 @@ def migrate_orders_cache(
                 rec.get("phone_model", ""),
                 rec.get("style",       ""),
                 photo_bytes,
+                rec.get("shop_name",   ""),
+                rec.get("stall",       ""),
+                rec.get("charm_shop",  ""),
+                rec.get("charm_code",  ""),
+                float(rec.get("match_score", 0.0)),
+                1 if rec.get("in_catalog") else 0,
+                rec.get("category",    ""),
+                rec.get("price",       ""),
+                rec.get("notes",       ""),
             ),
         )
         items_inserted += 1
@@ -523,7 +544,7 @@ def rebuild_fts_index(conn: sqlite3.Connection) -> None:
     running this once after a bulk migration ensures the index is pristine and
     any edge-case gaps are closed.
     """
-    log.info("Rebuilding FTS5 trigram index …")
+    log.info("Rebuilding FTS5 trigram index...")
     conn.execute("INSERT INTO catalog_fts(catalog_fts) VALUES('rebuild')")
     conn.commit()
     log.info("FTS5 index rebuild complete")
@@ -536,13 +557,13 @@ def rebuild_fts_index(conn: sqlite3.Connection) -> None:
 def _smoke_test(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
     tables = ["catalog", "charm_library", "charm_shops", "orders", "order_items", "processed_pdfs"]
-    print("\n── Row counts ──────────────────────────────────────")
+    print("\n--- Row counts -------------------------------------------")
     for tbl in tables:
         (n,) = cur.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()  # noqa: S608
         print(f"  {tbl:<20} {n:>6} rows")
 
     # FTS5 sanity check: retrieve top 3 catalog titles
-    print("\n── FTS5 sample (top 3 product titles) ─────────────")
+    print("\n--- FTS5 sample (top 3 product titles) ------------------")
     rows = cur.execute(
         "SELECT product_title FROM catalog_fts LIMIT 3"
     ).fetchall()
@@ -609,12 +630,12 @@ def main() -> None:
     catalog_path = project_dir / "data" / "supplier_catalog.xlsx"
     cache_path   = project_dir / "cache" / "orders_cache.json"
 
-    log.info("──────────────────────────────────────────")
+    log.info("------------------------------------------")
     log.info("Project dir  : %s", project_dir)
     log.info("Database     : %s", db_path)
     log.info("Catalog      : %s", catalog_path)
     log.info("Cache        : %s", cache_path)
-    log.info("──────────────────────────────────────────")
+    log.info("------------------------------------------")
 
     conn = init_db(db_path)
 

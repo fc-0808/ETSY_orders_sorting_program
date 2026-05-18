@@ -931,6 +931,51 @@ def get_charm_shop(
     )
 
 
+def get_supplier_dropdowns(
+    db_path: Path,
+) -> tuple[list[str], list[str], dict[str, str], dict[str, str]]:
+    """Return supplier shop/stall data for UI dropdowns from SQLite.
+
+    Queries the ``catalog`` table for all distinct shop-name / stall pairs.
+    Returns ``(shops, stalls, shop_to_stall, stall_to_shop)`` — equivalent to
+    what the legacy code built by parsing the ``Suppliers`` sheet in
+    ``supplier_catalog.xlsx``.
+
+    Falls back to empty lists/dicts (not an error) when the database is absent.
+    """
+    if not db_path.exists():
+        return [], [], {}, {}
+    try:
+        conn = get_db_connection(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT shop_name, stall FROM catalog "
+                "WHERE shop_name != '' OR stall != '' "
+                "ORDER BY shop_name, stall"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.debug("get_supplier_dropdowns failed: %s", exc)
+        return [], [], {}, {}
+
+    shops: list[str] = []
+    stalls: list[str] = []
+    shop_stalls: dict[str, str] = {}
+    stall_shops: dict[str, str] = {}
+    for row in rows:
+        shop  = row["shop_name"] or ""
+        stall = row["stall"]     or ""
+        if shop  and shop  not in shops:
+            shops.append(shop)
+        if stall and stall not in stalls:
+            stalls.append(stall)
+        if shop and stall:
+            shop_stalls.setdefault(shop,  stall)
+            stall_shops.setdefault(stall, shop)
+    return shops, stalls, shop_stalls, stall_shops
+
+
 # ---------------------------------------------------------------------------
 # Supplier catalog -- load
 # ---------------------------------------------------------------------------
@@ -3912,12 +3957,24 @@ def _save_cache_sqlite(
                     r.order.private_notes,
                 ),
             )
+            # Apply threshold filtering (same logic as _resolved_to_dict / JSON path)
+            if _needs_catalog_entry(r):
+                _shop   = ""
+                _stall  = ""
+                _incat  = 0
+            else:
+                _shop   = r.supplier.shop_name if r.supplier else ""
+                _stall  = r.supplier.stall     if r.supplier else ""
+                _incat  = 1 if r.supplier is not None else 0
+
             # Insert line item (fresh row every time — stale rows deleted above)
             cur.execute(
                 """
                 INSERT INTO order_items
-                    (order_number, title, quantity, phone_model, style, photo_bytes)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (order_number, title, quantity, phone_model, style, photo_bytes,
+                     shop_name, stall, charm_shop, charm_code, match_score,
+                     in_catalog, category, price, supplier_notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     r.order.order_number,
@@ -3926,6 +3983,15 @@ def _save_cache_sqlite(
                     r.item.phone_model,
                     r.item.style,
                     r.item.photo_bytes,
+                    _shop,
+                    _stall,
+                    r.supplier.charm_shop  if r.supplier else "",
+                    r.supplier.charm_code  if r.supplier else "",
+                    r.match_score,
+                    _incat,
+                    r.supplier.category    if r.supplier else "",
+                    r.supplier.price       if r.supplier else "",
+                    r.supplier.notes       if r.supplier else "",
                 ),
             )
 
@@ -3979,9 +4045,10 @@ def _load_cache_sqlite(
 ) -> tuple[list[ResolvedItem], set[str]]:
     """Load resolved items and the processed-PDFs set from SQLite.
 
-    ``supplier`` is always ``None`` on the returned items; the main pipeline
-    immediately re-matches every cached item against the current catalog so
-    the supplier field is authoritative only after that step.
+    Reconstructs the ``supplier`` CatalogEntry from the supplier columns stored
+    in ``order_items`` so the dashboard can display match status immediately
+    without a re-match pass.  The main pipeline may still re-match cached items
+    against the current catalog to pick up any catalog edits made since last run.
     """
     conn = get_db_connection(db_path)
     try:
@@ -3990,7 +4057,9 @@ def _load_cache_sqlite(
             SELECT
                 o.order_number, o.etsy_shop, o.buyer_name, o.buyer_username,
                 o.ship_to_name, o.ship_to_country, o.order_date, o.private_notes,
-                i.title, i.quantity, i.phone_model, i.style, i.photo_bytes
+                i.title, i.quantity, i.phone_model, i.style, i.photo_bytes,
+                i.shop_name, i.stall, i.charm_shop, i.charm_code,
+                i.match_score, i.in_catalog, i.category, i.price, i.supplier_notes
             FROM order_items i
             JOIN orders o ON i.order_number = o.order_number
             ORDER BY o.order_number, i.id
@@ -4022,7 +4091,30 @@ def _load_cache_sqlite(
             photo_bytes = bytes(row["photo_bytes"]) if row["photo_bytes"] else None,
         )
         order.items = [item]
-        items.append(ResolvedItem(order=order, item=item, supplier=None, match_score=0.0))
+
+        # Reconstruct CatalogEntry when any supplier field is populated.
+        _shop_name  = row["shop_name"]  or ""
+        _stall      = row["stall"]      or ""
+        _charm_shop = row["charm_shop"] or ""
+        _charm_code = row["charm_code"] or ""
+        _in_catalog = bool(row["in_catalog"])
+        _score      = float(row["match_score"] or 0.0)
+
+        if _shop_name or _stall or _charm_shop or _charm_code or _in_catalog:
+            supplier: CatalogEntry | None = CatalogEntry(
+                product_title = row["title"],
+                shop_name     = _shop_name,
+                stall         = _stall,
+                charm_shop    = _charm_shop,
+                charm_code    = _charm_code,
+                category      = row["category"]       or "",
+                price         = row["price"]          or "",
+                notes         = row["supplier_notes"] or "",
+            )
+        else:
+            supplier = None
+
+        items.append(ResolvedItem(order=order, item=item, supplier=supplier, match_score=_score))
 
     processed_pdfs = {row["filename"] for row in pdf_rows}
     log.info(
@@ -4739,33 +4831,47 @@ def get_fts_candidates(
     Results are ordered by BM25 relevance (most similar first).  The caller
     should apply ``_normalize`` to each returned title before fuzzy scoring.
 
-    The entire query term is wrapped in double-quotes so FTS5 treats it as a
-    phrase literal — inner double-quotes are doubled to satisfy the syntax.
-    This prevents operator keywords (AND, OR, NOT, ``*``, ``-``) that appear
-    in product titles from being mis-interpreted by the FTS5 query parser.
+    Strategy: each word in the query is phrase-quoted individually so that FTS5
+    operator keywords (AND, OR, NOT, ``*``, ``-``) cannot be mis-interpreted.
+    Words shorter than 3 characters are skipped because the trigram tokenizer
+    cannot generate a trigram from them.  We first try an AND query (all words
+    must appear) for precision; if that returns nothing we fall back to an OR
+    query (any word appears) for better recall.  The final rapidfuzz pass then
+    re-ranks/filters the small candidate set by score threshold.
 
     Returns an empty list on any error so callers can fall back gracefully.
     """
-    # Phrase-quote the whole normalized title; double any embedded quotes.
-    safe_term = '"{}"'.format(normalized_title.replace('"', '""'))
-    try:
-        rows = conn.execute(
-            """
-            SELECT c.product_title
-            FROM   catalog_fts f
-            JOIN   catalog     c ON f.rowid = c.id
-            WHERE  catalog_fts MATCH ?
-            ORDER  BY bm25(catalog_fts)
-            LIMIT  ?
-            """,
-            (safe_term, limit),
-        ).fetchall()
-        return [row["product_title"] for row in rows]
-    except Exception as exc:
-        # Log at DEBUG so a bad title doesn't flood the console; the caller
-        # will silently fall back to the full O(N) scan.
-        log.debug("FTS5 candidate query failed for %r: %s", normalized_title, exc)
+    import re as _re
+
+    # Extract clean alphanumeric words long enough for trigram matching.
+    words = [_re.sub(r"[^a-z0-9]", "", w) for w in normalized_title.lower().split()]
+    words = [w for w in words if len(w) >= 3]
+    if not words:
         return []
+
+    _SQL = """
+        SELECT c.product_title
+        FROM   catalog_fts f
+        JOIN   catalog     c ON f.rowid = c.id
+        WHERE  catalog_fts MATCH ?
+        ORDER  BY bm25(catalog_fts)
+        LIMIT  ?
+    """
+
+    def _run(join_op: str) -> list[str]:
+        quoted = ['"{}"'.format(w.replace('"', '""')) for w in words]
+        safe_term = f" {join_op} ".join(quoted)
+        try:
+            rows = conn.execute(_SQL, (safe_term, limit)).fetchall()
+            return [row["product_title"] for row in rows]
+        except Exception as exc:
+            log.debug("FTS5 query (%s) failed for %r: %s", join_op, normalized_title, exc)
+            return []
+
+    results = _run("AND")
+    if not results:
+        results = _run("OR")
+    return results
 
 
 def match_items(
